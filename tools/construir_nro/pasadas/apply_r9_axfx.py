@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""apply_r9_axfx.py <export_dir>
+
+R9 cpucode post-pass (after apply_fastdispatch.py, apply_r8_codegen.py and
+apply_r9_cpucode.py): a native body for func_801A3880, the AXFX reverb
+callback of SMNE01 (~10 % of the CPU thread in the PC profile; 96 samples x 3
+channels per call, ~330 calls/s).
+
+What it does. The generated function keeps every guest register in the
+CPUContext struct, and every guest store goes through a uint8_t* (may alias
+anything), so GCC reloads and re-stores ctx.gpr[]/fpr[]/ps1[]/cr around every
+access. The pass copies the body of the function from loc_801A3894 (right after
+the _savegpr call) to loc_801A3D8C (right before the _restgpr call) into a new
+function, nwii_r9_axfx_801A3894, mechanically:
+  ctx.gpr[N] -> gN, ctx.fpr[N] -> fN, ctx.ps1[N] -> pN, ctx.cr[0].x -> c0x,
+  ctx.ctr -> ctr, ctx.xer -> xer, ctx.inst_count += k -> ic += k,
+  ctx.fill/fmuls/fadds/fsubs/fctiwz -> the same formulas on the locals
+  (copied from CPUContext), guest memory through the same MemView accessors
+  (same fast paths, same slow paths, same order of accesses).
+The locals are loaded from ctx at entry and stored back at the exit, so at
+loc_801A3D8C ctx holds exactly what the generated code leaves there (all
+GPRs/FPRs/PS1/CR/CTR/pc/inst_count). The guest memory writes are the same
+values to the same addresses in the same order.
+The only thing left out are the two interrupt polls inside the loops
+(process_pending_callbacks at 0x801A3B68 and 0x801A3D88). They can only deliver
+an interrupt with MSR[EE] set, so the native body runs only when MSR[EE] is
+clear (otherwise the generated code runs as before); with EE clear a poll only
+advances the event scheduler, which then happens at the next poll of the
+caller instead (a few microseconds later, as if the function ran faster, which
+it does).
+NWII_AXFX_NATIVE=0 turns it off. NWII_AXFX_VERIFY=n (test only): every n-th
+call runs the native body on a snapshot, restores the snapshot, runs the
+generated code and compares all of guest RAM (MEM1+MEM2) and the guest
+registers ("[R9] axfx verify ...").
+Applied once (marks output_*.cpp with // [r9axfx]); refuses to run if the
+function's text is not the one this pass was written for (sha256 below).
+"""
+import hashlib, os, re, sys
+
+FUNC = 'func_801A3880'
+START = 'loc_801A3894'
+END = 'loc_801A3D8C'
+MARK = '// [r9axfx]'
+# sha256 of the generated function text (after apply_r8_codegen.py)
+EXPECTED_SHA = "297db6dc90dbcd33da52b57330a6f272ecff3af3651a99d6b1af8f2605e12c38"
+
+FILL = re.compile(r'^ctx\.fill\((\d+), (.*)\);$')
+F3 = re.compile(r'^ctx\.(fmuls|fadds|fsubs)\((\d+), (\d+), (\d+)\);$')
+FCTIWZ = re.compile(r'^ctx\.fctiwz\((\d+), (\d+)\);$')
+POLL_PC = re.compile(r'^ctx\.pc = (0x[0-9A-F]+);$')
+
+
+def find_function(text):
+    m = re.search(r'^void %s\(CPUContext& ctx\) \{\n' % FUNC, text, re.M)
+    if not m:
+        return None
+    end = text.index('\n}\n', m.end()) + 3
+    return m.start(), end
+
+
+def translate(body_lines):
+    out = []
+    gw, fw, pw = set(), set(), set()   # registers written in the region
+    fw_plain = set()                   # FPRs also written without ps1 (lfd, fmr, fctiwz)
+    gr, fr = set(), set()              # registers read
+    crw = False
+    ctrw = False
+    i = 0
+    n = len(body_lines)
+    while i < n:
+        raw = body_lines[i]
+        line = raw.strip()
+        code, _, comment = line.partition(' //')
+        code = code.strip()
+        i += 1
+        if not code or code.startswith('//'):
+            continue
+        m = POLL_PC.match(code)
+        if m and i < n and body_lines[i].strip() == 'if (process_pending_callbacks(ctx)) return;':
+            out.append('    pc = %s;  // interrupt poll of the generated code (MSR[EE] is clear here)' % m.group(1))
+            i += 1
+            continue
+        if code == 'goto %s;' % END:
+            out.append('    goto nwii_exit;')
+            continue
+        m = FILL.match(code)
+        if m:
+            d = m.group(1)
+            fw.add(int(d)); pw.add(int(d))
+            code = 'NWII_R9_FILL(%s, %s);' % (d, m.group(2))
+        m = F3.match(code)
+        if m:
+            op, d, a, b = m.groups()
+            fw.add(int(d)); pw.add(int(d)); fr.update((int(a), int(b)))
+            code = 'NWII_R9_%s(%s, %s, %s);' % (op.upper(), d, a, b)
+        m = FCTIWZ.match(code)
+        if m:
+            d, b = m.groups()
+            fw.add(int(d)); fr.add(int(b)); fw_plain.add(int(d))
+            code = 'NWII_R9_FCTIWZ(%s, %s);' % (d, b)
+        # plain register references
+        for mm in re.finditer(r'ctx\.gpr\[(\d+)\]\s*=(?!=)', code):
+            gw.add(int(mm.group(1)))
+        for mm in re.finditer(r'ctx\.fpr\[(\d+)\]\s*=(?!=)', code):
+            fw.add(int(mm.group(1))); fw_plain.add(int(mm.group(1)))
+        for mm in re.finditer(r'ctx\.gpr\[(\d+)\]', code):
+            gr.add(int(mm.group(1)))
+        for mm in re.finditer(r'ctx\.fpr\[(\d+)\]', code):
+            fr.add(int(mm.group(1)))
+        if re.search(r'ctx\.cr\[0\]\.(lt|gt|eq|so)\s*=(?!=)', code):
+            crw = True
+        if re.search(r'ctx\.ctr\s*(=(?!=)|--|\+\+)', code):
+            ctrw = True
+        code = re.sub(r'ctx\.gpr\[(\d+)\]', r'g\1', code)
+        code = re.sub(r'ctx\.fpr\[(\d+)\]', r'f\1', code)
+        code = re.sub(r'ctx\.cr\[0\]\.(lt|gt|eq|so)', r'c0\1', code)
+        code = code.replace('ctx.xer', 'xer').replace('ctx.ctr', 'ctr')
+        code = re.sub(r'^ctx\.inst_count \+= (\d+);$', r'ic += \1;', code)
+        if 'ctx' in code:
+            sys.exit('apply_r9_axfx: statement not handled: ' + line)
+        if re.match(r'^loc_[0-9A-F]+: ;$', code):
+            out.append(code)
+        else:
+            out.append('    ' + code + ((' //' + comment) if comment else ''))
+    return out, gw, fw, pw, gr, fr, crw, ctrw, fw_plain
+
+
+def build_native(body_lines):
+    out, gw, fw, pw, gr, fr, crw, ctrw, fw_plain = translate(body_lines)
+    # ps1 kept as a local only where fpr is also written without it; elsewhere
+    # ps1 == fpr after the last write (a flag says whether there was one).
+    pkeep = pw & fw_plain
+    pflag = pw - fw_plain
+    out = [re.sub(r'NWII_R9_(FILL|FMULS|FADDS|FSUBS)\((\d+),',
+                  lambda m: 'NWII_R9_%s%s(%s,' % (m.group(1), 'P' if int(m.group(2)) in pkeep else 'W', m.group(2)), l)
+           for l in out]
+    used_labels = set(re.findall(r'goto (loc_[0-9A-F]+);', '\n'.join(out)))
+    out = [l for l in out if not re.match(r'^loc_[0-9A-F]+: ;$', l) or l[:-3] in used_labels]
+    gs = sorted(gw | gr)
+    fs = sorted(fw | fr | pw)
+    L = []
+    L.append(MARK + ' native body of %s from %s to %s (perf/apply_r9_axfx.py)' % (FUNC, START, END))
+    L.append('// FILLP: ps1 kept in pD; FILLW: ps1 == fpr after it, wD says it happened')
+    L.append('#define NWII_R9_FILLP(D, X) do { const double t_ = (X); f##D = t_; p##D = t_; } while (0)')
+    L.append('#define NWII_R9_FILLW(D, X) do { f##D = (X); w##D = true; } while (0)')
+    for k in 'PW':
+        L.append('#define NWII_R9_FMULS%s(D, A, C) NWII_R9_FILL%s(D, nwii::runtime::ppc_single(f##A * nwii::runtime::ppc_force25(f##C)))' % (k, k))
+        L.append('#define NWII_R9_FADDS%s(D, A, B) NWII_R9_FILL%s(D, nwii::runtime::ppc_single(f##A + f##B))' % (k, k))
+        L.append('#define NWII_R9_FSUBS%s(D, A, B) NWII_R9_FILL%s(D, nwii::runtime::ppc_single(f##A - f##B))' % (k, k))
+    L.append('#define NWII_R9_FCTIWZ(D, B) do { const uint64_t v_ = nwii::runtime::ppc_fctiw_image(nwii::runtime::ppc_fctiwz(f##B), f##B); std::memcpy(&f##D, &v_, 8); } while (0)')
+    L.append('static NWII_NOINLINE void nwii_r9_axfx_native(CPUContext& ctx) {')
+    L.append('    nwii::runtime::MemView mv_(ctx.mmu);')
+    for r in gs:
+        L.append('    uint32_t g%d = ctx.gpr[%d];' % (r, r))
+    for r in fs:
+        L.append('    double f%d = ctx.fpr[%d];' % (r, r))
+    for r in sorted(pkeep):
+        L.append('    double p%d = ctx.ps1[%d];' % (r, r))
+    for r in sorted(pflag):
+        L.append('    bool w%d = false;' % r)
+    L.append('    bool c0lt = ctx.cr[0].lt, c0gt = ctx.cr[0].gt, c0eq = ctx.cr[0].eq, c0so = ctx.cr[0].so;')
+    L.append('    uint32_t ctr = ctx.ctr, pc = ctx.pc;')
+    L.append('    const uint32_t xer = ctx.xer;')
+    L.append('    uint64_t ic = 0;')
+    L.extend(out)
+    L.append('nwii_exit:')
+    for r in sorted(gw):
+        L.append('    ctx.gpr[%d] = g%d;' % (r, r))
+    for r in sorted(fw):
+        L.append('    ctx.fpr[%d] = f%d;' % (r, r))
+    for r in sorted(pkeep):
+        L.append('    ctx.ps1[%d] = p%d;' % (r, r))
+    for r in sorted(pflag):
+        L.append('    if (w%d) ctx.ps1[%d] = f%d;' % (r, r, r))
+    if crw:
+        L.append('    ctx.cr[0].lt = c0lt; ctx.cr[0].gt = c0gt; ctx.cr[0].eq = c0eq; ctx.cr[0].so = c0so;')
+    if ctrw:
+        L.append('    ctx.ctr = ctr;')
+    L.append('    ctx.pc = pc;')
+    L.append('    ctx.inst_count += ic;')
+    L.append('    (void)c0lt; (void)c0gt; (void)c0eq; (void)c0so; (void)xer;')
+    L.append('}')
+    for m in ('FILLP', 'FILLW', 'FMULSP', 'FADDSP', 'FSUBSP', 'FMULSW', 'FADDSW', 'FSUBSW', 'FCTIWZ'):
+        L.append('#undef NWII_R9_' + m)
+    return L
+
+
+HOOK = r'''
+// Entry from %(func)s at %(start)s. true: the native body ran and ctx is the
+// state of %(end)s. false: run the generated code (MSR[EE] set, NWII_AXFX_NATIVE=0,
+// or a NWII_AXFX_VERIFY round).
+namespace {
+struct R9AxfxRegs {
+  uint32_t gpr[32]; uint64_t fpr[32], ps1[32]; uint8_t cr[8][4];
+  uint32_t ctr, xer, lr, pc, msr; uint64_t inst_count;
+};
+R9AxfxRegs r9_axfx_regs(const CPUContext& c) {
+  R9AxfxRegs r;
+  std::memset(&r, 0, sizeof r);
+  for (int i = 0; i < 32; ++i) {
+    r.gpr[i] = c.gpr[i];
+    std::memcpy(&r.fpr[i], &c.fpr[i], 8);
+    std::memcpy(&r.ps1[i], &c.ps1[i], 8);
+  }
+  for (int i = 0; i < 8; ++i) {
+    r.cr[i][0] = c.cr[i].lt; r.cr[i][1] = c.cr[i].gt; r.cr[i][2] = c.cr[i].eq; r.cr[i][3] = c.cr[i].so;
+  }
+  r.ctr = c.ctr; r.xer = c.xer; r.lr = c.lr; r.pc = c.pc; r.msr = c.msr; r.inst_count = c.inst_count;
+  return r;
+}
+void r9_axfx_set_regs(CPUContext& c, const R9AxfxRegs& r) {
+  for (int i = 0; i < 32; ++i) {
+    c.gpr[i] = r.gpr[i];
+    std::memcpy(&c.fpr[i], &r.fpr[i], 8);
+    std::memcpy(&c.ps1[i], &r.ps1[i], 8);
+  }
+  for (int i = 0; i < 8; ++i) {
+    c.cr[i].lt = r.cr[i][0]; c.cr[i].gt = r.cr[i][1]; c.cr[i].eq = r.cr[i][2]; c.cr[i].so = r.cr[i][3];
+  }
+  c.ctr = r.ctr; c.xer = r.xer; c.lr = r.lr; c.pc = r.pc; c.msr = r.msr; c.inst_count = r.inst_count;
+}
+struct R9AxfxVerify {
+  bool pending = false;
+  uint64_t calls = 0, ok = 0, bad = 0, native = 0, fallback = 0;
+  std::vector<uint8_t> s1, s2;   // guest RAM before the call (allocated once)
+  uint64_t h1 = 0, h2 = 0;       // hash of guest RAM after the native body
+  R9AxfxRegs regs;               // guest registers after the native body
+};
+R9AxfxVerify& r9_axfx_state() { static R9AxfxVerify v; return v; }
+uint64_t r9_axfx_hash(const std::vector<uint8_t>& m) {
+  uint64_t h = 0x9E3779B97F4A7C15ull;
+  const size_t n = m.size() / 8;
+  const uint8_t* p = m.data();
+  for (size_t i = 0; i < n; ++i) {
+    uint64_t w;
+    std::memcpy(&w, p + i * 8, 8);
+    h = (h ^ w) * 0x100000001B3ull + (uint64_t)i;
+  }
+  for (size_t i = n * 8; i < m.size(); ++i) h = (h ^ p[i]) * 0x100000001B3ull;
+  return h;
+}
+}  // namespace
+
+static NWII_NOINLINE void nwii_r9_axfx_report(const R9AxfxVerify& v) {
+  std::cout << "[R9] axfx native=" << v.native << " generated(EE set)=" << v.fallback
+            << " verify ok=" << v.ok << " bad=" << v.bad << std::endl;
+}
+
+// NWII_AXFX_VERIFY round: snapshot guest RAM and registers, run the native body,
+// keep a hash of guest RAM and the registers it leaves, restore the snapshot and
+// let the generated code run; nwii_r9_axfx_verify_end compares at %(end)s.
+static NWII_NOINLINE bool nwii_r9_axfx_verify_begin(CPUContext& ctx) {
+  R9AxfxVerify& v = r9_axfx_state();
+  v.s1.resize(ctx.mmu.mem1.size());
+  v.s2.resize(ctx.mmu.mem2.size());
+  std::memcpy(v.s1.data(), ctx.mmu.mem1.data(), v.s1.size());
+  std::memcpy(v.s2.data(), ctx.mmu.mem2.data(), v.s2.size());
+  const R9AxfxRegs before = r9_axfx_regs(ctx);
+  nwii_r9_axfx_native(ctx);
+  v.h1 = r9_axfx_hash(ctx.mmu.mem1);
+  v.h2 = r9_axfx_hash(ctx.mmu.mem2);
+  v.regs = r9_axfx_regs(ctx);
+  std::memcpy(ctx.mmu.mem1.data(), v.s1.data(), v.s1.size());
+  std::memcpy(ctx.mmu.mem2.data(), v.s2.data(), v.s2.size());
+  r9_axfx_set_regs(ctx, before);
+  v.pending = true;
+  return false;
+}
+
+// At %(end)s of the generated code after a verify round.
+static NWII_NOINLINE void nwii_r9_axfx_verify_end(CPUContext& ctx) {
+  R9AxfxVerify& v = r9_axfx_state();
+  v.pending = false;
+  const R9AxfxRegs now = r9_axfx_regs(ctx);
+  bool good = std::memcmp(&now, &v.regs, sizeof now) == 0;
+  if (!good && v.bad < 20) {
+    for (int i = 0; i < 32; ++i) {
+      if (now.gpr[i] != v.regs.gpr[i]) std::cout << "[R9] axfx verify r" << i << " gen=0x" << std::hex << now.gpr[i] << " native=0x" << v.regs.gpr[i] << std::dec << "\n";
+      if (now.fpr[i] != v.regs.fpr[i]) std::cout << "[R9] axfx verify f" << i << " gen=0x" << std::hex << now.fpr[i] << " native=0x" << v.regs.fpr[i] << std::dec << "\n";
+      if (now.ps1[i] != v.regs.ps1[i]) std::cout << "[R9] axfx verify ps1_" << i << " gen=0x" << std::hex << now.ps1[i] << " native=0x" << v.regs.ps1[i] << std::dec << "\n";
+    }
+    if (std::memcmp(now.cr, v.regs.cr, sizeof now.cr)) std::cout << "[R9] axfx verify cr differs\n";
+    if (now.ctr != v.regs.ctr || now.pc != v.regs.pc || now.inst_count != v.regs.inst_count || now.lr != v.regs.lr)
+      std::cout << "[R9] axfx verify ctr/pc/lr/inst gen=" << now.ctr << "/0x" << std::hex << now.pc << "/0x" << now.lr << std::dec << "/" << now.inst_count
+                << " native=" << v.regs.ctr << "/0x" << std::hex << v.regs.pc << "/0x" << v.regs.lr << std::dec << "/" << v.regs.inst_count << "\n";
+  }
+  const uint64_t g1 = r9_axfx_hash(ctx.mmu.mem1), g2 = r9_axfx_hash(ctx.mmu.mem2);
+  if (g1 != v.h1 || g2 != v.h2) {
+    good = false;
+    if (v.bad < 20) {
+      size_t c1 = 0, c2 = 0;  // bytes the generated code changed (for context)
+      for (size_t i = 0; i < v.s1.size(); ++i) c1 += v.s1[i] != ctx.mmu.mem1[i];
+      for (size_t i = 0; i < v.s2.size(); ++i) c2 += v.s2[i] != ctx.mmu.mem2[i];
+      std::cout << "[R9] axfx verify guest RAM differs (MEM1 " << (g1 != v.h1 ? "differs" : "same") << ", MEM2 "
+                << (g2 != v.h2 ? "differs" : "same") << "; generated code changed " << c1 << " + " << c2 << " bytes)\n";
+    }
+  }
+  if (good) ++v.ok; else ++v.bad;
+  if ((v.ok + v.bad) %% 50 == 1 || !good) nwii_r9_axfx_report(v);
+}
+
+static inline bool nwii_r9_axfx_801A3894(CPUContext& ctx) {
+  static const bool on = [] { const char* e = NWII_ENV("NWII_AXFX_NATIVE"); return !(e && e[0] == '0'); }();
+  static const unsigned long every = [] { const char* e = NWII_ENV("NWII_AXFX_VERIFY"); return e ? std::strtoul(e, nullptr, 10) : 0ul; }();
+  R9AxfxVerify& v = r9_axfx_state();
+  if (__builtin_expect(!on || (ctx.msr & 0x8000u), 0)) {
+    ++v.fallback;
+    return false;
+  }
+  ++v.calls;
+  if (__builtin_expect(every != 0, 0) && v.calls %% every == 0)
+    return nwii_r9_axfx_verify_begin(ctx);
+  if (__builtin_expect(++v.native == 2000 || v.native == 200000, 0)) nwii_r9_axfx_report(v);
+  nwii_r9_axfx_native(ctx);
+  return true;
+}
+'''
+
+
+def main():
+    d = sys.argv[1]
+    for name in sorted(os.listdir(d)):
+        if not re.match(r'output_\d+\.cpp$', name):
+            continue
+        p = os.path.join(d, name)
+        text = open(p).read()
+        span = find_function(text)
+        if not span:
+            continue
+        if MARK in text:
+            sys.exit('apply_r9_axfx: already applied to ' + p)
+        a, b = span
+        func = text[a:b]
+        sha = hashlib.sha256(func.encode()).hexdigest()
+        if sha != EXPECTED_SHA:
+            sys.exit('apply_r9_axfx: %s in %s is not the expected generated code (sha256 %s)' % (FUNC, name, sha))
+        lines = func.split('\n')
+        si = lines.index(START + ': ;')
+        ei = lines.index(END + ': ;')
+        native = build_native(lines[si + 1:ei])
+        hook = HOOK % {'func': FUNC, 'start': START, 'end': END}
+        lines.insert(si + 1, '    if (nwii_r9_axfx_801A3894(ctx)) goto %s;  %s' % (END, MARK))
+        ei = lines.index(END + ': ;')
+        lines.insert(ei + 1, '    if (__builtin_expect(r9_axfx_state().pending, 0)) nwii_r9_axfx_verify_end(ctx);  ' + MARK)
+        new = '\n'.join(native) + '\n' + hook + '\n' + '\n'.join(lines)
+        extra_inc = '#include <cstdlib>\n#include <vector>\n#include <iostream>\n'
+        text = text[:a] + new + text[b:]
+        # includes at the top (after the first #include line)
+        first_inc = text.index('#include')
+        eol = text.index('\n', first_inc) + 1
+        text = text[:eol] + extra_inc + text[eol:]
+        open(p, 'w').write(text)
+        print('apply_r9_axfx: %s in %s: native body of %d lines' % (FUNC, name, len(native)))
+        return
+    sys.exit('apply_r9_axfx: %s not found' % FUNC)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 2 and sys.argv[2] == '--sha':
+        d = sys.argv[1]
+        for name in sorted(os.listdir(d)):
+            if re.match(r'output_\d+\.cpp$', name):
+                t = open(os.path.join(d, name)).read()
+                s = find_function(t)
+                if s:
+                    print(name, hashlib.sha256(t[s[0]:s[1]].encode()).hexdigest())
+        sys.exit(0)
+    main()

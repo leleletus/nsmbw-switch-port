@@ -1,0 +1,231 @@
+--- a/output_24.cpp
++++ b/output_24.cpp
+@@ -0,0 +1 @@
++#line 1 "/home/djvemo/nsmbw-port/r9/r17pgo/m4src/export/output_24.cpp"
+@@ -55385 +55386 @@
+-struct A2AxStat { uint64_t calls = 0, t[4] = {0, 0, 0, 0}, n[4] = {0, 0, 0, 0}, kc_ok = 0, kc_bad = 0, ov_skip = 0; };
++struct A2AxStat { uint64_t calls = 0, t[5] = {0, 0, 0, 0, 0}, n[5] = {0, 0, 0, 0, 0}, kc_ok = 0, kc_bad = 0, ov_skip = 0; };  /* [r43a] [4] kernel 4 */
+@@ -55711 +55712 @@
+-              (unsigned long long)s.kc_bad, (unsigned long long)s.ov_skip);
++              (unsigned long long)s.kc_bad, (unsigned long long)s.ov_skip); if (s.n[4]) std::printf("[A43] axfx kernel4 %.1f us/call (%llu)\n", s.t[4] / tpu / s.n[4], (unsigned long long)s.n[4]);
+@@ -55715 +55716 @@
+-// NWII_AXFX_KCHECK round: kernel 2 vs kernel 1 on the same input. All writable regions are
++static NWII_NOINLINE void nwii_a43_axfx_k4(A2AxK& K); static int g_a43_kern = 2;  // [r43a] kernel 4 (al final del archivo) // NWII_AXFX_KCHECK round: kernel 2 (o 4) vs kernel 1 on the same input. All writable regions are
+@@ -55727 +55728 @@
+-  nwii_a2_axfx_k2(K2);
++  if (g_a43_kern == 4) nwii_a43_axfx_k4(K2); else nwii_a2_axfx_k2(K2);
+@@ -55759 +55760 @@
+-    return e[0] == '1' ? 1 : 2;
++    return e[0] == '1' ? 1 : e[0] == '4' ? (g_a43_kern = 4) : 2;  // [r43a] "4": kernel 4
+@@ -55890 +55891 @@
+-  if (use == 2 && !(a2_is_single(f1) && a2_is_single(f3) && a2_is_single(f4) && a2_is_single(f5) &&
++  if ((use == 2 || use == 4) && !(a2_is_single(f1) && a2_is_single(f3) && a2_is_single(f4) && a2_is_single(f5) &&
+@@ -55905 +55906 @@
+-    if (use == 2) nwii_a2_axfx_k2(K, nx); else nwii_a2_axfx_k1(K);
++    if (use == 4) nwii_a43_axfx_k4(K); else if (use == 2) nwii_a2_axfx_k2(K, nx); else nwii_a2_axfx_k1(K);
+@@ -55911 +55912 @@
+-    if (use == 2) nwii_a2_axfx_k2(K, nx); else nwii_a2_axfx_k1(K);
++    if (use == 4) nwii_a43_axfx_k4(K); else if (use == 2) nwii_a2_axfx_k2(K, nx); else nwii_a2_axfx_k1(K);
+@@ -83316,0 +83318,202 @@
++
++// ==== [r43a] (frente A) kernel 4 de la reverb AXFX (NWII_AXFX_KERNEL=4) ==============================
++// Mismas operaciones que el kernel 2, en float y en el mismo orden POR CANAL, pero los tres canales (L, R, S)
++// van juntos en los carriles 0-2 de un vector de 4 float (el 3 no se usa): las lineas de retardo de cada canal
++// son regiones disjuntas (el llamador lo comprueba antes de usar los kernels 2/4), asi que hacer los tres
++// canales a la vez no cambia ningun resultado; la suma/producto IEEE en float es la misma en escalar y en
++// vector (sin FMA: -ffp-contract=off). En la Switch el kernel 2 hace los canales uno detras de otro con una
++// cadena de dependencias larga y muchos registros derramados (265 ldr / 136 str en 0x16e8 bytes).
++// Comprobacion: NWII_AXFX_KERNEL=4 NWII_AXFX_KCHECK=n (kernel 4 frente al 1, byte a byte).
++namespace {
++typedef float a43v4f __attribute__((vector_size(16)));
++typedef uint32_t a43v4u __attribute__((vector_size(16)));
++typedef uint8_t a43v16b __attribute__((vector_size(16)));
++inline a43v4f a43_bs(a43v4u u) {
++  const a43v16b m = {3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12};
++  return (a43v4f)__builtin_shuffle((a43v16b)u, m);
++}
++#if defined(__aarch64__)
++inline a43v4f a43_ld(const uint8_t* p0, const uint8_t* p1, const uint8_t* p2) {
++  uint32_t a, b, c;
++  std::memcpy(&a, p0, 4);
++  std::memcpy(&b, p1, 4);
++  std::memcpy(&c, p2, 4);
++  return a43_bs((a43v4u){a, b, c, 0});  // rev32 de NEON
++}
++inline void a43_st(uint8_t* p0, uint8_t* p1, uint8_t* p2, a43v4f v) {
++  const a43v4u u = (a43v4u)a43_bs((a43v4u)v);
++  const uint32_t a = u[0], b = u[1], c = u[2];
++  std::memcpy(p0, &a, 4);
++  std::memcpy(p1, &b, 4);
++  std::memcpy(p2, &c, 4);
++}
++#else  // x86-64 sin SSSE3 (sin pshufb): el barajado de bytes sale carisimo; mismo resultado con bswap escalar
++inline a43v4f a43_ld(const uint8_t* p0, const uint8_t* p1, const uint8_t* p2) {
++  return (a43v4f){a2_rf(p0), a2_rf(p1), a2_rf(p2), 0.0f};
++}
++inline void a43_st(uint8_t* p0, uint8_t* p1, uint8_t* p2, a43v4f v) {
++  a2_wf(p0, v[0]);
++  a2_wf(p1, v[1]);
++  a2_wf(p2, v[2]);
++}
++#endif
++inline a43v4f a43_sp(float f) { return (a43v4f){f, f, f, f}; }
++}  // namespace
++
++static NWII_NOINLINE void nwii_a43_axfx_k4(A2AxK& K) {
++  static const bool pf_on = [] { const char* e = NWII_ENV("NWII_AXFX_PREFETCH"); return !(e && e[0] == '0'); }();
++  uint8_t* const in0 = K.in[0]; uint8_t* const in1 = K.in[1]; uint8_t* const in2 = K.in[2];
++  uint8_t* const sd0 = K.sd[0]; uint8_t* const sd1 = K.sd[1]; uint8_t* const sd2 = K.sd[2];
++  uint8_t* const ou0 = K.ou[0]; uint8_t* const ou1 = K.ou[1]; uint8_t* const ou2 = K.ou[2];
++  uint8_t* const E0 = K.E[0]; uint8_t* const E1 = K.E[1]; uint8_t* const E2 = K.E[2];
++  uint8_t* const P0 = K.PD[0]; uint8_t* const P1 = K.PD[1]; uint8_t* const P2 = K.PD[2];
++  uint8_t* const B0 = K.B3[0]; uint8_t* const B1 = K.B3[1]; uint8_t* const B2 = K.B3[2];
++  uint8_t* const C00 = K.C[0][0]; uint8_t* const C01 = K.C[0][1]; uint8_t* const C02 = K.C[0][2];
++  uint8_t* const C10 = K.C[1][0]; uint8_t* const C11 = K.C[1][1]; uint8_t* const C12 = K.C[1][2];
++  uint8_t* const C20 = K.C[2][0]; uint8_t* const C21 = K.C[2][1]; uint8_t* const C22 = K.C[2][2];
++  uint8_t* const A00 = K.A[0][0]; uint8_t* const A01 = K.A[0][1];
++  uint8_t* const A10 = K.A[1][0]; uint8_t* const A11 = K.A[1][1];
++  uint8_t* const A20 = K.A[2][0]; uint8_t* const A21 = K.A[2][1];
++  uint32_t ei0 = K.ei[0], ei1 = K.ei[1], ei2 = K.ei[2], pdi = K.pdi;
++  uint32_t ci0 = K.ci[0], ci1 = K.ci[1], ci2 = K.ci[2], ai0 = K.ai[0], ai1 = K.ai[1];
++  uint32_t bi0 = K.b3i[0], bi1 = K.b3i[1], bi2 = K.b3i[2];
++  const uint32_t esz = K.esz, pdn = K.pdn, g29 = K.g29;
++  const uint32_t cn0 = K.cn[0], cn1 = K.cn[1], cn2 = K.cn[2], an0 = K.an[0], an1 = K.an[1];
++  const uint32_t bn0 = K.b3n[0], bn1 = K.b3n[1], bn2 = K.b3n[2];
++  const bool send = K.send != 0, outp = K.outp != 0;
++  const a43v4f k32 = a43_sp((float)K.k32), k36 = a43_sp((float)K.k36), k40 = a43_sp((float)K.k40);
++  const a43v4f kc0 = a43_sp((float)K.kc[0]), kc1 = a43_sp((float)K.kc[1]), kc2 = a43_sp((float)K.kc[2]);
++  const float k320 = (float)K.k320, k324 = (float)K.k324;
++  const a43v4f z = a43_sp((float)K.z);
++  const a43v4f f1 = a43_sp((float)K.f1), f3 = a43_sp((float)K.f3), f4 = a43_sp((float)K.f4), f5 = a43_sp((float)K.f5);
++  const float f6 = (float)K.f6;
++  const double f0 = K.f0;
++  a43v4f lp = {(float)K.lp[0], (float)K.lp[1], (float)K.lp[2], 0.0f};
++  const uint64_t hi = K.hi;
++  // prefetch: funcion aparte que recibe los indices por valor (una lambda [&] no integrada obliga a tener todos
++  // los indices en la pila durante el bucle)
++  auto prefetch = [&K, send, outp, esz, pdn](uint32_t n, uint32_t d, uint32_t e0, uint32_t e1, uint32_t e2, uint32_t pd,
++                                            uint32_t c0, uint32_t c1, uint32_t c2, uint32_t a0, uint32_t a1, uint32_t b0,
++                                            uint32_t b1, uint32_t b2) __attribute__((noinline)) {
++    const uint32_t ci[3] = {c0, c1, c2}, ai[2] = {a0, a1}, bi[3] = {b0, b1, b2};
++    for (int ch = 0; ch < 3; ++ch) {
++      if (n + d < 96) {
++        __builtin_prefetch(K.in[ch] + 4 * (n + d), 1, 3);
++        if (send) __builtin_prefetch(K.sd[ch] + 4 * (n + d), 0, 3);
++        if (outp) __builtin_prefetch(K.ou[ch] + 4 * (n + d), 1, 3);
++      }
++      a2_pf(K.E[ch], e0, esz, d);
++      a2_pf(K.E[ch], e1, esz, d);
++      a2_pf(K.E[ch], e2, esz, d);
++      if (pdn != 0) a2_pf(K.PD[ch], pd, pdn, d);
++      for (int k = 0; k < 3; ++k) a2_pf(K.C[ch][k], ci[k], K.cn[k], d);
++      for (int k = 0; k < 2; ++k) a2_pf(K.A[ch][k], ai[k], K.an[k], d);
++      a2_pf(K.B3[ch], bi[ch], K.b3n[ch], d);
++    }
++  };
++  if (pf_on) {
++    prefetch(0, 0, ei0, ei1, ei2, pdi, ci0, ci1, ci2, ai0, ai1, bi0, bi1, bi2);
++    prefetch(0, 16, ei0, ei1, ei2, pdi, ci0, ci1, ci2, ai0, ai1, bi0, bi1, bi2);
++  }
++  auto in_f = [send, hi, f0](const uint8_t* ip, const uint8_t* sp_) __attribute__((always_inline)) -> float {
++    uint32_t x;
++    std::memcpy(&x, ip, 4);
++    x = __builtin_bswap32(x);
++    if (send) { uint32_t y; std::memcpy(&y, sp_, 4); x = x + __builtin_bswap32(y); }
++    return (float)(nwii::runtime::f64_from(hi | (uint32_t)(x ^ 0x80000000u)) - f0);
++  };
++  for (uint32_t n = 0; n < 95; ++n) {
++    if (pf_on && (n & 15) == 0) prefetch(n, 32, ei0, ei1, ei2, pdi, ci0, ci1, ci2, ai0, ai1, bi0, bi1, bi2);
++    const uint32_t o4 = 4 * n;
++    const a43v4f f11 = {in_f(in0 + o4, sd0 + o4), in_f(in1 + o4, sd1 + o4), in_f(in2 + o4, sd2 + o4), 0.0f};
++    // early reflections
++    a43v4f f8 = a43_ld(E0 + 4 * ei0, E1 + 4 * ei0, E2 + 4 * ei0);
++    a43v4f f2 = a43_ld(E0 + 4 * ei1, E1 + 4 * ei1, E2 + 4 * ei1);
++    f8 = k32 * f8;
++    a43v4f f9 = a43_ld(E0 + 4 * ei2, E1 + 4 * ei2, E2 + 4 * ei2);
++    f2 = k36 * f2;
++    a43_st(E0 + 4 * ei2, E1 + 4 * ei2, E2 + 4 * ei2, f11);
++    a43v4f f7 = k40 * f9;
++    f2 = f8 + f2;
++    f2 = f7 + f2;
++    // pre-delay
++    if (pdn != 0) {
++      f9 = a43_ld(P0 + 4 * pdi, P1 + 4 * pdi, P2 + 4 * pdi);
++      a43_st(P0 + 4 * pdi, P1 + 4 * pdi, P2 + 4 * pdi, f11);
++    } else {
++      f9 = f11;
++    }
++    // combs
++    a43v4f f10 = z;
++    f8 = a43_ld(C00 + 4 * ci0, C10 + 4 * ci0, C20 + 4 * ci0);
++    f7 = f8 * kc0; f10 = f10 + f8; f7 = f9 + f7;
++    a43_st(C00 + 4 * ci0, C10 + 4 * ci0, C20 + 4 * ci0, f7);
++    f8 = a43_ld(C01 + 4 * ci1, C11 + 4 * ci1, C21 + 4 * ci1);
++    f7 = f8 * kc1; f10 = f10 + f8; f7 = f9 + f7;
++    a43_st(C01 + 4 * ci1, C11 + 4 * ci1, C21 + 4 * ci1, f7);
++    f8 = a43_ld(C02 + 4 * ci2, C12 + 4 * ci2, C22 + 4 * ci2);
++    f7 = f8 * kc2; f10 = f10 + f8; f7 = f9 + f7;
++    a43_st(C02 + 4 * ci2, C12 + 4 * ci2, C22 + 4 * ci2, f7);
++    // all-passes
++    f8 = a43_ld(A00 + 4 * ai0, A10 + 4 * ai0, A20 + 4 * ai0);
++    f7 = f8 * f3; f7 = f10 + f7;
++    a43_st(A00 + 4 * ai0, A10 + 4 * ai0, A20 + 4 * ai0, f7);
++    f7 = f7 * f3; f8 = f8 - f7;
++    f9 = a43_ld(A01 + 4 * ai1, A11 + 4 * ai1, A21 + 4 * ai1);
++    f7 = f9 * f3; f7 = f8 + f7;
++    a43_st(A01 + 4 * ai1, A11 + 4 * ai1, A21 + 4 * ai1, f7);
++    f8 = f7 * f3;
++    // low-pass
++    f7 = lp;
++    f8 = f9 - f8;
++    f7 = f1 * f7;
++    f8 = f4 * f8;
++    f9 = f8 + f7;
++    lp = f9;
++    // per-channel all-pass (indice propio de cada canal)
++    f8 = a43_ld(B0 + 4 * bi0, B1 + 4 * bi1, B2 + 4 * bi2);
++    f7 = f8 * f3; f7 = f9 + f7;
++    a43_st(B0 + 4 * bi0, B1 + 4 * bi1, B2 + 4 * bi2, f7);
++    f7 = f7 * f3;
++    if (++bi0 >= bn0) bi0 = g29;
++    if (++bi1 >= bn1) bi1 = g29;
++    if (++bi2 >= bn2) bi2 = g29;
++    f7 = f8 - f7;
++    f7 = f7 * f5;
++    f2 = f7 + f2;
++    // cross-talk and outputs (L = ch0, R = ch1, S = ch2): escalar, como el kernel 2
++    const float fa = f2[0], fb = f2[1], fc = f2[2];
++    float g2 = fb + fc;
++    float g7 = fa + fc;
++    float g9 = g2 * f6;
++    float g8 = g7 * f6;
++    const float g13 = fa + fb;
++    g9 = fa + g9;
++    g8 = fb + g8;
++    g7 = g13 * f6;
++    g7 = fc + g7;
++    auto fct = [](float v) -> uint32_t { return __builtin_bswap32(nwii::runtime::ppc_fctiwz((double)v)); };
++    auto st = [](uint8_t* q, uint32_t v) { std::memcpy(q, &v, 4); };
++    st(in0 + o4, fct(g9 * k320));
++    st(in1 + o4, fct(g8 * k320));
++    st(in2 + o4, fct(g7 * k320));
++    if (outp) {
++      st(ou0 + o4, fct(g9 * k324));
++      st(ou1 + o4, fct(g8 * k324));
++      st(ou2 + o4, fct(g7 * k324));
++    }
++    if (++ei0 >= esz) ei0 = g29;
++    if (++ei1 >= esz) ei1 = g29;
++    if (++ei2 >= esz) ei2 = g29;
++    if (pdn != 0 && ++pdi >= pdn) pdi = g29;
++    if (++ci0 >= cn0) ci0 = g29;
++    if (++ci1 >= cn1) ci1 = g29;
++    if (++ci2 >= cn2) ci2 = g29;
++    if (++ai0 >= an0) ai0 = g29;
++    if (++ai1 >= an1) ai1 = g29;
++  }
++  K.ei[0] = ei0; K.ei[1] = ei1; K.ei[2] = ei2; K.pdi = pdi;
++  K.ci[0] = ci0; K.ci[1] = ci1; K.ci[2] = ci2; K.b3i[0] = bi0; K.b3i[1] = bi1; K.b3i[2] = bi2;
++  K.lp[0] = (double)lp[0]; K.lp[1] = (double)lp[1]; K.lp[2] = (double)lp[2];
++  K.ai[0] = ai0; K.ai[1] = ai1;
++}

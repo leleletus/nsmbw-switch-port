@@ -1,0 +1,92 @@
+diff --git a/mesa-imported/codegen/nv50_ir.cpp b/mesa-imported/codegen/nv50_ir.cpp
+index a7adec0..ef44695 100644
+--- a/mesa-imported/codegen/nv50_ir.cpp
++++ b/mesa-imported/codegen/nv50_ir.cpp
+@@ -590,6 +590,10 @@ void Instruction::init()
+    predSrc = -1;
+    flagsDef = -1;
+    flagsSrc = -1;
++
++#ifndef R15DK_UAM_UPSTREAM
++   sched = 0x7e0; // r15dk parche 1 (= SwitchWakerHD 6): sin barreras ni esperas
++#endif
+ }
+ 
+ Instruction::Instruction()
+diff --git a/mesa-imported/codegen/nv50_ir_emit_gm107.cpp b/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
+index 04717c8..aa317de 100644
+--- a/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
++++ b/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
+@@ -4119,7 +4119,11 @@ SchedDataCalculatorGM107::setDelay(Instruction *insn, int delay,
+    if (delay <= GM107_MIN_ISSUE_DELAY && (wr & rd) != 7) {
+       // Barriers take one additional clock cycle to become active on top of
+       // the clock consumed by the instruction producing it.
++#ifndef R15DK_UAM_UPSTREAM
++      if (!next || insn->bb != next->bb) { // r15dk parche 2 (= Mesa 20.1, SwitchWaker 8)
++#else
+       if (!next) {
++#endif
+          delay = 0x2;
+       } else {
+          int wt = getWtDepBar(next);
+@@ -4128,7 +4132,11 @@ SchedDataCalculatorGM107::setDelay(Instruction *insn, int delay,
+       }
+    }
+ 
++#ifndef R15DK_UAM_UPSTREAM
++   if (true) { // r15dk parche 3: sin dual issue (motas en SwitchWakerHD; Mesa 20.1 nunca lo usa)
++#else
+    if (lastDualIssued || !next || delay > 1 || !targ->canDualIssue(insn, next)) {
++#endif
+       delay = CLAMP(delay, GM107_MIN_ISSUE_DELAY, GM107_MAX_ISSUE_DELAY);
+       lastDualIssued = false;
+    } else {
+diff --git a/source/compiler_iface.cpp b/source/compiler_iface.cpp
+index 7ce5809..bf62aff 100644
+--- a/source/compiler_iface.cpp
++++ b/source/compiler_iface.cpp
+@@ -678,3 +678,32 @@ void DekoCompiler::OutputTgsi(const char* tgsiFile)
+ 		fclose(f);
+ 	}
+ }
++
++// r15dk parche 4: los mismos bytes que OutputDksh, a un buffer que da el llamador.
++void DekoCompiler::OutputDkshMem(void* (*grow)(void* user, size_t size), void* user)
++{
++	DkshHeader hdr = {};
++	hdr.magic        = DKSH_MAGIC;
++	hdr.header_sz    = sizeof(DkshHeader);
++	hdr.control_sz   = Align256(sizeof(DkshHeader) + sizeof(DkshProgramHeader));
++	hdr.code_sz      = Align256((m_stage != pipeline_stage_compute ? 0x80 : 0x00) + m_codeSize) + Align256(m_dataSize);
++	hdr.programs_off = sizeof(DkshHeader);
++	hdr.num_programs = 1;
++	size_t total = hdr.control_sz + hdr.code_sz;
++	uint8_t* p = (uint8_t*)grow(user, total);
++	if (!p) return;
++	memset(p, 0, total);
++	memcpy(p, &hdr, sizeof(hdr));
++	memcpy(p + sizeof(hdr), &m_dkph, sizeof(m_dkph));
++	size_t off = hdr.control_sz;
++	if (m_stage != pipeline_stage_compute)
++	{
++		static const char s_padding[s_shaderStartOffset] = "lol nvidia why did you make us waste space here";
++		memcpy(p + off, s_padding, sizeof(s_padding)); off += sizeof(s_padding);
++		memcpy(p + off, &m_nvsh, sizeof(m_nvsh)); off += sizeof(m_nvsh);
++	}
++	memcpy(p + off, m_code, m_codeSize); off += m_codeSize;
++	off = Align256(off);
++	if (m_dataSize)
++		memcpy(p + off, m_data, m_dataSize);
++}
+diff --git a/source/compiler_iface.h b/source/compiler_iface.h
+index 63e1042..19c0664 100644
+--- a/source/compiler_iface.h
++++ b/source/compiler_iface.h
+@@ -39,6 +39,7 @@ public:
+ 
+ 	bool CompileGlsl(const char* glsl);
+ 	void OutputDksh(const char* dkshFile);
++	void OutputDkshMem(void* (*grow)(void* user, size_t size), void* user); // r15dk parche 4
+ 	void OutputRawCode(const char* rawFile);
+ 	void OutputTgsi(const char* tgsiFile);
+ };

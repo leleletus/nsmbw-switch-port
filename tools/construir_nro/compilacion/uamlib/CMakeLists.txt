@@ -1,0 +1,45 @@
+# uamlib: uam 1.1.0 (devkitPro) con los parches «r15dk» como biblioteca estática, sin meson (copia de r9/r15dk/ext/uamlib).
+# Los ficheros generados (bison/flex/mako) vienen en terceros/uam_gen.
+cmake_minimum_required(VERSION 3.16)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  project(uamlib C CXX)
+  if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+  endif()
+endif()
+set(UAM "" CACHE PATH "fuente de devkitPro/uam (commit 5a5afc2 + material/uam_r15dk.patch)")
+set(GEN "" CACHE PATH "ficheros generados de uam (terceros/uam_gen)")
+set(SRC
+  ${UAM}/source/compiler_iface.cpp ${UAM}/source/glsl_frontend.cpp ${UAM}/source/mini-os.c
+  ${UAM}/source/tgsi_support.cpp ${CMAKE_CURRENT_SOURCE_DIR}/uam_api.cpp
+  ${GEN}/glsl/glsl_parser.cpp ${GEN}/glsl/glsl_lexer.cpp
+  ${GEN}/glsl/glcpp/glcpp-parse.c ${GEN}/glsl/glcpp/glcpp-lex.c)
+foreach(sub codegen tgsi util cso_cache glsl glsl/glcpp compiler program state_tracker main)
+  file(READ ${UAM}/mesa-imported/${sub}/meson.build _mb)
+  string(REGEX MATCHALL "files\\(([^)]*)\\)" _blocks "${_mb}")
+  foreach(_b IN LISTS _blocks)
+    string(REGEX MATCHALL "'[^']+'" _names "${_b}")
+    foreach(_n IN LISTS _names)
+      string(REPLACE "'" "" _n "${_n}")
+      list(APPEND SRC ${UAM}/mesa-imported/${sub}/${_n})
+    endforeach()
+  endforeach()
+endforeach()
+list(REMOVE_DUPLICATES SRC)
+add_library(uamlib STATIC ${SRC})
+target_include_directories(uamlib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(uamlib PRIVATE ${UAM}/source ${UAM}/mesa-imported ${GEN} ${GEN}/glsl ${GEN}/glsl/glcpp
+  ${UAM}/mesa-imported/glsl ${UAM}/mesa-imported/glsl/glcpp)
+set_target_properties(uamlib PROPERTIES C_STANDARD 99 CXX_STANDARD 11)
+target_compile_definitions(uamlib PRIVATE "PACKAGE_STRING=\"uam 1.1.0 r15dk\"" DESKTOP _USE_MATH_DEFINES NDEBUG
+  _GNU_SOURCE HAVE_POSIX_MEMALIGN)
+target_compile_options(uamlib PRIVATE -ffunction-sections -fdata-sections -w -O2)
+if(NOT DEFINED NX_ROOT)
+  add_executable(uam_r15dk ${UAM}/source/main.cpp)
+  target_include_directories(uam_r15dk PRIVATE ${UAM}/source ${UAM}/mesa-imported ${GEN}/glsl)
+  target_compile_definitions(uam_r15dk PRIVATE "PACKAGE_STRING=\"uam 1.1.0 r15dk\"" DESKTOP NDEBUG)
+  target_compile_options(uam_r15dk PRIVATE -w)
+  target_link_libraries(uam_r15dk PRIVATE uamlib)
+  add_executable(uam_dksh_dump ${CMAKE_CURRENT_SOURCE_DIR}/uam_dksh_dump.cpp)
+  target_link_libraries(uam_dksh_dump PRIVATE uamlib)
+endif()

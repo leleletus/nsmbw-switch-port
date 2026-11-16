@@ -1,0 +1,972 @@
+--- a/output_24.cpp
++++ b/output_24.cpp
+@@ -52892,0 +52893,2 @@
++#include <cstdio>
++#include <cstring>
+@@ -52893,0 +52896,13 @@
++// [a2axfx] r16a2: the loop itself is a separate kernel; two versions (NWII_AXFX_KERNEL):
++//   1 = the r9 loop (doubles, ppc_single after every operation), kept for A/B and checks;
++//   2 = (default) the same operations in float. Every operand is a single (lfs / earlier
++//       single results; checked below), so float a op b == (double)(float)((double)a op (double)b)
++//       for + - * (exact product / double rounding is innocuous: 53 >= 2*24+2), and
++//       ppc_single_bits() of a single is its float bits. Same order of operations and memory
++//       accesses per channel; plus software prefetch of the delay lines (they are read once
++//       per delay period, so every line is a cache miss; the A57 prefetcher does not follow
++//       ~35 streams at once).
++//   ab = alternate 1 and 2 call by call (same result; for the timing line).
++// NWII_AXFX_KCHECK=n: every n-th call run kernel 2, keep its result, restore the regions and
++// run kernel 1, compare (cheap: only the regions the loop can write). [A2] lines in the log.
++// NWII_AXFX_TIME=1 (default on): [A2] axfx line every 3000 calls with the time per call.
+@@ -52896,0 +52912,16 @@
++struct A2AxK {
++  uint8_t *in[3], *sd[3], *E[3], *PD[3], *C[3][3], *A[3][2], *B3[3], *ou[3];
++  uint32_t ei[3], pdi, ci[3], ai[2], b3i[3];
++  uint32_t esz, pdn, cn[3], an[2], b3n[3], g29, send, outp;
++  uint64_t hi;
++  double k32, k36, k40, kc[3], k320, k324, z, lp[3], f0, f1, f3, f4, f5, f6;
++};
++inline uint64_t a2_ticks() {
++#if defined(__aarch64__)
++  uint64_t t;
++  asm volatile("mrs %0, cntpct_el0" : "=r"(t));  // as libnx armGetSystemTick (cntvct_el0 traps on Horizon)
++  return t;
++#else
++  return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch()).count();
++#endif
+@@ -52898,13 +52929,16 @@
+-static NWII_NOINLINE bool nwii_r9_axfx_fast(nwii::runtime::MemView& mv, uint32_t g0, uint32_t g1, uint32_t g2,
+-                                            uint32_t g4, uint32_t g29, uint32_t& g3, uint32_t& g5, uint32_t& g6,
+-                                            double f0, double f1, double f3, double f4, double f5, double f6,
+-                                            uint64_t& ic) {
+-  using nwii::runtime::MMU;
+-  static const bool on = [] { const char* e = NWII_ENV("NWII_AXFX_FAST"); return !(e && e[0] == '0'); }();
+-  if (!on || mv.watch) return false;
+-  auto pa = [](uint32_t a) -> uint32_t { return a & 0x3FFFFFFFu; };
+-  auto okr = [](uint32_t p, uint64_t n) -> bool {
+-    return n > 0 && ((p >= 0x10u && (uint64_t)p + n <= MMU::kMem1Size) ||
+-                     (p >= 0x10000000u && (uint64_t)p + n <= 0x10000000ull + MMU::kMem2Size));
+-  };
+-  auto hp = [&](uint32_t p) -> uint8_t* { return p < 0x10000000u ? mv.b1 + p : mv.b2 + (p - 0x10000000u); };
++inline double a2_ticks_per_us() {
++#if defined(__aarch64__)
++  uint64_t f;
++  asm volatile("mrs %0, cntfrq_el0" : "=r"(f));
++  return f ? f / 1e6 : 19.2;
++#else
++  return 1000.0;
++#endif
++}
++// t/n[1] kernel 1, [2] kernel 2, [3] kernel 2 + L2 prefetch of the next call's lines
++struct A2AxStat { uint64_t calls = 0, t[4] = {0, 0, 0, 0}, n[4] = {0, 0, 0, 0}, kc_ok = 0, kc_bad = 0, ov_skip = 0; };
++A2AxStat g_a2_ax;
++}  // namespace
++
++// kernel 1: the r9 loop, unchanged
++static NWII_NOINLINE void nwii_a2_axfx_k1(A2AxK& K) {
+@@ -52915 +52948,0 @@
+-  // stfs + lfs of the same slot (the guest does this through its stack)
+@@ -52919,78 +52952,8 @@
+-
+-  R9AxRgn rg[48];
+-  int nr = 0;
+-  auto add = [&](uint32_t vaddr, uint64_t n, bool w) -> bool {
+-    const uint32_t p = pa(vaddr);
+-    if (!okr(p, n)) return false;
+-    rg[nr++] = {p, (uint32_t)n, w};
+-    return true;
+-  };
+-  // the struct (offsets 0..327), the SDA2 constants (r2-20804..r2-20776), the stack frame slots
+-  if (!add(g4, 328, true) || !add(g2 - 20804u, 28, false) || !add(g1 + 8u, 72, true)) return false;
+-  uint8_t* const R = hp(pa(g4));
+-  uint8_t* const S = hp(pa(g1 + 8u)) - 8;  // S + off = guest r1 + off
+-  const uint32_t send = rd32(R + 312), outp = rd32(R + 316);
+-  const uint32_t esz = rd32(R + 24), pdn = rd32(R + 60);
+-  uint32_t ei[3] = {rd32(R + 12), rd32(R + 16), rd32(R + 20)};
+-  uint32_t pdi = rd32(R + 56);
+-  uint32_t ci[3] = {rd32(R + 104), rd32(R + 108), rd32(R + 112)};
+-  const uint32_t cn[3] = {rd32(R + 116), rd32(R + 120), rd32(R + 124)};
+-  uint32_t ai[2] = {rd32(R + 176), rd32(R + 180)};
+-  const uint32_t an[2] = {rd32(R + 184), rd32(R + 188)};
+-  if (esz == 0 || ei[0] >= esz || ei[1] >= esz || ei[2] >= esz) return false;
+-  if (pdn != 0 && pdi >= pdn) return false;
+-  for (int k = 0; k < 3; ++k) if (ci[k] >= cn[k]) return false;
+-  for (int k = 0; k < 2; ++k) if (ai[k] >= an[k]) return false;
+-  uint8_t *in[3], *sd[3] = {}, *E[3], *PD[3] = {}, *C[3][3], *A[3][2], *B3[3], *ou[3] = {};
+-  uint32_t b3i[3], b3n[3];
+-  const uint32_t outv[3] = {g3, g5, g6};
+-  for (int ch = 0; ch < 3; ++ch) {
+-    const uint32_t vin = rd32(S + 44 + 4 * ch);
+-    if (!add(vin, 96 * 4, true)) return false;
+-    in[ch] = hp(pa(vin));
+-    if (send != 0) {
+-      const uint32_t vs = rd32(S + 8 + 4 * ch);
+-      if (!add(vs, 96 * 4, false)) return false;
+-      sd[ch] = hp(pa(vs));
+-    }
+-    if (outp != 0) {
+-      if (!add(outv[ch], 96 * 4, true)) return false;
+-      ou[ch] = hp(pa(outv[ch]));
+-    }
+-    const uint32_t ve = rd32(R + 0 + 4 * ch);
+-    if (!add(ve, 4ull * esz, true)) return false;
+-    E[ch] = hp(pa(ve));
+-    if (pdn != 0) {
+-      const uint32_t vp = rd32(R + 44 + 4 * ch);
+-      if (!add(vp, 4ull * pdn, true)) return false;
+-      PD[ch] = hp(pa(vp));
+-    }
+-    for (int k = 0; k < 3; ++k) {
+-      const uint32_t vc = rd32(R + 68 + 12 * ch + 4 * k);
+-      if (!add(vc, 4ull * cn[k], true)) return false;
+-      C[ch][k] = hp(pa(vc));
+-    }
+-    for (int k = 0; k < 2; ++k) {
+-      const uint32_t va = rd32(R + 152 + 8 * ch + 4 * k);
+-      if (!add(va, 4ull * an[k], true)) return false;
+-      A[ch][k] = hp(pa(va));
+-    }
+-    const uint32_t vb = rd32(R + 200 + 4 * ch);
+-    b3i[ch] = rd32(R + 212 + 4 * ch);
+-    b3n[ch] = rd32(R + 224 + 4 * ch);
+-    if (b3i[ch] >= b3n[ch] || !add(vb, 4ull * b3n[ch], true)) return false;
+-    B3[ch] = hp(pa(vb));
+-  }
+-  for (int i = 0; i < nr; ++i)
+-    for (int j = i + 1; j < nr; ++j)
+-      if ((rg[i].w || rg[j].w) && (uint64_t)rg[i].p < (uint64_t)rg[j].p + rg[j].n &&
+-          (uint64_t)rg[j].p < (uint64_t)rg[i].p + rg[i].n)
+-        return false;
+-
+-  // loop-invariant values (struct fields the loop only reads, constants)
+-  const double k32 = rdf(R + 32), k36 = rdf(R + 36), k40 = rdf(R + 40);
+-  const double kc[3] = {rdf(R + 140), rdf(R + 144), rdf(R + 148)};
+-  const double k320 = rdf(R + 320), k324 = rdf(R + 324);
+-  const double z = rdf(hp(pa(g2 - 20804u)));  // lfs f10, -20804(r2)
+-  double lp[3] = {rdf(R + 252), rdf(R + 256), rdf(R + 260)};
+-  const uint64_t hi = (uint64_t)g0 << 32;
++  uint8_t *const *in = K.in, *const *sd = K.sd, *const *E = K.E, *const *PD = K.PD, *const *B3 = K.B3, *const *ou = K.ou;
++  uint32_t* ei = K.ei; uint32_t& pdi = K.pdi; uint32_t* ci = K.ci; uint32_t* ai = K.ai; uint32_t* b3i = K.b3i;
++  const uint32_t esz = K.esz, pdn = K.pdn, *cn = K.cn, *an = K.an, *b3n = K.b3n, g29 = K.g29;
++  const uint32_t send = K.send, outp = K.outp;
++  const double k32 = K.k32, k36 = K.k36, k40 = K.k40, *kc = K.kc, k320 = K.k320, k324 = K.k324, z = K.z;
++  const double f0 = K.f0, f1 = K.f1, f3 = K.f3, f4 = K.f4, f5 = K.f5, f6 = K.f6;
++  double* lp = K.lp;
++  const uint64_t hi = K.hi;
+@@ -53025 +52988 @@
+-        uint8_t* const q = C[ch][k] + 4 * ci[k];
++        uint8_t* const q = K.C[ch][k] + 4 * ci[k];
+@@ -53034 +52997 @@
+-        uint8_t* const q = A[ch][0] + 4 * ai[0];
++        uint8_t* const q = K.A[ch][0] + 4 * ai[0];
+@@ -53043 +53006 @@
+-        uint8_t* const q = A[ch][1] + 4 * ai[1];
++        uint8_t* const q = K.A[ch][1] + 4 * ai[1];
+@@ -53098,0 +53062,407 @@
++}
++
++// kernel 2: the same in float, with prefetch (see the header comment)
++static inline float a2_rf(const uint8_t* q) {
++  uint32_t v;
++  std::memcpy(&v, q, 4);
++  v = __builtin_bswap32(v);
++  float f;
++  std::memcpy(&f, &v, 4);
++  return f;
++}
++static inline void a2_wf(uint8_t* q, float f) {
++  uint32_t v;
++  std::memcpy(&v, &f, 4);
++  v = __builtin_bswap32(v);
++  std::memcpy(q, &v, 4);
++}
++// prefetch the line holding element i+d of a ring of n 4-byte elements (wrapping to 0)
++static inline void a2_pf(const uint8_t* base, uint32_t i, uint32_t n, uint32_t d) {
++  uint32_t j = i + d;
++  if (j >= n) { j -= n; if (j >= n) j %= n; }
++  __builtin_prefetch(base + 4u * j, 1, 3);
++}
++static inline void a2_pf2(const uint8_t* base, uint32_t i, uint32_t n, uint32_t d) {
++  uint32_t j = i + d;
++  if (j >= n) { j -= n; if (j >= n) j %= n; }
++  __builtin_prefetch(base + 4u * j, 1, 2);
++}
++static NWII_NOINLINE void nwii_a2_axfx_k2(A2AxK& K, bool pf_next = false) {
++  static const bool pf_on = [] { const char* e = NWII_ENV("NWII_AXFX_PREFETCH"); return !(e && e[0] == '0'); }();
++  uint8_t *const *in = K.in, *const *sd = K.sd, *const *E = K.E, *const *PD = K.PD, *const *B3 = K.B3, *const *ou = K.ou;
++  uint32_t ei0 = K.ei[0], ei1 = K.ei[1], ei2 = K.ei[2], pdi = K.pdi;
++  uint32_t ci[3] = {K.ci[0], K.ci[1], K.ci[2]}, ai[2] = {K.ai[0], K.ai[1]};
++  uint32_t b3i[3] = {K.b3i[0], K.b3i[1], K.b3i[2]};
++  const uint32_t esz = K.esz, pdn = K.pdn, g29 = K.g29;
++  const uint32_t cn[3] = {K.cn[0], K.cn[1], K.cn[2]}, an[2] = {K.an[0], K.an[1]};
++  const uint32_t b3n[3] = {K.b3n[0], K.b3n[1], K.b3n[2]};
++  const bool send = K.send != 0, outp = K.outp != 0;
++  const float k32 = (float)K.k32, k36 = (float)K.k36, k40 = (float)K.k40;
++  const float kc[3] = {(float)K.kc[0], (float)K.kc[1], (float)K.kc[2]};
++  const double k320 = K.k320, k324 = K.k324;
++  const float z = (float)K.z;
++  const float f1 = (float)K.f1, f3 = (float)K.f3, f4 = (float)K.f4, f5 = (float)K.f5, f6 = (float)K.f6;
++  const double f0 = K.f0;
++  float lp[3] = {(float)K.lp[0], (float)K.lp[1], (float)K.lp[2]};
++  const uint64_t hi = K.hi;
++  // prefetch of every stream d elements ahead
++  auto prefetch = [&](uint32_t n, uint32_t d) {
++    for (int ch = 0; ch < 3; ++ch) {
++      if (n + d < 96) {
++        __builtin_prefetch(in[ch] + 4 * (n + d), 1, 3);
++        if (send) __builtin_prefetch(sd[ch] + 4 * (n + d), 0, 3);
++        if (outp) __builtin_prefetch(ou[ch] + 4 * (n + d), 1, 3);
++      }
++      a2_pf(E[ch], ei0, esz, d);
++      a2_pf(E[ch], ei1, esz, d);
++      a2_pf(E[ch], ei2, esz, d);
++      if (pdn != 0) a2_pf(PD[ch], pdi, pdn, d);
++      for (int k = 0; k < 3; ++k) a2_pf(K.C[ch][k], ci[k], cn[k], d);
++      for (int k = 0; k < 2; ++k) a2_pf(K.A[ch][k], ai[k], an[k], d);
++      a2_pf(B3[ch], b3i[ch], b3n[ch], d);
++    }
++  };
++  if (pf_on) { prefetch(0, 0); prefetch(0, 16); }
++  for (uint32_t n = 0; n < 95; ++n) {
++    if (pf_on && (n & 15) == 0) prefetch(n, 32);
++    float acc[3];
++    for (int ch = 0; ch < 3; ++ch) {
++      uint32_t x;
++      std::memcpy(&x, in[ch] + 4 * n, 4);
++      x = __builtin_bswap32(x);
++      if (send) { uint32_t y; std::memcpy(&y, sd[ch] + 4 * n, 4); x = x + __builtin_bswap32(y); }
++      const float f11 = (float)(nwii::runtime::f64_from(hi | (uint32_t)(x ^ 0x80000000u)) - f0);
++      // early reflections
++      uint8_t* const e = E[ch];
++      float f8 = a2_rf(e + 4 * ei0);
++      float f2 = a2_rf(e + 4 * ei1);
++      f8 = k32 * f8;
++      float f9 = a2_rf(e + 4 * ei2);
++      f2 = k36 * f2;
++      a2_wf(e + 4 * ei2, f11);
++      float f7 = k40 * f9;
++      f2 = f8 + f2;
++      f2 = f7 + f2;
++      // pre-delay
++      if (pdn != 0) {
++        f9 = a2_rf(PD[ch] + 4 * pdi);
++        a2_wf(PD[ch] + 4 * pdi, f11);
++      } else {
++        f9 = f11;
++      }
++      // combs
++      float f10 = z;
++      for (int k = 0; k < 3; ++k) {
++        uint8_t* const q = K.C[ch][k] + 4 * ci[k];
++        f8 = a2_rf(q);
++        f7 = f8 * kc[k];
++        f10 = f10 + f8;
++        f7 = f9 + f7;
++        a2_wf(q, f7);
++      }
++      // all-passes
++      {
++        uint8_t* const q = K.A[ch][0] + 4 * ai[0];
++        f8 = a2_rf(q);
++        f7 = f8 * f3;
++        f7 = f10 + f7;
++        a2_wf(q, f7);
++        f7 = f7 * f3;
++        f8 = f8 - f7;
++      }
++      {
++        uint8_t* const q = K.A[ch][1] + 4 * ai[1];
++        f9 = a2_rf(q);
++        f7 = f9 * f3;
++        f7 = f8 + f7;
++        a2_wf(q, f7);
++        f8 = f7 * f3;
++      }
++      // low-pass
++      f7 = lp[ch];
++      f8 = f9 - f8;
++      f7 = f1 * f7;
++      f8 = f4 * f8;
++      f9 = f8 + f7;
++      lp[ch] = f9;
++      // per-channel all-pass
++      {
++        uint8_t* const q = B3[ch] + 4 * b3i[ch];
++        f8 = a2_rf(q);
++        f7 = f8 * f3;
++        f7 = f9 + f7;
++        a2_wf(q, f7);
++        f7 = f7 * f3;
++        if (++b3i[ch] >= b3n[ch]) b3i[ch] = g29;
++        f7 = f8 - f7;
++      }
++      f7 = f7 * f5;
++      f2 = f7 + f2;
++      acc[ch] = f2;
++    }
++    // cross-talk and outputs (L = ch0, R = ch1, S = ch2)
++    const float f10 = acc[0], f12 = acc[1], f11 = acc[2];
++    float f2 = f12 + f11;
++    float f7 = f10 + f11;
++    float f9 = f2 * f6;
++    float f8 = f7 * f6;
++    const float f13 = f10 + f12;
++    f9 = f10 + f9;
++    f8 = f12 + f8;
++    f7 = f13 * f6;
++    f7 = f11 + f7;
++    auto fct = [](float v) -> uint32_t { return __builtin_bswap32(nwii::runtime::ppc_fctiwz((double)v)); };
++    auto st = [](uint8_t* q, uint32_t v) { std::memcpy(q, &v, 4); };
++    st(in[0] + 4 * n, fct(f9 * (float)k320));
++    st(in[1] + 4 * n, fct(f8 * (float)k320));
++    st(in[2] + 4 * n, fct(f7 * (float)k320));
++    if (outp) {
++      st(ou[0] + 4 * n, fct(f9 * (float)k324));
++      st(ou[1] + 4 * n, fct(f8 * (float)k324));
++      st(ou[2] + 4 * n, fct(f7 * (float)k324));
++    }
++    // indices
++    if (++ei0 >= esz) ei0 = g29;
++    if (++ei1 >= esz) ei1 = g29;
++    if (++ei2 >= esz) ei2 = g29;
++    if (pdn != 0 && ++pdi >= pdn) pdi = g29;
++    for (int k = 0; k < 3; ++k) if (++ci[k] >= cn[k]) ci[k] = g29;
++    for (int k = 0; k < 2; ++k) if (++ai[k] >= an[k]) ai[k] = g29;
++  }
++  K.ei[0] = ei0; K.ei[1] = ei1; K.ei[2] = ei2; K.pdi = pdi;
++  for (int k = 0; k < 3; ++k) { K.ci[k] = ci[k]; K.b3i[k] = b3i[k]; K.lp[k] = (double)lp[k]; }
++  K.ai[0] = ai[0]; K.ai[1] = ai[1];
++  // [a2pfnext] the next call (3 ms later) reads the following 95 elements of every delay line:
++  // ask for them now, into L2 only (PSTL2KEEP), so that call starts with them near.
++  if (pf_next) {
++    auto pr = [](const uint8_t* b, uint32_t i, uint32_t n) {
++      for (uint32_t d = 0; d < 96 + 16; d += 16) a2_pf2(b, i, n, d);
++    };
++    for (int ch = 0; ch < 3; ++ch) {
++      pr(E[ch], ei0, esz); pr(E[ch], ei1, esz); pr(E[ch], ei2, esz);
++      if (pdn != 0) pr(PD[ch], pdi, pdn);
++      for (int k = 0; k < 3; ++k) pr(K.C[ch][k], ci[k], cn[k]);
++      for (int k = 0; k < 2; ++k) pr(K.A[ch][k], ai[k], an[k]);
++      pr(B3[ch], b3i[ch], b3n[ch]);
++    }
++  }
++}
++
++// is d exactly a single (bit for bit after a float round trip)?
++static inline bool a2_is_single(double d) {
++  const double r = (double)(float)d;
++  return std::memcmp(&r, &d, 8) == 0;
++}
++
++static NWII_NOINLINE void nwii_a2_axfx_report() {
++  const A2AxStat& s = g_a2_ax;
++  const double tpu = a2_ticks_per_us();
++  std::printf("[A2] axfx %llu calls: kernel1 %.1f us/call (%llu), kernel2 %.1f us/call (%llu), kernel2+next %.1f us/call (%llu), "
++              "kcheck ok=%llu bad=%llu, overlap check skipped %llu\n",
++              (unsigned long long)s.calls, s.n[1] ? s.t[1] / tpu / s.n[1] : 0.0, (unsigned long long)s.n[1],
++              s.n[2] ? s.t[2] / tpu / s.n[2] : 0.0, (unsigned long long)s.n[2],
++              s.n[3] ? s.t[3] / tpu / s.n[3] : 0.0, (unsigned long long)s.n[3], (unsigned long long)s.kc_ok,
++              (unsigned long long)s.kc_bad, (unsigned long long)s.ov_skip);
++  std::fflush(stdout);
++}
++
++// NWII_AXFX_KCHECK round: kernel 2 vs kernel 1 on the same input. All writable regions are
++// disjoint (checked before), so saving and restoring them is enough.
++static NWII_NOINLINE void nwii_a2_axfx_kcheck(A2AxK& K, const R9AxRgn* rg, int nr,
++                                             uint8_t* (*hp)(void*, uint32_t), void* hpctx) {
++  static std::vector<uint8_t> save, res;
++  size_t tot = 0;
++  for (int i = 0; i < nr; ++i) if (rg[i].w) tot += rg[i].n;
++  save.resize(tot);
++  res.resize(tot);
++  size_t o = 0;
++  for (int i = 0; i < nr; ++i) if (rg[i].w) { std::memcpy(save.data() + o, hp(hpctx, rg[i].p), rg[i].n); o += rg[i].n; }
++  A2AxK K2 = K;
++  nwii_a2_axfx_k2(K2);
++  o = 0;
++  for (int i = 0; i < nr; ++i) if (rg[i].w) { std::memcpy(res.data() + o, hp(hpctx, rg[i].p), rg[i].n); o += rg[i].n; }
++  o = 0;
++  for (int i = 0; i < nr; ++i) if (rg[i].w) { std::memcpy(hp(hpctx, rg[i].p), save.data() + o, rg[i].n); o += rg[i].n; }
++  nwii_a2_axfx_k1(K);
++  bool good = std::memcmp(&K, &K2, sizeof K) == 0;
++  size_t nb = 0;
++  o = 0;
++  for (int i = 0; i < nr; ++i) if (rg[i].w) {
++    const uint8_t* p = hp(hpctx, rg[i].p);
++    for (uint32_t j = 0; j < rg[i].n; ++j) nb += p[j] != res[o + j];
++    o += rg[i].n;
++  }
++  if (nb) good = false;
++  if (good) ++g_a2_ax.kc_ok; else ++g_a2_ax.kc_bad;
++  if (!good && g_a2_ax.kc_bad <= 20)
++    std::printf("[A2] axfx kcheck MISMATCH call %llu: %zu bytes differ, state %s\n",
++                (unsigned long long)g_a2_ax.calls, nb, std::memcmp(&K, &K2, sizeof K) ? "differs" : "same");
++}
++
++static NWII_NOINLINE bool nwii_r9_axfx_fast(nwii::runtime::MemView& mv, uint32_t g0, uint32_t g1, uint32_t g2,
++                                            uint32_t g4, uint32_t g29, uint32_t& g3, uint32_t& g5, uint32_t& g6,
++                                            double f0, double f1, double f3, double f4, double f5, double f6,
++                                            uint64_t& ic) {
++  using nwii::runtime::MMU;
++  static const bool on = [] { const char* e = NWII_ENV("NWII_AXFX_FAST"); return !(e && e[0] == '0'); }();
++  // 1, 2 or 3 (= alternate)
++  static const int kern = [] {
++    const char* e = NWII_ENV("NWII_AXFX_KERNEL");
++    if (!e || !e[0]) return 2;
++    if (e[0] == 'a') return 3;
++    return e[0] == '1' ? 1 : 2;
++  }();
++  static const unsigned long kcheck = [] { const char* e = NWII_ENV("NWII_AXFX_KCHECK"); return e ? std::strtoul(e, nullptr, 10) : 0ul; }();
++  // NWII_AXFX_PFNEXT: 0 (default: the console measured it ~1 us/call worse) off, 1 on,
++  // "ab" = alternate in blocks of 1000 calls (both timings on the [A2] line)
++  static const int pfnext = [] {
++    const char* e = NWII_ENV("NWII_AXFX_PFNEXT");
++    if (!e || !e[0]) return 0;
++    if (e[0] == 'a') return 2;
++    return e[0] == '1' ? 1 : 0;
++  }();
++  static const bool timing = [] { const char* e = NWII_ENV("NWII_AXFX_TIME"); return !(e && e[0] == '0'); }();
++  if (!on || mv.watch) return false;
++  auto pa = [](uint32_t a) -> uint32_t { return a & 0x3FFFFFFFu; };
++  auto okr = [](uint32_t p, uint64_t n) -> bool {
++    return n > 0 && ((p >= 0x10u && (uint64_t)p + n <= MMU::kMem1Size) ||
++                     (p >= 0x10000000u && (uint64_t)p + n <= 0x10000000ull + MMU::kMem2Size));
++  };
++  auto hp = [&](uint32_t p) -> uint8_t* { return p < 0x10000000u ? mv.b1 + p : mv.b2 + (p - 0x10000000u); };
++  auto rd32 = [](const uint8_t* q) -> uint32_t { uint32_t v; std::memcpy(&v, q, 4); return __builtin_bswap32(v); };
++  auto wr32 = [](uint8_t* q, uint32_t v) { v = __builtin_bswap32(v); std::memcpy(q, &v, 4); };
++  auto rdf = [&](const uint8_t* q) -> double { const uint32_t b = rd32(q); float f; std::memcpy(&f, &b, 4); return (double)f; };
++  auto wrf = [&](uint8_t* q, double d) { wr32(q, nwii::runtime::ppc_single_bits(d)); };
++
++  R9AxRgn rg[48];
++  int nr = 0;
++  auto add = [&](uint32_t vaddr, uint64_t n, bool w) -> bool {
++    const uint32_t p = pa(vaddr);
++    if (!okr(p, n)) return false;
++    rg[nr++] = {p, (uint32_t)n, w};
++    return true;
++  };
++  // the struct (offsets 0..327), the SDA2 constants (r2-20804..r2-20776), the stack frame slots
++  if (!add(g4, 328, true) || !add(g2 - 20804u, 28, false) || !add(g1 + 8u, 72, true)) return false;
++  uint8_t* const R = hp(pa(g4));
++  uint8_t* const S = hp(pa(g1 + 8u)) - 8;  // S + off = guest r1 + off
++  A2AxK K;
++  K.send = rd32(R + 312);
++  K.outp = rd32(R + 316);
++  const uint32_t send = K.send, outp = K.outp;
++  const uint32_t esz = rd32(R + 24), pdn = rd32(R + 60);
++  K.esz = esz; K.pdn = pdn; K.g29 = g29;
++  uint32_t* const ei = K.ei;
++  ei[0] = rd32(R + 12); ei[1] = rd32(R + 16); ei[2] = rd32(R + 20);
++  K.pdi = rd32(R + 56);
++  uint32_t* const ci = K.ci;
++  ci[0] = rd32(R + 104); ci[1] = rd32(R + 108); ci[2] = rd32(R + 112);
++  uint32_t* const cn = K.cn;
++  cn[0] = rd32(R + 116); cn[1] = rd32(R + 120); cn[2] = rd32(R + 124);
++  uint32_t* const ai = K.ai;
++  ai[0] = rd32(R + 176); ai[1] = rd32(R + 180);
++  uint32_t* const an = K.an;
++  an[0] = rd32(R + 184); an[1] = rd32(R + 188);
++  if (esz == 0 || ei[0] >= esz || ei[1] >= esz || ei[2] >= esz) return false;
++  if (pdn != 0 && K.pdi >= pdn) return false;
++  for (int k = 0; k < 3; ++k) if (ci[k] >= cn[k]) return false;
++  for (int k = 0; k < 2; ++k) if (ai[k] >= an[k]) return false;
++  const uint32_t outv[3] = {g3, g5, g6};
++  for (int ch = 0; ch < 3; ++ch) {
++    K.sd[ch] = nullptr; K.ou[ch] = nullptr; K.PD[ch] = nullptr;
++    const uint32_t vin = rd32(S + 44 + 4 * ch);
++    if (!add(vin, 96 * 4, true)) return false;
++    K.in[ch] = hp(pa(vin));
++    if (send != 0) {
++      const uint32_t vs = rd32(S + 8 + 4 * ch);
++      if (!add(vs, 96 * 4, false)) return false;
++      K.sd[ch] = hp(pa(vs));
++    }
++    if (outp != 0) {
++      if (!add(outv[ch], 96 * 4, true)) return false;
++      K.ou[ch] = hp(pa(outv[ch]));
++    }
++    const uint32_t ve = rd32(R + 0 + 4 * ch);
++    if (!add(ve, 4ull * esz, true)) return false;
++    K.E[ch] = hp(pa(ve));
++    if (pdn != 0) {
++      const uint32_t vp = rd32(R + 44 + 4 * ch);
++      if (!add(vp, 4ull * pdn, true)) return false;
++      K.PD[ch] = hp(pa(vp));
++    }
++    for (int k = 0; k < 3; ++k) {
++      const uint32_t vc = rd32(R + 68 + 12 * ch + 4 * k);
++      if (!add(vc, 4ull * cn[k], true)) return false;
++      K.C[ch][k] = hp(pa(vc));
++    }
++    for (int k = 0; k < 2; ++k) {
++      const uint32_t va = rd32(R + 152 + 8 * ch + 4 * k);
++      if (!add(va, 4ull * an[k], true)) return false;
++      K.A[ch][k] = hp(pa(va));
++    }
++    const uint32_t vb = rd32(R + 200 + 4 * ch);
++    K.b3i[ch] = rd32(R + 212 + 4 * ch);
++    K.b3n[ch] = rd32(R + 224 + 4 * ch);
++    if (K.b3i[ch] >= K.b3n[ch] || !add(vb, 4ull * K.b3n[ch], true)) return false;
++    K.B3[ch] = hp(pa(vb));
++  }
++  // [a2ovcache] the region lists repeat (the same delay buffers; the aux buffers and the stack frame
++  // alternate among a few sets): the pairwise overlap test (~630 pairs) only runs for a list that is
++  // not one of the last 4 that passed it.
++  static R9AxRgn ov_rg[4][48];
++  static int ov_nr[4] = {-1, -1, -1, -1}, ov_next = 0;
++  bool same = false;
++  for (int c = 0; c < 4 && !same; ++c) {
++    same = ov_nr[c] == nr;
++    for (int i = 0; same && i < nr; ++i)
++      same = rg[i].p == ov_rg[c][i].p && rg[i].n == ov_rg[c][i].n && rg[i].w == ov_rg[c][i].w;
++  }
++  if (same) {
++    ++g_a2_ax.ov_skip;
++  } else {
++    for (int i = 0; i < nr; ++i)
++      for (int j = i + 1; j < nr; ++j)
++        if ((rg[i].w || rg[j].w) && (uint64_t)rg[i].p < (uint64_t)rg[j].p + rg[j].n &&
++            (uint64_t)rg[j].p < (uint64_t)rg[i].p + rg[i].n)
++          return false;
++    for (int i = 0; i < nr; ++i) ov_rg[ov_next][i] = rg[i];
++    ov_nr[ov_next] = nr;
++    ov_next = (ov_next + 1) & 3;
++  }
++
++  // loop-invariant values (struct fields the loop only reads, constants)
++  K.k32 = rdf(R + 32); K.k36 = rdf(R + 36); K.k40 = rdf(R + 40);
++  K.kc[0] = rdf(R + 140); K.kc[1] = rdf(R + 144); K.kc[2] = rdf(R + 148);
++  K.k320 = rdf(R + 320); K.k324 = rdf(R + 324);
++  K.z = rdf(hp(pa(g2 - 20804u)));  // lfs f10, -20804(r2)
++  K.lp[0] = rdf(R + 252); K.lp[1] = rdf(R + 256); K.lp[2] = rdf(R + 260);
++  K.hi = (uint64_t)g0 << 32;
++  K.f0 = f0; K.f1 = f1; K.f3 = f3; K.f4 = f4; K.f5 = f5; K.f6 = f6;
++
++  int use = kern == 3 ? 1 + (int)(g_a2_ax.calls & 1) : kern;
++  // kernel 2 needs every float operand to be a single (always true: lfs / single ops)
++  if (use == 2 && !(a2_is_single(f1) && a2_is_single(f3) && a2_is_single(f4) && a2_is_single(f5) &&
++                    a2_is_single(f6)))
++    use = 1;
++  ++g_a2_ax.calls;
++  if (__builtin_expect(kcheck != 0 && g_a2_ax.calls % kcheck == 0, 0)) {
++    struct HpCtx { uint8_t *b1, *b2; } hc{mv.b1, mv.b2};
++    nwii_a2_axfx_kcheck(K, rg, nr,
++                        [](void* c, uint32_t p) -> uint8_t* {
++                          const HpCtx* h = (const HpCtx*)c;
++                          return p < 0x10000000u ? h->b1 + p : h->b2 + (p - 0x10000000u);
++                        },
++                        &hc);
++  } else if (timing) {
++    const bool nx = use == 2 && (pfnext == 1 || (pfnext == 2 && (g_a2_ax.calls / 1000) % 2 == 1));
++    const uint64_t t0 = a2_ticks();
++    if (use == 2) nwii_a2_axfx_k2(K, nx); else nwii_a2_axfx_k1(K);
++    const int slot = nx ? 3 : use;
++    g_a2_ax.t[slot] += a2_ticks() - t0;
++    ++g_a2_ax.n[slot];
++  } else {
++    const bool nx = use == 2 && (pfnext == 1 || (pfnext == 2 && (g_a2_ax.calls / 1000) % 2 == 1));
++    if (use == 2) nwii_a2_axfx_k2(K, nx); else nwii_a2_axfx_k1(K);
++  }
++  if (__builtin_expect(g_a2_ax.calls % 3000 == 0, 0)) nwii_a2_axfx_report();
++
+@@ -53101 +53471 @@
+-  if (pdn != 0) wr32(R + 56, pdi);
++  if (pdn != 0) wr32(R + 56, K.pdi);
+@@ -53105,2 +53475,2 @@
+-    wrf(R + 252 + 4 * ch, lp[ch]);
+-    wr32(R + 212 + 4 * ch, b3i[ch]);
++    wrf(R + 252 + 4 * ch, K.lp[ch]);
++    wr32(R + 212 + 4 * ch, K.b3i[ch]);
+@@ -62615,0 +62986,387 @@
++// [a2delay] native body of func_801A5C10 from loc_801A5C24 to loc_801A5E70 (r9/r16a2/tools/apply_a2_delay.py)
++static NWII_NOINLINE void nwii_a2_delay_native(CPUContext& ctx) {
++    nwii::runtime::MemView mv_(ctx.mmu);
++    uint32_t g0 = ctx.gpr[0];
++    uint32_t g3 = ctx.gpr[3];
++    uint32_t g4 = ctx.gpr[4];
++    uint32_t g5 = ctx.gpr[5];
++    uint32_t g6 = ctx.gpr[6];
++    uint32_t g7 = ctx.gpr[7];
++    uint32_t g8 = ctx.gpr[8];
++    uint32_t g9 = ctx.gpr[9];
++    uint32_t g10 = ctx.gpr[10];
++    uint32_t g11 = ctx.gpr[11];
++    uint32_t g12 = ctx.gpr[12];
++    uint32_t g20 = ctx.gpr[20];
++    uint32_t g21 = ctx.gpr[21];
++    uint32_t g22 = ctx.gpr[22];
++    uint32_t g23 = ctx.gpr[23];
++    uint32_t g24 = ctx.gpr[24];
++    uint32_t g25 = ctx.gpr[25];
++    uint32_t g26 = ctx.gpr[26];
++    uint32_t g27 = ctx.gpr[27];
++    uint32_t g28 = ctx.gpr[28];
++    uint32_t g29 = ctx.gpr[29];
++    uint32_t g30 = ctx.gpr[30];
++    uint32_t g31 = ctx.gpr[31];
++    bool c0lt = ctx.cr[0].lt, c0gt = ctx.cr[0].gt, c0eq = ctx.cr[0].eq, c0so = ctx.cr[0].so;
++    uint32_t ctr = ctx.ctr, pc = ctx.pc, xer = ctx.xer;
++    uint64_t ic = 0;
++    ic += 6;
++    g0 = mv_.read32<188285u>(g4 + 52); // lwz r0, 52(r4)
++    c0lt = ((int32_t)g0 < 0);
++    c0gt = ((int32_t)g0 > 0);
++    c0eq = ((int32_t)g0 == 0);
++    c0so = (xer >> 31) & 1;
++    if (c0eq) goto loc_801A5C3C;
++    g0 = std::rotl(g0, 0) & 0xFFFFFFFD; // rlwinm r0, r0, 0, 31, 29
++    mv_.write32<188286u>(g4 + 52, g0); // stw r0, 52(r4)
++    goto nwii_exit;
++loc_801A5C3C: ;
++    ic += 11;
++    g6 = mv_.read32<188287u>(g4 + 72); // lwz r6, 72(r4)
++    g10 = mv_.read32<188288u>(g4 + 40); // lwz r10, 40(r4)
++    c0lt = ((int32_t)g6 < 0);
++    c0gt = ((int32_t)g6 > 0);
++    c0eq = ((int32_t)g6 == 0);
++    c0so = (xer >> 31) & 1;
++    g11 = mv_.read32<188289u>(g3 + 0); // lwz r11, 0(r3)
++    g12 = mv_.read32<188290u>(g3 + 4); // lwz r12, 4(r3)
++    {
++    uint64_t res = (uint64_t)(uint32_t)~g10 + (uint64_t)(uint32_t)128 + 1;
++    g24 = (uint32_t)res;
++    xer = (xer & ~(1u << 29)) | ((uint32_t)(res >> 32) & 1u) << 29;
++    } // subfic
++    g31 = mv_.read32<188291u>(g3 + 8); // lwz r31, 8(r3)
++    if (c0eq) goto loc_801A5C68;
++    g3 = mv_.read32<188292u>(g6 + 0); // lwz r3, 0(r6)
++    g5 = mv_.read32<188293u>(g6 + 4); // lwz r5, 4(r6)
++    g6 = mv_.read32<188294u>(g6 + 8); // lwz r6, 8(r6)
++loc_801A5C68: ;
++    ic += 6;
++    g20 = mv_.read32<188295u>(g4 + 76); // lwz r20, 76(r4)
++    c0lt = ((int32_t)g20 < 0);
++    c0gt = ((int32_t)g20 > 0);
++    c0eq = ((int32_t)g20 == 0);
++    c0so = (xer >> 31) & 1;
++    if (c0eq) goto loc_801A5C80;
++    g7 = mv_.read32<188296u>(g20 + 0); // lwz r7, 0(r20)
++    g8 = mv_.read32<188297u>(g20 + 4); // lwz r8, 4(r20)
++    g9 = mv_.read32<188298u>(g20 + 8); // lwz r9, 8(r20)
++loc_801A5C80: ;
++    ic += 3;
++    g25 = 96; // li r25, 96
++    g0 = 0; // li r0, 0
++    ctr = g25; // mtctr r25
++loc_801A5C8C: ;
++    ic += 36;
++    g21 = mv_.read32<188299u>(g4 + 12); // lwz r21, 12(r4)
++    g20 = mv_.read32<188300u>(g4 + 72); // lwz r20, 72(r4)
++    g23 = std::rotl(g21, 2) & 0xFFFFFFFC; // rlwinm r23, r21, 2, 0, 29
++    g22 = mv_.read32<188301u>(g4 + 0); // lwz r22, 0(r4)
++    g21 = mv_.read32<188302u>(g4 + 4); // lwz r21, 4(r4)
++    c0lt = ((int32_t)g20 < 0);
++    c0gt = ((int32_t)g20 > 0);
++    c0eq = ((int32_t)g20 == 0);
++    c0so = (xer >> 31) & 1;
++    g20 = mv_.read32<188303u>(g4 + 8); // lwz r20, 8(r4)
++    g30 = mv_.read32<188304u>(g22 + g23); // lwzx
++    g29 = mv_.read32<188305u>(g21 + g23); // lwzx
++    g28 = mv_.read32<188306u>(g20 + g23); // lwzx
++    if (c0eq) goto loc_801A5D1C;
++    g20 = mv_.read32<188307u>(g3 + 0); // lwz r20, 0(r3)
++    g3 = g3 + 4; // addi r3, r3, 4
++    g22 = mv_.read32<188308u>(g11 + 0); // lwz r22, 0(r11)
++    g23 = mv_.read32<188309u>(g31 + 0); // lwz r23, 0(r31)
++    g20 = g22 + g20;
++    g22 = mv_.read32<188310u>(g6 + 0); // lwz r22, 0(r6)
++    g27 = mv_.read32<188311u>(g4 + 28); // lwz r27, 28(r4)
++    g20 = g24 * g20; // mullw
++    g22 = g23 + g22;
++    g21 = mv_.read32<188312u>(g5 + 0); // lwz r21, 0(r5)
++    g25 = mv_.read32<188313u>(g12 + 0); // lwz r25, 0(r12)
++    g5 = g5 + 4; // addi r5, r5, 4
++    g6 = g6 + 4; // addi r6, r6, 4
++    g26 = g25 + g21;
++    g21 = mv_.read32<188314u>(g4 + 36); // lwz r21, 36(r4)
++    g23 = g10 * g27; // mullw
++    g25 = mv_.read32<188315u>(g4 + 32); // lwz r25, 32(r4)
++    g27 = g20 + g23;
++    g26 = g24 * g26; // mullw
++    g23 = g10 * g25; // mullw
++    g22 = g24 * g22; // mullw
++    g26 = g26 + g23;
++    g21 = g10 * g21; // mullw
++    g25 = g22 + g21;
++    goto loc_801A5D58;
++loc_801A5D1C: ;
++    ic += 15;
++    g21 = mv_.read32<188316u>(g11 + 0); // lwz r21, 0(r11)
++    g26 = mv_.read32<188317u>(g4 + 28); // lwz r26, 28(r4)
++    g25 = mv_.read32<188318u>(g12 + 0); // lwz r25, 0(r12)
++    g27 = g24 * g21; // mullw
++    g23 = mv_.read32<188319u>(g4 + 32); // lwz r23, 32(r4)
++    g22 = mv_.read32<188320u>(g31 + 0); // lwz r22, 0(r31)
++    g21 = mv_.read32<188321u>(g4 + 36); // lwz r21, 36(r4)
++    g26 = g10 * g26; // mullw
++    g25 = g24 * g25; // mullw
++    g27 = g27 + g26;
++    g23 = g10 * g23; // mullw
++    g22 = g24 * g22; // mullw
++    g26 = g25 + g23;
++    g21 = g10 * g21; // mullw
++    g25 = g22 + g21;
++loc_801A5D58: ;
++    ic += 36;
++    g21 = mv_.read32<188322u>(g4 + 24); // lwz r21, 24(r4)
++    {
++    int32_t sv = (int32_t)g27;
++    g27 = (uint32_t)(sv >> 7);
++    uint32_t ca = (sv < 0 && (uint32_t)(sv & 127u) != 0) ? 1 : 0;
++    xer = (xer & ~(1u << 29)) | (ca << 29);
++    } // srawi
++    {
++    int32_t sv = (int32_t)g26;
++    g26 = (uint32_t)(sv >> 7);
++    uint32_t ca = (sv < 0 && (uint32_t)(sv & 127u) != 0) ? 1 : 0;
++    xer = (xer & ~(1u << 29)) | (ca << 29);
++    } // srawi
++    g22 = mv_.read32<188323u>(g4 + 12); // lwz r22, 12(r4)
++    g21 = g30 * g21; // mullw
++    {
++    int32_t sv = (int32_t)g25;
++    g25 = (uint32_t)(sv >> 7);
++    uint32_t ca = (sv < 0 && (uint32_t)(sv & 127u) != 0) ? 1 : 0;
++    xer = (xer & ~(1u << 29)) | (ca << 29);
++    } // srawi
++    g23 = mv_.read32<188324u>(g4 + 0); // lwz r23, 0(r4)
++    g22 = std::rotl(g22, 2) & 0xFFFFFFFC; // rlwinm r22, r22, 2, 0, 29
++    mv_.write32<188325u>(g4 + 32, g26); // stw r26, 32(r4)
++    mv_.write32<188326u>(g4 + 36, g25); // stw r25, 36(r4)
++    mv_.write32<188327u>(g4 + 28, g27); // stw r27, 28(r4)
++    {
++    int32_t sv = (int32_t)g21;
++    g21 = (uint32_t)(sv >> 7);
++    uint32_t ca = (sv < 0 && (uint32_t)(sv & 127u) != 0) ? 1 : 0;
++    xer = (xer & ~(1u << 29)) | (ca << 29);
++    } // srawi
++    g27 = g27 + g21;
++    mv_.write32<188328u>(g23 + g22, g27); // stwx
++    g23 = mv_.read32<188329u>(g4 + 24); // lwz r23, 24(r4)
++    g22 = mv_.read32<188330u>(g4 + 12); // lwz r22, 12(r4)
++    g27 = g29 * g23; // mullw
++    g23 = mv_.read32<188331u>(g4 + 4); // lwz r23, 4(r4)
++    g22 = std::rotl(g22, 2) & 0xFFFFFFFC; // rlwinm r22, r22, 2, 0, 29
++    {
++    int32_t sv = (int32_t)g27;
++    g27 = (uint32_t)(sv >> 7);
++    uint32_t ca = (sv < 0 && (uint32_t)(sv & 127u) != 0) ? 1 : 0;
++    xer = (xer & ~(1u << 29)) | (ca << 29);
++    } // srawi
++    g26 = g26 + g27;
++    mv_.write32<188332u>(g23 + g22, g26); // stwx
++    g22 = mv_.read32<188333u>(g4 + 24); // lwz r22, 24(r4)
++    g27 = mv_.read32<188334u>(g4 + 12); // lwz r27, 12(r4)
++    g22 = g28 * g22; // mullw
++    g23 = mv_.read32<188335u>(g4 + 8); // lwz r23, 8(r4)
++    g26 = std::rotl(g27, 2) & 0xFFFFFFFC; // rlwinm r26, r27, 2, 0, 29
++    g27 = g27 + 1; // addi r27, r27, 1
++    {
++    int32_t sv = (int32_t)g22;
++    g22 = (uint32_t)(sv >> 7);
++    uint32_t ca = (sv < 0 && (uint32_t)(sv & 127u) != 0) ? 1 : 0;
++    xer = (xer & ~(1u << 29)) | (ca << 29);
++    } // srawi
++    g25 = g25 + g22;
++    mv_.write32<188336u>(g23 + g26, g25); // stwx
++    g25 = mv_.read32<188337u>(g4 + 16); // lwz r25, 16(r4)
++    mv_.write32<188338u>(g4 + 12, g27); // stw r27, 12(r4)
++    c0lt = (g27 < g25);
++    c0gt = (g27 > g25);
++    c0eq = (g27 == g25);
++    c0so = (xer >> 31) & 1;
++    if (c0lt) goto loc_801A5DE8;
++    mv_.write32<188339u>(g4 + 12, g0); // stw r0, 12(r4)
++loc_801A5DE8: ;
++    ic += 33;
++    g25 = mv_.read32<188340u>(g4 + 44); // lwz r25, 44(r4)
++    g25 = g30 * g25; // mullw
++    {
++    int32_t sv = (int32_t)g25;
++    g25 = (uint32_t)(sv >> 7);
++    uint32_t ca = (sv < 0 && (uint32_t)(sv & 127u) != 0) ? 1 : 0;
++    xer = (xer & ~(1u << 29)) | (ca << 29);
++    } // srawi
++    mv_.write32<188341u>(g11 + 0, g25); // stw r25, 0(r11)
++    g11 = g11 + 4; // addi r11, r11, 4
++    g25 = mv_.read32<188342u>(g4 + 44); // lwz r25, 44(r4)
++    g25 = g29 * g25; // mullw
++    {
++    int32_t sv = (int32_t)g25;
++    g25 = (uint32_t)(sv >> 7);
++    uint32_t ca = (sv < 0 && (uint32_t)(sv & 127u) != 0) ? 1 : 0;
++    xer = (xer & ~(1u << 29)) | (ca << 29);
++    } // srawi
++    mv_.write32<188343u>(g12 + 0, g25); // stw r25, 0(r12)
++    g12 = g12 + 4; // addi r12, r12, 4
++    g25 = mv_.read32<188344u>(g4 + 44); // lwz r25, 44(r4)
++    g25 = g28 * g25; // mullw
++    {
++    int32_t sv = (int32_t)g25;
++    g25 = (uint32_t)(sv >> 7);
++    uint32_t ca = (sv < 0 && (uint32_t)(sv & 127u) != 0) ? 1 : 0;
++    xer = (xer & ~(1u << 29)) | (ca << 29);
++    } // srawi
++    mv_.write32<188345u>(g31 + 0, g25); // stw r25, 0(r31)
++    g31 = g31 + 4; // addi r31, r31, 4
++    g25 = mv_.read32<188346u>(g4 + 76); // lwz r25, 76(r4)
++    c0lt = ((int32_t)g25 < 0);
++    c0gt = ((int32_t)g25 > 0);
++    c0eq = ((int32_t)g25 == 0);
++    c0so = (xer >> 31) & 1;
++    if (c0eq) goto loc_801A5E6C;
++    g25 = mv_.read32<188347u>(g4 + 48); // lwz r25, 48(r4)
++    g25 = g30 * g25; // mullw
++    {
++    int32_t sv = (int32_t)g25;
++    g25 = (uint32_t)(sv >> 7);
++    uint32_t ca = (sv < 0 && (uint32_t)(sv & 127u) != 0) ? 1 : 0;
++    xer = (xer & ~(1u << 29)) | (ca << 29);
++    } // srawi
++    mv_.write32<188348u>(g7 + 0, g25); // stw r25, 0(r7)
++    g7 = g7 + 4; // addi r7, r7, 4
++    g25 = mv_.read32<188349u>(g4 + 48); // lwz r25, 48(r4)
++    g25 = g29 * g25; // mullw
++    {
++    int32_t sv = (int32_t)g25;
++    g25 = (uint32_t)(sv >> 7);
++    uint32_t ca = (sv < 0 && (uint32_t)(sv & 127u) != 0) ? 1 : 0;
++    xer = (xer & ~(1u << 29)) | (ca << 29);
++    } // srawi
++    mv_.write32<188350u>(g8 + 0, g25); // stw r25, 0(r8)
++    g8 = g8 + 4; // addi r8, r8, 4
++    g25 = mv_.read32<188351u>(g4 + 48); // lwz r25, 48(r4)
++    g25 = g28 * g25; // mullw
++    {
++    int32_t sv = (int32_t)g25;
++    g25 = (uint32_t)(sv >> 7);
++    uint32_t ca = (sv < 0 && (uint32_t)(sv & 127u) != 0) ? 1 : 0;
++    xer = (xer & ~(1u << 29)) | (ca << 29);
++    } // srawi
++    mv_.write32<188352u>(g9 + 0, g25); // stw r25, 0(r9)
++    g9 = g9 + 4; // addi r9, r9, 4
++loc_801A5E6C: ;
++    ic += 1;
++    pc = 0x801A5E6C;  // interrupt poll of the generated code (MSR[EE] is clear here)
++    ctr--;
++    if (ctr != 0) goto loc_801A5C8C;
++nwii_exit:
++    ctx.gpr[0] = g0;
++    ctx.gpr[3] = g3;
++    ctx.gpr[5] = g5;
++    ctx.gpr[6] = g6;
++    ctx.gpr[7] = g7;
++    ctx.gpr[8] = g8;
++    ctx.gpr[9] = g9;
++    ctx.gpr[10] = g10;
++    ctx.gpr[11] = g11;
++    ctx.gpr[12] = g12;
++    ctx.gpr[20] = g20;
++    ctx.gpr[21] = g21;
++    ctx.gpr[22] = g22;
++    ctx.gpr[23] = g23;
++    ctx.gpr[24] = g24;
++    ctx.gpr[25] = g25;
++    ctx.gpr[26] = g26;
++    ctx.gpr[27] = g27;
++    ctx.gpr[28] = g28;
++    ctx.gpr[29] = g29;
++    ctx.gpr[30] = g30;
++    ctx.gpr[31] = g31;
++    ctx.cr[0].lt = c0lt; ctx.cr[0].gt = c0gt; ctx.cr[0].eq = c0eq; ctx.cr[0].so = c0so;
++    ctx.ctr = ctr;
++    ctx.xer = xer;
++    ctx.pc = pc;
++    ctx.inst_count += ic;
++    (void)c0lt; (void)c0gt; (void)c0eq; (void)c0so;
++}
++
++// Entry from func_801A5C10 at loc_801A5C24. true: the native body ran and ctx is the state of
++// loc_801A5E70. false: run the generated code (MSR[EE] set, off, or a verify round).
++namespace {
++struct A2DelayVerify {
++  bool pending = false;
++  uint64_t calls = 0, ok = 0, bad = 0, native = 0, fallback = 0;
++  std::vector<uint8_t> s1, s2;
++  uint64_t h1 = 0, h2 = 0;
++  R9AxfxRegs regs;
++};
++A2DelayVerify& a2_delay_state() { static A2DelayVerify v; return v; }
++}  // namespace
++
++static NWII_NOINLINE void nwii_a2_delay_report(const A2DelayVerify& v) {
++  std::printf("[A2] delay native=%llu generated(EE set)=%llu verify ok=%llu bad=%llu\n",
++              (unsigned long long)v.native, (unsigned long long)v.fallback, (unsigned long long)v.ok,
++              (unsigned long long)v.bad);
++  std::fflush(stdout);
++}
++
++static NWII_NOINLINE bool nwii_a2_delay_verify_begin(CPUContext& ctx) {
++  A2DelayVerify& v = a2_delay_state();
++  v.s1.resize(ctx.mmu.mem1.size());
++  v.s2.resize(ctx.mmu.mem2.size());
++  std::memcpy(v.s1.data(), ctx.mmu.mem1.data(), v.s1.size());
++  std::memcpy(v.s2.data(), ctx.mmu.mem2.data(), v.s2.size());
++  const R9AxfxRegs before = r9_axfx_regs(ctx);
++  nwii_a2_delay_native(ctx);
++  v.h1 = r9_axfx_hash(ctx.mmu.mem1);
++  v.h2 = r9_axfx_hash(ctx.mmu.mem2);
++  v.regs = r9_axfx_regs(ctx);
++  std::memcpy(ctx.mmu.mem1.data(), v.s1.data(), v.s1.size());
++  std::memcpy(ctx.mmu.mem2.data(), v.s2.data(), v.s2.size());
++  r9_axfx_set_regs(ctx, before);
++  v.pending = true;
++  return false;
++}
++
++static NWII_NOINLINE void nwii_a2_delay_verify_end(CPUContext& ctx) {
++  A2DelayVerify& v = a2_delay_state();
++  v.pending = false;
++  const R9AxfxRegs now = r9_axfx_regs(ctx);
++  bool good = std::memcmp(&now, &v.regs, sizeof now) == 0;
++  if (!good && v.bad < 20) {
++    for (int i = 0; i < 32; ++i)
++      if (now.gpr[i] != v.regs.gpr[i]) std::printf("[A2] delay verify r%d gen=0x%x native=0x%x\n", i, now.gpr[i], v.regs.gpr[i]);
++    if (std::memcmp(now.cr, v.regs.cr, sizeof now.cr)) std::printf("[A2] delay verify cr differs\n");
++    if (now.xer != v.regs.xer) std::printf("[A2] delay verify xer gen=0x%x native=0x%x\n", now.xer, v.regs.xer);
++    if (now.ctr != v.regs.ctr || now.pc != v.regs.pc || now.inst_count != v.regs.inst_count || now.lr != v.regs.lr)
++      std::printf("[A2] delay verify ctr/pc/lr/inst gen=%u/0x%x/0x%x/%llu native=%u/0x%x/0x%x/%llu\n", now.ctr, now.pc,
++                  now.lr, (unsigned long long)now.inst_count, v.regs.ctr, v.regs.pc, v.regs.lr,
++                  (unsigned long long)v.regs.inst_count);
++  }
++  const uint64_t g1 = r9_axfx_hash(ctx.mmu.mem1), g2 = r9_axfx_hash(ctx.mmu.mem2);
++  if (g1 != v.h1 || g2 != v.h2) {
++    good = false;
++    if (v.bad < 20) std::printf("[A2] delay verify guest RAM differs (MEM1 %s, MEM2 %s)\n", g1 != v.h1 ? "differs" : "same",
++                                g2 != v.h2 ? "differs" : "same");
++  }
++  if (good) ++v.ok; else ++v.bad;
++  if ((v.ok + v.bad) % 50 == 1 || !good) nwii_a2_delay_report(v);
++}
++
++static inline bool nwii_a2_delay_801A5C24(CPUContext& ctx) {
++  static const bool on = [] { const char* e = NWII_ENV("NWII_AXFX_DELAY_NATIVE"); return !(e && e[0] == '0'); }();
++  static const unsigned long every = [] { const char* e = NWII_ENV("NWII_AXFX_DVERIFY"); return e ? std::strtoul(e, nullptr, 10) : 0ul; }();
++  A2DelayVerify& v = a2_delay_state();
++  if (__builtin_expect(!on || (ctx.msr & 0x8000u), 0)) {
++    ++v.fallback;
++    return false;
++  }
++  ++v.calls;
++  if (__builtin_expect(every != 0, 0) && v.calls % every == 0)
++    return nwii_a2_delay_verify_begin(ctx);
++  if (__builtin_expect(++v.native % 6000 == 0, 0)) nwii_a2_delay_report(v);
++  nwii_a2_delay_native(ctx);
++  return true;
++}
++
+@@ -62650,0 +63408 @@
++    if (nwii_a2_delay_801A5C24(ctx)) goto loc_801A5E70;  // [a2delay]
+@@ -63185,0 +63944 @@
++    if (__builtin_expect(a2_delay_state().pending, 0)) nwii_a2_delay_verify_end(ctx);  // [a2delay]

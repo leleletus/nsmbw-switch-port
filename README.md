@@ -94,7 +94,7 @@ publican. Interruptores de comprobación (`*_CHECK`) comparan la ruta nueva con 
 
 ## Cómo se construye (visión general)
 
-No hay una orden única: el código del juego se genera a partir del disco del propio usuario y se compila aparte.
+Hay una orden única: `tools/construir_nro/construir_nro.py` (ver `tools/construir_nro/LEEME.md`), que parte de tu copia del juego y produce el NRO y los datos de la SD.
 
 1. **Recompilar el juego** con NWiiRecomp (commit y cambios en [`recompilador/`](recompilador/UPSTREAM.md)) sobre el
    ejecutable y los módulos extraídos de tu disco. Salida: `output_*.cpp`, `main_output.cpp` (no se incluyen).

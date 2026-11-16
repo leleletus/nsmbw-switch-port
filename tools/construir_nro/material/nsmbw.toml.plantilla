@@ -1,0 +1,108 @@
+# [construir_nro] configuración del recompilador (copia de recomp/nsmbw.toml con @MARCAS@ que rellena construir_nro.py)
+project_name = "NSMBW"
+input_game_dir = "@JUEGO@"
+output_dir = "@SALIDA@"
+runtime_source_dir = "@RUNTIME@"
+sdk_sigdb = "@SIGDB@"
+split_output = true
+instructions_per_file = 20000
+# Prologue-signature false positives: ES library functions (0x801D8xxx) that
+# the scanner took for IOS_IoctlvAsync/IOS_Ioctlv; the real ones are 0x8022xxxx.
+hle_skip = [0x801D84E0, 0x801D85F0, 0x801D86E0, 0x801D8D20]
+
+[game]
+id = "SMNE01"
+
+[system]
+platform = "wii"
+nand_dir = "@NAND@"   # emulated NAND (saves) on the host
+language = "es"                            # auto/en/es/fr/de/it/nl/ja (IPL.LNG)
+
+[graphics]
+backend = "opengl"
+window_width = 1280
+window_height = 720
+vsync = true
+
+[input]
+mode = 6
+# Multiplayer (virtual Wii Remotes 1-4). Defaults: player 1 = keyboard + first
+# controller, players 2-4 = the next controllers plugged in (hotplug).
+#players = 4                 # how many remotes can connect (1-4)
+#joycon_mode = "auto"        # "single": each Joy-Con is one player; "pair"/"auto" (PC) = L+R together
+#background_input = true     # controllers keep working without window focus
+#nx_controller_applet = true # Switch: controller applet on "Add a remote" / lost pad
+#
+#[input.player1]
+#device = "keyboard"         # auto | keyboard | gamepad | keyboard+gamepad | none
+#[input.player2]
+#device = "gamepad"
+#gamepad = "Joy-Con (R)"     # part of the name, "#n" (n-th controller) or GUID
+#tilt = "auto"               # auto | stick | motion | none
+#tilt_invert = false
+#rumble = true
+#buttons = { two = ["a", "b"], one = ["x", "y"], shake = ["rightshoulder"] }
+#keys = { two = "Space", one = "V" }   # only with device = "keyboard..."
+
+# Wii Remote HLE (SMNE01 addresses). Replaces the Bluetooth stack with four
+# virtual sideways remotes: see NWiiRuntime/src/hle/wpad_hle.cpp and
+# src/input/wii_remotes.cpp
+[hle_hooks]
+"801edaf0" = "NWII_KPADInitEx"              # KPADInitEx (would start Bluetooth)
+"801dfa50" = "NWII_HLE_Nop"                 # WPADInit
+"801ed3a0" = "NWII_KPADRead"                # KPADRead
+"801ed3b0" = "NWII_KPADReadEx"              # KPADReadEx
+"801ee0b0" = "NWII_HLE_Return0"             # KPAD DPD callback setter
+"801ee150" = "NWII_HLE_Nop"                 # KPADDisableDPD
+"801ee170" = "NWII_HLE_Nop"                 # KPADEnableDPD
+"801dfac0" = "NWII_WPADStartSimpleSync"     # WPAD simple sync: "Add a remote" screen
+"801dfad0" = "NWII_WPADStopSimpleSync"      # WPADStopSimpleSync
+"801dfaf0" = "NWII_HLE_Return0"             # WPADSetSimpleSyncCallback (old cb = none)
+"801dfb00" = "NWII_HLE_Return0"             # WPADSetClearDeviceCallback (old cb = none)
+"801dfb30" = "NWII_WPADGetStatus"           # WPADGetStatus (-> WUD state; 3 = ready)
+"801dfb40" = "NWII_WPADGetRadioSensitivity" # WPADGetRadioSensitivity
+"801dfbd0" = "NWII_WPADSetAcceptConnection" # WPAD accept-connection switch (dRemoconMng)
+"801e0e40" = "NWII_WPADDisconnect"          # WPADDisconnect
+"801e0f00" = "NWII_HLE_Nop"                 # WPADSetSpeakerVolume
+"801e0f40" = "NWII_WPADProbe"               # WPADProbe
+"801e1060" = "NWII_HLE_Return0"             # WPAD callback setter (returns old)
+"801e10f0" = "NWII_HLE_Return0"             # WPAD callback setter (returns old)
+"801e12c0" = "NWII_HLE_Return0"             # WPAD async info request
+"801e14e0" = "NWII_WPADControlMotor"        # WPADControlMotor (rumble)
+"801e15b0" = "NWII_HLE_Nop"                 # WPADEnableMotor
+"801e15f0" = "NWII_HLE_Return1"             # WPADIsMotorEnabled
+"801e1820" = "NWII_HLE_Return0"             # WPADSaveConfig
+"801e1dd0" = "NWII_HLE_Return0"             # WPAD per-channel getter (cb+0x83c)
+"801e1e20" = "NWII_HLE_Return0"             # WPAD control request
+"801e35f0" = "NWII_HLE_Return0"             # WPADCanSendStreamData
+"801e3680" = "NWII_HLE_Return0"             # WPADSendStreamData (speaker)
+
+# REL modules recompiled ahead of time; bases read from Dolphin (scripts/dolphin_rels.py)
+[[rel_aot]]
+path = "@RELS@/d_profileNP.rel"
+module_base = 0x807684C0
+bss_base = 0x8076D460  # bss size 0x208
+
+[[rel_aot]]
+path = "@RELS@/d_basesNP.rel"
+module_base = 0x8076D680
+bss_base = 0x80990820  # bss size 0x12484
+
+[[rel_aot]]
+path = "@RELS@/d_enemiesNP.rel"
+module_base = 0x809A2CC0
+bss_base = 0x80B11440  # bss size 0xB4E0
+
+[[rel_aot]]
+path = "@RELS@/d_en_bossNP.rel"
+module_base = 0x80B1C940
+bss_base = 0x80B89AC0  # bss size 0x487C
+
+
+# Interrupt handlers and IOS callbacks run with the scheduler locked, as
+# __OSDispatchInterrupt does (OSDisableScheduler / OSEnableScheduler +
+# __OSReschedule). Without it OSWakeupThread switched threads mid-handler and
+# lost IPC mailbox acks. Reschedule counter lives at r13-0x4F80 (SMNE01).
+# Read at run time.
+[hle]
+sched_lock_offset = 0x4F80
