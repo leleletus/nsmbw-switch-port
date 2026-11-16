@@ -137,6 +137,35 @@ Las ayudas de diagnóstico son opcionales y solo se activan si el usuario las pi
 ## Rendimiento y reloj de la consola (opcional)
 
 Medido a los relojes de fábrica en portátil (CPU 1020 MHz, GPU 460 MHz): 58–60 fps en casi todo el juego y ~57,5 en
-niveles de agua, donde el límite es la CPU. El modo dock no sube la CPU, así que no cambia ese caso. Quien tenga
-instalado **sys-clk** (módulo aparte, no viene con Atmosphère) puede crear un perfil para el juego con CPU 1224 MHz y
-GPU 460 MHz para tener más margen en agua; esa cifra es una estimación proporcional, pendiente de medir.
+niveles de agua, donde el límite es la CPU. El modo dock no sube la CPU, así que no cambia ese caso.
+
+Desde **m6r**, si la consola tiene instalado **sys-clk** (módulo aparte, no viene con Atmosphère; también su variante
+Horizon OC), **el juego le pide él solo CPU 1224 MHz** mientras está abierto (un «override» temporal; la GPU no se
+toca) y lo quita al salir. Desde **m6s**, al pulsar HOME (o al dormir la consola) el juego devuelve el reloj al
+perfil de sys-clk y lo vuelve a pedir al volver al juego, así que cerrar el programa desde HOME lo deja quitado.
+No hace falta crear ningún perfil. Sin sys-clk no hace nada ni muestra nada. Detalles:
+
+- Se cambia en `config.toml`, sección `[switch]`: `cpu_mhz = 1224` (valores: 1020, 1122, 1224, 1326, 1428, 1581,
+  1683, 1785); **`cpu_mhz = 0` lo desactiva** (sys-clk sigue con sus propios perfiles).
+- Para medir a relojes de fábrica: `cpu_mhz = 0`, o `NWII_NX_SYSCLK_OFF = "1"` en `debug.toml`.
+- El override de sys-clk manda sobre sus perfiles: si tienes un perfil con más CPU para este juego, pon aquí ese valor
+  o `0`. Si el juego se cierra por un fallo sin pasar por HOME, el override se queda hasta que lo quites en el menú de
+  sys-clk o reinicies.
+- La cifra de 1224 MHz es una estimación proporcional para tener margen en agua, pendiente de medir.
+
+Inclinación con el mando: desde m6r viene corregida de fábrica (`tilt_invert = false`). Si en `config.toml` tenías
+`tilt_invert = true` de una versión anterior, **cámbialo a `false`** (con `true` vuelve el sentido antiguo, al revés).
+
+## Estado final (16-nov-2026): versión m6t
+
+Medido en una Switch v1 en portátil, GPU 460 MHz, lista fija de cinco escenas (desierto 4 jugadores · agua · cielo ·
+nubes · castillo), fps dibujados:
+
+| | desierto | agua | cielo | nubes | castillo |
+|---|---|---|---|---|---|
+| Punto de partida (15-nov) | 55 | 35 | 41 | 59 | 47 |
+| CPU 1020 MHz (fábrica) | 59,5 | 57,7 | 59,5 | 60,0 | 59,0 |
+| CPU 1224 MHz (pedida a sys-clk por el juego) | 59,8 | 58,9 | 58,4 | 60,0 | 59,1 |
+
+Selector de mundos del mapa («−»): de 39,8 a 59,8 fps. Pendiente conocido: los niveles de agua no llegan a 60
+constantes a 1020 MHz (el límite es el hilo del juego); ver `status/ESTADO.md` para lo probado y descartado.

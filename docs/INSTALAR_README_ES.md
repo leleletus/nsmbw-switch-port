@@ -139,7 +139,9 @@ jugador 1 = modo portátil o el mando n.º 1; jugador N = mando n.º N. Vale un
 
 ### Ajustes (`env.txt`), solo si hace falta
 
-- `NWII_NX_TILT_INVERT=1`: inclinación por movimiento al revés.
+- `NWII_NX_TILT_INVERT=1`: inclinación por movimiento al revés respecto al sentido por defecto (desde m6r el
+  sentido por defecto ya es el corregido; con esta variable vuelve el de antes).
+- `NWII_NX_SYSCLK_OFF=1`: (m6r) no pedir CPU a sys-clk.
 - `NWII_NX_NO_MOTION=1`: sin sensor de movimiento (ZR/R siguen sacudiendo).
 - `NWII_NX_SIX_ROTATE=0`: si la inclinación de un Joy-Con suelto va en el eje equivocado.
 - `NWII_NX_JOYCON=single` (cada Joy-Con un jugador) o `pair` (L+R juntos). Por defecto:

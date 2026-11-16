@@ -87,6 +87,7 @@ if(NINTENDO_SWITCH)
         src/platform/switch/switch_audio.cpp
         src/platform/switch/switch_profiler.cpp
         src/platform/switch/switch_alloc.cpp
+        src/platform/switch/sysclk_client.cpp
         src/hle/gx/dk/dkgl.cpp)
     # r15dk: backend deko3d (uamlib = uam dentro de la NRO; las bibliotecas se añaden al enlazar:
     # r9/r15dk/tools/variant_build_dk.sh)

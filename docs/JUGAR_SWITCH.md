@@ -93,7 +93,8 @@ Se crea sola la primera vez y cada opción viene explicada. Para jugar no hace f
 | `[input] joycon_mode = "single"` / `"pair"` | cada Joy-Con es un jugador / L+R juntos |
 | `[input] players = 2` | máximo de jugadores |
 | `[switch] motion = false` | sin sensor de movimiento (R/ZR siguen sacudiendo) |
-| `[switch] tilt_invert = true` | inclinación al revés |
+| `[switch] tilt_invert = true` | inclinación al revés (desde m6r el valor por defecto, `false`, ya es el sentido correcto; antes hacía falta `true`) |
+| `[switch] cpu_mhz = 1224` | desde m6r: CPU que el juego pide a sys-clk si está instalado (1020, 1122, 1224, 1326, 1428, 1581, 1683, 1785); `0` = no pedir nada |
 | `[graphics] internal_resolution = "auto"` | resolución interna: `"auto"` = 1x (la de la Wii, 640x528) en portátil y 2x (1280x1056) en el dock (salida 1080p); `1` = la de la Wii (lo más ligero); `2`, `3`, `4` = más nítido y más trabajo de GPU. Un número aquí vale para los dos modos |
 | `[graphics] internal_resolution_handheld = 2` | solo en modo portátil (viene comentada con `#`): por ejemplo `2` para probar más nitidez en portátil (más trabajo de GPU). Cambia en marcha al quitar o poner el dock |
 

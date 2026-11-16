@@ -144,7 +144,8 @@ void do_init() {
   if (g_single_mode) std::atexit(restore_assignment);
 
   // env.txt: NWII_NX_NO_MOTION=1 turns motion tilt/shake off (buttons only);
-  // NWII_NX_TILT_INVERT=1 flips the sign of the motion tilt only;
+  // NWII_NX_TILT_INVERT=1 flips the sign of the motion tilt only, relative
+  // to the (m6r) default below: config.toml tilt_invert = true sets it;
   // NWII_NX_JOY_ROTATE=1 rotates single Joy-Con sticks by hand.
   g_motion_enabled = std::getenv("NWII_NX_NO_MOTION") == nullptr;
   g_motion_invert = std::getenv("NWII_NX_TILT_INVERT") != nullptr;
@@ -205,11 +206,13 @@ bool read_motion(Player &pl, int style, float *tilt_out, bool *shake_out) {
   }
   if (g > 0.7f && g < 1.3f) {
     // Roll from the side (X) axis only, so it works with the controller held
-    // flat or upright: turning right lowers the right end, which swings the
-    // measured "up" towards -X (X already turned for single Joy-Cons above).
-    // NWII_NX_TILT_INVERT=1 flips it if a controller reports the opposite
-    // sign.
-    float t = std::asin(std::fmax(-1.0f, std::fmin(1.0f, -x / g)));
+    // flat or upright (X already turned for single Joy-Cons above).
+    // m6r: the default sign is asin(+x/g). Before m6r it was asin(-x/g) and
+    // every player had to set tilt_invert = true (confirmed on hardware), so
+    // the corrected sign is now the default. NWII_NX_TILT_INVERT=1
+    // (config.toml tilt_invert = true, or an old debug.toml line) flips it
+    // back to the pre-m6r sign: it always means "inverted w.r.t. the default".
+    float t = std::asin(std::fmax(-1.0f, std::fmin(1.0f, x / g)));
     if (g_motion_invert) t = -t;
     const float mag = std::fabs(t) - kTiltDeadZone;
     pl.last_tilt = mag > 0.0f ? std::copysign(mag, t) : 0.0f;

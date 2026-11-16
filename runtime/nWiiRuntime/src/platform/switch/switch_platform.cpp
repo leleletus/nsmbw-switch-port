@@ -2,6 +2,7 @@
 #include "../../core/s2.h"  // r34s2
 #include "switch_platform.h"
 #include "switch_input.h"
+#include "sysclk_client.h"
 #include "switch_audio.h"
 #include "switch_profiler.h"
 
@@ -74,8 +75,10 @@ constexpr const char *kDefaultToml =
     "\n"
     "[switch]\n"
     "motion = true             # inclinar/sacudir girando el mando (false = solo botones)\n"
-    "tilt_invert = false       # true = inclinación al revés\n"
-    "\n"
+    "tilt_invert = false       # true = inclinación al revés (antes de m6r hacía falta true;\n"
+    "                          # ya viene corregida: déjalo en false)\n"
+    "cpu_mhz = 1224            # CPU que se pide a sys-clk si está instalado (0 = no pedir;\n"
+    "                          # 1020 1122 1224 1326 1428 1581 1683 1785)\n"    "\n"
     "[graphics]\n"
     "# Resolución interna: \"auto\" = \"720p\" en portátil y \"1080p\" en el dock (la imagen del\n"
     "# juego sale 1:1 en la pantalla). 1 = la de la Wii (640x528, lo más ligero); también vale\n"
@@ -341,7 +344,9 @@ void apply_env(const std::string &key, const std::string &val) {
                             key == "NWII_DLMEMO" || key == "NWII_PINDEX" || key == "NWII_RENDER_FREE" ||
                             key == "NWII_DLMEMO_LIST" || key == "NWII_WPROF" ||
                             // r31t: encendido por defecto, "0" lo apaga
-                            key == "NWII_T_EFBVAR";
+                            key == "NWII_T_EFBVAR" ||
+                            // m6r: cpu_mhz = 0 means "ask sys-clk for nothing"
+                            key == "NWII_NX_CPU_MHZ";
     const bool off = lv.empty() || lv == "off" || lv == "false" || lv == "no" ||
                      (lv == "0" && !keeps_zero);
     if (off)
@@ -374,6 +379,8 @@ void load_switch_options() {
     flag(sw, "motion", "NWII_NX_NO_MOTION", false);
     flag(sw, "tilt_invert", "NWII_NX_TILT_INVERT", true);
     flag(sw, "fps_overlay", "NWII_FPS_OVERLAY", true);  // r10: on-screen fps / frame time / thread load
+    // m6r: CPU MHz asked from sys-clk (sysclk_client.cpp); 0 = none
+    if (auto v = sw["cpu_mhz"].value<int64_t>()) apply_env("NWII_NX_CPU_MHZ", std::to_string(*v));
   }
   if (!parse_toml(g_root + "/debug.toml", dbg)) return;
   flag(dbg, "fps_log", "NWII_LOG", true);
@@ -756,6 +763,9 @@ bool early_init(int *argc, char ***argv) {
     Result rc = appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
     std::printf("[NX] CPU boost (FastLoad): %s\n", R_SUCCEEDED(rc) ? "on" : "failed");
   }
+  // m6r: if sys-clk is installed, ask it for cpu_mhz (default 1224) while the
+  // game runs; removed in shutdown()/atexit. Quietly nothing otherwise.
+  sysclk_start();
   return true;
 }
 
@@ -931,6 +941,7 @@ void c38_sink_flush() {
 }
 
 void shutdown() {
+  sysclk_stop();  // m6r: give the CPU back to sys-clk's own profile
   rumble(false);
   std::fflush(stdout);
   std::fflush(stderr);

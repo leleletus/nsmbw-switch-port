@@ -78,7 +78,7 @@ orden, las etapas hechas cuyas entradas no cambiaron se saltan (la construcción
 | `recompilar` | `main.dol` + 4 REL → `export/` (87 `output_N.cpp` + `main_output.cpp`), pasadas base `apply_fastdispatch.py` y `apply_r8_codegen.py --prune-only --memview`, tabla de saltos `jt.txt` | ~15 s |
 | `pasadas` | las pasadas del port, en este orden: cpucode (`apply_r9_cpucode/axfx/psq/axfx_fast`), fastmem (`apply_r12_fastmem.py`), A2 (reverb, `output_24`), G6 entry/notrace/inline, G6c (`apply_g6c.py --proto 3`), G7 (`--feat stfs,psq,fp,poll,icm,disp,cr`), S2; después A43 (kernel 4 de la reverb) y la unidad del agua nativa (`gen_w_agua.py`, W). **Cada paso se compara con `referencia/*.sha256`** | ~2,5 min |
 | `uamlib` | compila uamlib (compilador de shaders de deko3d: devkitPro/uam + `material/uam_r15dk.patch`) y la deja como `libuamlib_ns.a` (todo local salvo `uamlib::Compile`) | ~30 s con `-j8` |
-| `vista` | árbol de compilación: `export/` + runtime (`runtime/nWiiRuntime`, el de m6q) + GLAD; cada fuente y cabecera empieza por `#line 1 "<ruta original>"` (ver PGO) | < 5 s |
+| `vista` | árbol de compilación: `export/` + runtime (`runtime/nWiiRuntime`, el de m6s = m6q + inclinación corregida + petición de CPU a sys-clk, quitada al perder el foco) + GLAD; cada fuente y cabecera empieza por `#line 1 "<ruta original>"` (ver PGO) | < 5 s |
 | `compilar` | CMake + ninja con devkitA64: `main_output.cpp` sola y luego todo con `-jN`; el agua nativa; enlace (con PGO: pares caliente/frío + orden L de m6q); `nacptool` + `elf2nro`; comprueba la tabla fastmem (0 mal formadas) y que esté `[WAGUA]` | ~11,5 min con PGO, ~7,5 sin PGO (`-j8`) |
 | `sd` | `preparar_sd.py` copia los datos del juego y el NRO a `salida/sd/switch/NSMBWnx/` | ~10 s |
 
@@ -133,6 +133,23 @@ recompilador, uam y toml++ (`--recompilador`, `--uam`, `--tomlplusplus`):
 | repetición desde cero | el mismo código (solo cambia la fecha de compilación) |
 | `--sin-pgo` | sale (compilación 7,4 min con `-j8`); fastmem 723 842 entradas, 0 mal formadas; `.text` 57,7 MB (con PGO 62,6 MB). **Rendimiento sin medir en consola** |
 | reanudar | probado a mano en varias tandas (etapas hechas se saltan; ninja y los objetos del código generado solo se rehacen si cambian) |
+
+**m6r** (16-nov-2026, runtime de m6q + dos cambios solo de Switch, parche en `r9/r47final/m6r_vs_m6q.patch`):
+inclinación por movimiento corregida de fábrica (`tilt_invert = false` da ahora el sentido que antes daba `true`) y
+petición de CPU a sys-clk (`src/platform/switch/sysclk_client.cpp`, `[switch] cpu_mhz = 1224`, `0` = nada;
+`NWII_NX_SYSCLK_OFF=1` lo apaga). Construido con esta herramienta desde una carpeta vacía (PGO + orden L, 12,8 min):
+los 12 pasos del código generado `= referencia`; fastmem 871 162 entradas, 0 mal formadas; frente al NRO por defecto
+de m6q, de 101 895 funciones **101 887 iguales** (solo cambian campos de reubicación) y distintas solo las del runtime
+tocado (`early_init`, `shutdown`, `apply_env`, `poll_pad` con la inclinación, `__nx_mod0`) más las nuevas
+`sysclk_start`/`sysclk_stop`. NRO sha256 `cdf3085581ce7f09d2e50394566e6f629cb1d83687a2f9641a9aa447c8677279`.
+Probado en consola (Horizon OC, `hoc:clk` API 2): pide 1224 MHz; pero HOME → cerrar programa mata el proceso sin
+`shutdown()`/`atexit` y el override se quedaba puesto. **m6s** lo arregla: con un gancho de applet quita el override al
+perder el foco (HOME, dormir) y lo vuelve a pedir al recuperarlo (`[NX] sys-clk: quitado (foco perdido)` /
+`pedido (foco recuperado)`); parche `r9/r47final/m6s_vs_m6q.patch`. En consola el gancho de foco no llegó a ejecutarse antes del cierre, así que
+**m6t** además bloquea la salida (`appletLockExit`) mientras hay sesión con sys-clk: HOME → cerrar llega como
+ExitRequested, el juego quita el override (`quitado (salida pedida)`), vacía el registro y sale por `shutdown()`
+(`appletUnlockExit`); un hilo de guarda desbloquea la salida a los 3 s y termina el proceso a los 6 s pase lo que pase.
+Parche `r9/r47final/m6t_vs_m6q.patch`; m6t sin probar aún en consola.
 
 Lo que **no** está probado:
 - **Ningún NRO de esta herramienta se ha ejecutado aún en la consola.** El de `--sin-comprobar-dol` tiene el mismo

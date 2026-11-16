@@ -28,7 +28,7 @@
 // paused while it is shown.
 //
 // env.txt: NWII_NX_NO_MOTION=1 (buttons only), NWII_NX_TILT_INVERT=1 (flip
-// motion tilt), NWII_NX_JOY_ROTATE=1 (rotate the stick of single Joy-Cons
+// motion tilt w.r.t. the m6r default, = the pre-m6r sign), NWII_NX_JOY_ROTATE=1 (rotate the stick of single Joy-Cons
 // by hand if the system does not), NWII_NX_SIX_ROTATE=0 (do not turn the
 // six-axis of single Joy-Cons to the sideways hold), NWII_NX_JOYCON=single|pair
 // (= [input] joycon_mode).

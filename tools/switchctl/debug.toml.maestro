@@ -8,3 +8,4 @@ MESA_NO_ERROR = "1"     # r10e: OpenGL sin comprobación de errores en cada llam
 NWII_NX_TILT_INVERT = "1"   # 15-nov: la inclinación por movimiento de los Joy-Con iba al revés (pedido del usuario); borrar esta línea para volver al signo anterior
 
 # 16-nov: binario m6q instalado; trae de fábrica todo lo anterior (fusión del agua, agua nativa, audio, registro en segundo plano) más la fusión de dibujos de listas. Para apagar algo: <NOMBRE>_OFF = "1".
+NWII_NX_SYSCLK_OFF = "1"   # 16-nov: en las mediciones el juego NO pide CPU a sys-clk (m6r); quitar esta línea para jugar
