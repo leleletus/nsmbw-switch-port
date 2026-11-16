@@ -6,11 +6,5 @@ NWII_POLL_STATS = "1"   # contadores del sondeo de interrupciones en la línea d
 #NWII_NORING = "0"      # anillo de vértices: en r10e el mapa bajó de 17 a 11-13 fps con él; desactivado
 MESA_NO_ERROR = "1"     # r10e: OpenGL sin comprobación de errores en cada llamada (ahorra CPU)
 NWII_NX_TILT_INVERT = "1"   # 15-nov: la inclinación por movimiento de los Joy-Con iba al revés (pedido del usuario); borrar esta línea para volver al signo anterior
-# --- 15-nov 21:20, binario m6h instalado: mejoras medidas en M29 que m6h trae apagadas (m6i las traerá de fábrica; entonces sobran) ---
-NWII_D_MERGE = "1"      # funde los 1 100 dibujos sueltos de la superficie del agua en uno
-NWII_W_AGUA = "1"       # rutina nativa de la superficie de agua/lava/veneno/arena (misma salida byte a byte)
-NWII_W_WGP = "1"        # escritura ligera al pipe de GX
-NWII_A_MIX = "2"        # mezclador de audio integrado + ADPCM por lotes (salida idéntica lista a lista)
-NWII_A_NOSPIN = "1"     # las esperas cortas del sonido duermen en vez de girar
-NWII_A_REQSPIN = "200"
-NWII_M_LOGBG = "1"      # vaciado del registro a la SD en un hilo aparte (no en el render)
+
+# 16-nov: binario m6q instalado; trae de fábrica todo lo anterior (fusión del agua, agua nativa, audio, registro en segundo plano) más la fusión de dibujos de listas. Para apagar algo: <NOMBRE>_OFF = "1".
