@@ -120,4 +120,4 @@ usa `debug.toml` (`tools/switchctl/debug.toml.maestro`) y el control remoto por 
 - El recompilador de terceros tiene licencia propia **de uso no comercial** y prohíbe el entrenamiento de IA
   ([`recompilador/LICENSE_NWiiRecomp`](recompilador/LICENSE_NWiiRecomp)); las obras derivadas deben mantener esas condiciones.
 - «Nintendo», «Wii», «Switch» y «New Super Mario Bros.» son marcas de Nintendo; este proyecto no está afiliado a ella.
-- Licencia del trabajo propio de este repositorio: **sin decidir** (ver nota del autor antes de publicar).
+- Licencia de este repositorio: la misma del proyecto original del que deriva (ver `LICENSE`): uso no comercial y atribución. No incluye nada del juego; el NRO no se distribuye: cada quien lo construye con `tools/construir_nro` a partir de su propia copia.
