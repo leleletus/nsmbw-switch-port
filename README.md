@@ -121,3 +121,22 @@ usa `debug.toml` (`tools/switchctl/debug.toml.maestro`) y el control remoto por 
   ([`recompilador/LICENSE_NWiiRecomp`](recompilador/LICENSE_NWiiRecomp)); las obras derivadas deben mantener esas condiciones.
 - «Nintendo», «Wii», «Switch» y «New Super Mario Bros.» son marcas de Nintendo; este proyecto no está afiliado a ella.
 - Licencia de este repositorio: la misma del proyecto original del que deriva (ver `LICENSE`): uso no comercial y atribución. No incluye nada del juego; el NRO no se distribuye: cada quien lo construye con `tools/construir_nro` a partir de su propia copia.
+
+## Qué ve el usuario final (sin depuración)
+
+Una instalación normal (el `.nro` construido con `tools/construir_nro` + los datos de `tools/preparar_sd`) **no muestra
+contador de fps ni escribe registros**: el juego arranca en modo silencioso y solo guarda errores graves en
+`logs/nwii_err.log`. No hay que desactivar nada.
+
+Las ayudas de diagnóstico son opcionales y solo se activan si el usuario las pide:
+
+- Contador de fps en pantalla: `fps_overlay = true` en la sección `[switch]` de `config.toml`.
+- Registro detallado y perfilador: un fichero `debug.toml` junto al `.nro` (ver `tools/switchctl/debug.toml.maestro`,
+  que es el que se usó para medir). Cuesta rendimiento; **bórralo para jugar**.
+
+## Rendimiento y reloj de la consola (opcional)
+
+Medido a los relojes de fábrica en portátil (CPU 1020 MHz, GPU 460 MHz): 58–60 fps en casi todo el juego y ~57,5 en
+niveles de agua, donde el límite es la CPU. El modo dock no sube la CPU, así que no cambia ese caso. Quien tenga
+instalado **sys-clk** (módulo aparte, no viene con Atmosphère) puede crear un perfil para el juego con CPU 1224 MHz y
+GPU 460 MHz para tener más margen en agua; esa cifra es una estimación proporcional, pendiente de medir.
