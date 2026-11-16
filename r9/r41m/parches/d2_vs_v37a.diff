@@ -1,0 +1,423 @@
+diff --color -ruN r40d/base_v37a/nWiiRuntime/src/hle/gx/renderer_gl.cpp r40d/nWiiRuntime/src/hle/gx/renderer_gl.cpp
+--- r40d/base_v37a/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-15 06:18:14.236574383 -0500
++++ r40d/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-15 13:07:50.661724612 -0500
+@@ -5733,6 +5733,9 @@
+ const std::vector<uint32_t> *g_render_pack = nullptr;
+ // r36r NWII_R_PREFIX: register writes of dropped frames, run before the frame (gx.cpp).
+ const std::vector<GXCommand> *g_render_prefix = nullptr;
++// r40d NWII_D_DROPFAST: first command of the frame to render (gx.cpp; the ones
++// before it are the dropped part of the batch, whose kept writes are in the prefix).
++size_t g_render_start = 0;
+ 
+ // R14 R5, GPU XF: prefetch from the worker's entry list, without the
+ // dependent loads of the old prefetch (command -> DecodedVerts -> entry, each
+@@ -6119,7 +6122,7 @@
+     for (int pass = pre ? 0 : 1; pass < 2; ++pass) {
+     const GXCommand *const cmd0 = pass == 0 ? pre->data() : commands.data();
+     const size_t ncmd = pass == 0 ? pre->size() : commands.size();
+-    for (size_t ci = 0; ci < ncmd; ++ci) {
++    for (size_t ci = pass == 0 ? 0 : std::min(g_render_start, ncmd); ci < ncmd; ++ci) {  // r40d: start
+       const GXCommand &cmd = cmd0[ci];
+       // R14 R5: the command array is walked once, in order, 136 bytes a
+       // command (~45 000 per world-map frame, ~6 MB: the first load of each was
+diff --color -ruN r40d/base_v37a/nWiiRuntime/src/hle/gx.cpp r40d/nWiiRuntime/src/hle/gx.cpp
+--- r40d/base_v37a/nWiiRuntime/src/hle/gx.cpp	2026-11-15 13:06:19.210287726 -0500
++++ r40d/nWiiRuntime/src/hle/gx.cpp	2026-11-15 13:25:42.320757928 -0500
+@@ -786,6 +786,7 @@
+ extern const std::vector<const void *> *g_render_entries;  // renderer_gl.cpp (R14 R5)
+ extern const std::vector<uint32_t> *g_render_pack;         // renderer_gl.cpp (R14 R5)
+ extern const std::vector<GXCommand> *g_render_prefix;      // renderer_gl.cpp (r36r NWII_R_PREFIX)
++extern size_t g_render_start;                              // renderer_gl.cpp (r40d NWII_D_DROPFAST)
+ }
+ static uint64_t g_ph[8], g_ph_n;
+ static std::vector<nwii::runtime::gx::GXCommand*> s_draws;
+@@ -1003,6 +1004,10 @@
+     // r36r NWII_R_PREFIX: the kept register writes of the frames retracted
+     // before this one (no draws), rendered before `frame`.
+     std::vector<nwii::runtime::gx::GXCommand> pre;
++    // r40d NWII_D_DROPFAST: `frame` starts with the dropped part of its batch
++    // (draws and dead writes, never rendered; its kept writes are in `pre`):
++    // the renderer starts at frame[start].
++    size_t start = 0;
+     uint64_t seq = 0;          // R22 R7: frame number (s_prep_frames) of its frame
+     bool has_draws = false;    // R22 R7: its commands may point at retired vertices
+     bool render_frees = false; // R22 R7: no command shares a reference count with the worker
+@@ -1233,14 +1238,19 @@
+ // exactly as a drain that finds two frame ends drops the first one's draws.
+ static void RetractToPrefix(FramePacket &pkt) {
+     auto &v = pkt.frame;
++    // r40d NWII_D_DROPFAST: frame[0, start) is the dropped part of the packet's
++    // batch (its kept writes are already in pkt.pre): never looked at again.
++    const size_t b = std::min(pkt.start, v.size());
++    pkt.start = 0;
+     if (rcoal::On()) {
+-        const size_t w = rcoal::Compact(v, 0, v.size(), [&](nwii::runtime::gx::GXCommand &c) {
++        const size_t w = rcoal::Compact(v, b, v.size(), [&](nwii::runtime::gx::GXCommand &c) {
+             if (c.type == nwii::runtime::gx::GXCommandType::BPRegister && c.reg == 0x52) {
+                 if ((c.val & 0x4000) && !c.stale_copy) ++pkt.stats.dropped;
+                 c.stale_copy = true;
+             }
+         });
+         v.erase(v.begin() + w, v.end());
++        if (b) v.erase(v.begin(), v.begin() + b);  // r40d
+         pkt.draws.clear();
+         pkt.entries.clear();
+         pkt.pack.clear();
+@@ -1252,8 +1262,8 @@
+         }
+         return;
+     }
+-    size_t w = 0;
+-    for (size_t i = 0; i < v.size(); ++i) {
++    size_t w = b;  // r40d (was 0)
++    for (size_t i = b; i < v.size(); ++i) {
+         auto &c = v[i];
+         if (c.type == nwii::runtime::gx::GXCommandType::DrawPrimitive) continue;
+         if (c.type == nwii::runtime::gx::GXCommandType::BPRegister && c.reg == 0x52) {
+@@ -1264,6 +1274,7 @@
+         ++w;
+     }
+     v.erase(v.begin() + w, v.end());
++    if (b) v.erase(v.begin(), v.begin() + b);  // r40d
+     pkt.draws.clear();
+     pkt.entries.clear();
+     pkt.pack.clear();
+@@ -1275,6 +1286,192 @@
+     }
+ }
+ 
++// ---- r40d (frente D): NWII_D_DROPFAST ----------------------------------------
++// A drain whose batch holds two or more frame ends (the worker fell behind)
++// drops the frames before the last one. The old path (PrepFrame, `else` below)
++// moves EVERY command of the batch one by one into s_frame, the kept frame's
++// included, and forgets the parser's draw entries (all its draws prepared
++// again): on the Switch ~14 ms split + ~8 ms decode per prepared frame in
++// agua_pinguino and the castle party, so the next batch holds two or three
++// frame ends again (the slow regime keeps itself going).
++// NWII_D_DROPFAST=1: the dropped part [0, D) of the batch is handled as a
++// retracted packet is (RetractToPrefix): its kept register writes (no draws,
++// rcoal's dead writes removed, EFB copies stale) are APPENDED to pkt.pre, which
++// the renderer runs first, in the same order; the kept frame takes the fast path
++// (s_carry handed over whole, the parser's entries kept) and the renderer starts
++// at frame[D] (FramePacket::start, g_render_start). The dropped commands stay in
++// the frame vector, never rendered, until the packet is freed (render thread or
++// worker, as the frame); their owning pointers (DrawRaw, decoded vertices: counts
++// not atomic, shared with the display-list cache) are reset here, on the worker,
++// so the packet's render_frees still holds. One backward pass over [0, D) does
++// rcoal's marking (same rules as rcoal::Mark) and collects the kept commands;
++// only those (~15 % of the dropped part) are moved.
++namespace dfast {
++static bool On() {
++    static const bool on = [] {
++        const char *e = NWII_ENV("NWII_D_DROPFAST");
++        const bool v = e && e[0] && e[0] != '0';
++        if (v) std::printf("[D40] descarte barato en el trabajador: NWII_D_DROPFAST=1\n");
++        return v;
++    }();
++    return on;
++}
++// Counters (worker), printed by Report every ~2 s when there was a multi-end
++// batch: fast path (this) and old path (PrepFrame's `else`), for both settings.
++static uint64_t st_parts = 0, st_frames = 0, st_cmds = 0, st_kept = 0, st_ticks = 0;
++static uint64_t st_old_parts = 0, st_old_frames = 0, st_old_cmds = 0, st_old_ticks = 0;
++static std::vector<uint32_t> s_keep;
++// The dropped part v[0, D): kept writes appended to `pre`, draws disowned.
++static void DropPart(std::vector<nwii::runtime::gx::GXCommand> &v, size_t D,
++                     std::vector<nwii::runtime::gx::GXCommand> &pre, uint64_t &dropped_xfb) {
++    using nwii::runtime::gx::GXCommandType;
++    const uint64_t t0 = wprof::Tick();
++    const bool coal = rcoal::On(), check = coal && rcoal::CheckOn();
++    if (check) rcoal::s_dead.assign(D, 0);
++    s_keep.clear();
++    rcoal::NewSegment();
++    size_t draws = 0, dead = 0;
++    for (size_t i = D; i-- > 0;) {
++        auto &c = v[i];
++        if (i >= 8) __builtin_prefetch(&v[i - 8]);
++        if (c.type == GXCommandType::DrawPrimitive) {
++            ++draws;
++            if (c.raw) c.raw.reset();
++            if (c.shared_vertices) c.shared_vertices.reset();
++            continue;
++        }
++        if (coal) {
++            if (c.type == GXCommandType::BPRegister) {
++                const uint8_t reg = (uint8_t)c.reg;
++                if (rcoal::IsBarrierBP(reg)) {
++                    rcoal::NewSegment();
++                } else {
++                    const uint32_t k = rcoal::BpKey(c);
++                    if (rcoal::s_bp_stamp[k] == rcoal::s_stamp) {
++                        ++dead;
++                        if (check) rcoal::s_dead[i] = 1;
++                        continue;
++                    }
++                    rcoal::s_bp_stamp[k] = rcoal::s_stamp;
++                }
++            } else if (c.type == GXCommandType::XFRegister) {
++                const uint32_t a = c.reg, n = (uint32_t)c.payload.size();
++                if (n != 0 && a + n <= rcoal::kXfWords) {
++                    bool all = true;
++                    for (uint32_t k = 0; k < n; ++k)
++                        if (rcoal::s_xf_stamp[a + k] != rcoal::s_stamp) {
++                            all = false;
++                            rcoal::s_xf_stamp[a + k] = rcoal::s_stamp;
++                        }
++                    if (all) {
++                        ++dead;
++                        if (check) rcoal::s_dead[i] = 1;
++                        continue;
++                    }
++                }
++            }
++        }
++        s_keep.push_back((uint32_t)i);
++    }
++    if (coal) {
++        rcoal::st_dead += dead;
++        rcoal::st_draws += draws;
++        ++rcoal::st_calls;
++        rcoal::st_in += D;
++        if (check) rcoal::Check(v, 0, D, rcoal::s_dead);
++    }
++    uint64_t ends = 0;
++    pre.reserve(pre.size() + s_keep.size());
++    for (size_t j = s_keep.size(); j-- > 0;) {
++        auto &c = v[s_keep[j]];
++        if (c.type == GXCommandType::BPRegister && c.reg == 0x52) {
++            if ((c.val & 0x4000) && !c.stale_copy) ++ends;
++            c.stale_copy = true;
++        }
++        pre.push_back(std::move(c));
++    }
++    dropped_xfb += ends;
++    ++st_parts;
++    st_frames += ends;
++    st_cmds += D;
++    st_kept += s_keep.size();
++    st_ticks += wprof::Tick() - t0;
++}
++// NWII_D_DROPFAST_CHECK=1 (tests): the command list the renderer gets from the
++// fast drop (the appended part of pkt.pre, then frame[start, end]) must equal,
++// command by command, the one the old path would have built (same commands,
++// same values and payloads, same draw objects, same stale flags).
++static bool CheckOn() {
++    static const bool on = NWII_ENV("NWII_D_DROPFAST_CHECK") != nullptr;
++    return on;
++}
++static uint64_t st_chk = 0, st_chk_bad = 0, st_chk_cmds = 0;
++static std::vector<uint64_t> s_exp;
++static inline uint64_t CmdHash(const nwii::runtime::gx::GXCommand &c, bool stale) {
++    uint64_t h = (uint64_t)c.type | ((uint64_t)c.prim_type << 8) | ((uint64_t)stale << 16) |
++                 ((uint64_t)c.reg << 24) | ((uint64_t)c.length << 40);
++    h = h * 0x9E3779B97F4A7C15ull ^ c.val;
++    h = h * 0x9E3779B97F4A7C15ull ^ c.bp_raw;
++    h = h * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)c.raw.get();
++    h = h * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)c.shared_vertices.get();
++    h = h * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)c.vertices.size();
++    const size_t n = c.payload.size();
++    h = h * 0x9E3779B97F4A7C15ull ^ n;
++    for (size_t k = 0; k < n; ++k) {
++        uint32_t u;
++        std::memcpy(&u, &c.payload.data()[k], 4);
++        h = h * 0x100000001B3ull ^ u;
++    }
++    return h;
++}
++// Before DropPart: what the old path would hand the renderer from v[0, end].
++static void CheckExpect(const std::vector<nwii::runtime::gx::GXCommand> &v, size_t D, size_t end) {
++    using nwii::runtime::gx::GXCommandType;
++    const bool coal = rcoal::On();
++    if (coal) rcoal::Mark(v, 0, D);
++    s_exp.clear();
++    for (size_t i = 0; i < end; ++i) {
++        const auto &c = v[i];
++        if (i < D) {
++            if (c.type == GXCommandType::DrawPrimitive) continue;
++            if (coal && rcoal::s_dead[i]) continue;
++            s_exp.push_back(CmdHash(c, c.stale_copy || (c.type == GXCommandType::BPRegister && c.reg == 0x52)));
++        } else {
++            s_exp.push_back(CmdHash(c, c.stale_copy));
++        }
++    }
++}
++static void CheckGot(const std::vector<nwii::runtime::gx::GXCommand> &pre, size_t pre0,
++                     const std::vector<nwii::runtime::gx::GXCommand> &frame, size_t start, size_t end) {
++    size_t k = 0;
++    bool ok = (pre.size() - pre0) + (end - start) == s_exp.size();
++    for (size_t i = pre0; ok && i < pre.size(); ++i) ok = CmdHash(pre[i], pre[i].stale_copy) == s_exp[k++];
++    for (size_t i = start; ok && i < end; ++i) ok = CmdHash(frame[i], frame[i].stale_copy) == s_exp[k++];
++    ++st_chk;
++    st_chk_cmds += s_exp.size();
++    if (!ok) ++st_chk_bad;
++}
++static void Report() {
++    static auto last = std::chrono::steady_clock::now();
++    const auto now = std::chrono::steady_clock::now();
++    if (now - last < std::chrono::seconds(2)) return;
++    last = now;
++    if (CheckOn())
++        std::printf("[D40CHECK] lotes comprobados=%llu ordenes=%llu distintos=%llu\n", (unsigned long long)st_chk,
++                    (unsigned long long)st_chk_cmds, (unsigned long long)st_chk_bad);
++    if (st_parts || st_old_parts)
++        std::printf("[D40] lotes con varios finales: barato %llu (fot. tirados %llu, ordenes %llu, conservadas %llu,"
++                    " %.0f us/lote) | viejo %llu (fot. tirados %llu, ordenes %llu, %.0f us/lote)\n",
++                    (unsigned long long)st_parts, (unsigned long long)st_frames, (unsigned long long)st_cmds,
++                    (unsigned long long)st_kept, st_parts ? wprof::TickUs(st_ticks) / (double)st_parts : 0.0,
++                    (unsigned long long)st_old_parts, (unsigned long long)st_old_frames,
++                    (unsigned long long)st_old_cmds,
++                    st_old_parts ? wprof::TickUs(st_old_ticks) / (double)st_old_parts : 0.0);
++    st_parts = st_frames = st_cmds = st_kept = st_ticks = 0;
++    st_old_parts = st_old_frames = st_old_cmds = st_old_ticks = 0;
++}
++}  // namespace dfast
++
+ // The preparing half of a drain (see above). Returns the packet a frame was
+ // produced into (nullptr: none yet): the one `acquire` returns (called once a frame end is
+ // parsed; `retracted`: it hands back a packet not rendered yet, whose
+@@ -1475,7 +1672,14 @@
+     auto &frame = s_frame;
+     frame.clear();
+     s_draws.clear();
+-    if (prev_frame_end < 0 && !retr_slow) {
++    // r40d NWII_D_DROPFAST: a batch with two or more frame ends also takes the
++    // fast path; its dropped part [0, fstart) goes to pkt.pre (see dfast::).
++    const bool dfast_now = prev_frame_end >= 0 && !retr_slow && RPrefixOn() && dfast::On();
++    const size_t fstart = dfast_now ? (size_t)prev_frame_end + 1 : 0;
++    if ((prev_frame_end < 0 || dfast_now) && !retr_slow) {
++        const size_t d_pre0 = pkt.pre.size();
++        if (dfast_now && dfast::CheckOn()) dfast::CheckExpect(s_carry, fstart, (size_t)last_frame_end + 1);
++        if (dfast_now) dfast::DropPart(s_carry, fstart, pkt.pre, s_prep_pending.dropped);
+         // Nothing to drop (the usual case at full speed): move only the
+         // commands after the frame end (the next frame's start) out, and
+         // take the rest as the frame without touching it.
+@@ -1487,10 +1691,12 @@
+         s_carry.erase(s_carry.begin() + last_frame_end + 1, s_carry.end());
+         frame.swap(s_carry);
+         s_carry.swap(tail);
++        if (dfast_now && dfast::CheckOn()) dfast::CheckGot(pkt.pre, d_pre0, frame, fstart, frame.size());
+         // Draw positions: the frame keeps those up to its end (same
+         // indices), the carried-over tail gets the rest, rebased.
+         size_t k = 0;
+         s_draw_entries.clear();
++        while (k < s_carry_draws.size() && s_carry_draws[k] < fstart) ++k;  // r40d: dropped draws
+         for (; k < s_carry_draws.size() && (int)s_carry_draws[k] <= last_frame_end; ++k) {
+             s_draws.push_back(&frame[s_carry_draws[k]]);
+             s_draw_entries.push_back(s_carry_ents[k]);
+@@ -1503,6 +1709,8 @@
+         s_carry_draws.resize(w);
+         s_carry_ents.resize(w);
+     } else {
++    const uint64_t old_t0 = wprof::Tick();  // r40d: cost of this path ([D40])
++    const uint64_t old_drop0 = s_prep_pending.dropped;
+     frame.reserve(pkt.frame.size() + s_carry.size());
+     // R11: a retracted packet's commands (draws already dropped) come first.
+     for (auto &c : pkt.frame) frame.push_back(std::move(c));
+@@ -1547,6 +1755,12 @@
+             s_carry_draws.push_back((uint32_t)i);
+             s_carry_ents.push_back(nwii::runtime::gx::FifoParser::kEntryUnknown);
+         }
++    if (prev_frame_end >= 0) {  // r40d: counters of the old path ([D40])
++        ++dfast::st_old_parts;
++        dfast::st_old_frames += s_prep_pending.dropped - old_drop0;
++        dfast::st_old_cmds += (uint64_t)prev_frame_end + 1;
++        dfast::st_old_ticks += wprof::Tick() - old_t0;
++    }
+     }
+ 
+     // NWII_FRAMESIG: per-frame signature (draw count + TEV colour/konst regs
+@@ -1608,9 +1822,11 @@
+     if (s_r7check) {
+         size_t k = 0;
+         bool ok = true;
+-        for (auto &c : frame)
++        for (size_t fi = fstart; fi < frame.size(); ++fi) {  // r40d: from the kept frame
++            auto &c = frame[fi];
+             if (c.type == nwii::runtime::gx::GXCommandType::DrawPrimitive)
+                 ok = ok && k < s_draws.size() && s_draws[k++] == &c;
++        }
+         ok = ok && k == s_draws.size();
+         static uint64_t checked = 0, bad = 0, nty[4], npay;
+         for (auto &c : frame) { ++nty[(int)c.type & 3]; npay += c.payload.size(); }
+@@ -1673,7 +1889,7 @@
+     s_prep_pending.draws += nd;
+     if (!wprof_split) st.mark(wprof::kDecode);
+     wprof::s_frames.fetch_add(1, std::memory_order_relaxed);
+-    wprof::s_cmds.fetch_add(s_frame.size(), std::memory_order_relaxed);
++    wprof::s_cmds.fetch_add(s_frame.size() - fstart, std::memory_order_relaxed);
+     wprof::s_draws.fetch_add(nd, std::memory_order_relaxed);
+     PH(4);
+     auto d1 = std::chrono::steady_clock::now();
+@@ -1686,6 +1902,7 @@
+     pkt.draws.swap(s_draws);
+     pkt.entries.swap(s_draw_entries);
+     pkt.pack.swap(s_draw_pack);
++    pkt.start = fstart;  // r40d
+     pkt.seq = s_prep_frames;
+     pkt.has_draws = !pkt.draws.empty();
+     // (the draws not in the todo list are display-list memo draws: never owning)
+@@ -1760,6 +1977,7 @@
+         }
+     }
+     rcoal::Report();  // r36r
++    dfast::Report();  // r40d
+     return &pkt;
+ }
+ 
+@@ -1921,6 +2139,7 @@
+                 pkt.entries.size() == pkt.draws.size() ? &pkt.entries : nullptr;
+             nwii::runtime::gx::g_render_pack = &pkt.pack;
+             nwii::runtime::gx::g_render_prefix = &pkt.pre;  // r36r (empty unless NWII_R_PREFIX)
++            nwii::runtime::gx::g_render_start = pkt.start;  // r40d (0 unless NWII_D_DROPFAST)
+             // r31t (frente T), SOLO MEDIR: NWII_T_NORENDER=N dibuja 1 de cada N fotogramas
+             // (el hilo de render queda casi parado) para ver cuanto frena al hilo del juego
+             // el trabajo del render en los otros nucleos (cache L2 compartida, memoria).
+@@ -1935,6 +2154,7 @@
+             nwii::runtime::gx::g_render_entries = nullptr;
+             nwii::runtime::gx::g_render_pack = nullptr;
+             nwii::runtime::gx::g_render_prefix = nullptr;
++            nwii::runtime::gx::g_render_start = 0;
+             if (gpuprof) g_gpu_timer.end();
+             g_prof_render_cpu_us += thread_cpu_us() - rc0;
+             auto r1 = std::chrono::steady_clock::now();
+@@ -2020,8 +2240,39 @@
+         return s_rendering == &s_pkts[0] ? &s_pkts[1] : &s_pkts[0];
+     };
+     auto last_frame = clk::now();
++#if !defined(__SWITCH__)
++    // r40d, SOLO PRUEBAS EN PC: NWII_D_SLOWWORKER=<factor>[,<us>]: tras cada llamada a PrepFrame que trabajo, el
++    // trabajador duerme (factor - 1) x lo que tardo (+ us si preparo un fotograma): un trabajador <factor> veces
++    // mas lento, como el de la Switch (nucleo 2 compartido con la CPU de sonido); asi llegan lotes con dos
++    // finales de fotograma y el coste del descarte realimenta el siguiente lote, como en la consola.
++    static const double s_d_slow_f = [] {
++        const char *e = std::getenv("NWII_D_SLOWWORKER");
++        return e ? std::atof(e) : 0.0;
++    }();
++    static const long s_d_slow_us = [] {
++        const char *e = std::getenv("NWII_D_SLOWWORKER");
++        const char *c = e ? std::strchr(e, ',') : nullptr;
++        return c ? std::atol(c + 1) : 0L;
++    }();
++#endif
+     for (;;) {
+-        if (FramePacket *fill = PrepFrame(acquire, false)) {
++#if !defined(__SWITCH__)
++        const auto d_t0 = clk::now();
++        const uint64_t d_f0 = s_prep_frames;
++        const bool d_had = s_d_slow_f > 1.0 &&
++                           (!s_parse_buf.empty() ||
++                            [] { std::lock_guard<FifoLock> lock(g_fifo_mutex); return !g_hw_fifo.empty(); }());
++#endif
++        FramePacket *fill = PrepFrame(acquire, false);
++#if !defined(__SWITCH__)
++        if (d_had) {
++            const auto el = clk::now() - d_t0;
++            std::this_thread::sleep_for(
++                std::chrono::duration_cast<std::chrono::microseconds>(el * (s_d_slow_f - 1.0)) +
++                std::chrono::microseconds(s_prep_frames != d_f0 ? s_d_slow_us : 0L));
++        }
++#endif
++        if (fill) {
+             {
+                 const int64_t t = PipeNow();
+                 const int64_t x = s_pipe_xfb_last.load(std::memory_order_relaxed);

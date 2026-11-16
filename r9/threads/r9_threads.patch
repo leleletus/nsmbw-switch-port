@@ -1,0 +1,2481 @@
+diff --color -ruN -x '*.orig' -x '*.rej' base/nWiiRuntime/CMakeLists.txt threads/nWiiRuntime/CMakeLists.txt
+--- base/nWiiRuntime/CMakeLists.txt	2026-10-27 15:30:33.553288011 -0500
++++ threads/nWiiRuntime/CMakeLists.txt	2026-10-31 06:55:31.990161763 -0500
+@@ -47,6 +47,8 @@
+     src/hle/texture_cache_gl.cpp
+     src/hle/ax.cpp
+     src/hle/ax/ax_hle.cpp
++    src/hle/ax/ax_hle_ref.cpp
++    src/hle/ax/ax_async.cpp
+     src/hle/ios.cpp
+     src/hle/ios_kernel.cpp
+     src/hle/virtual_disc.cpp
+diff --color -ruN -x '*.orig' -x '*.rej' base/nWiiRuntime/src/core/main.cpp threads/nWiiRuntime/src/core/main.cpp
+--- base/nWiiRuntime/src/core/main.cpp	2026-10-31 03:38:55.951329536 -0500
++++ threads/nWiiRuntime/src/core/main.cpp	2026-10-31 06:55:31.990332342 -0500
+@@ -847,7 +847,7 @@
+         std::printf(", host thread %.0f%%", 100.0 * (host_cpu - host_cpu0) / dt);
+       if (cpu_cpu >= 0)
+         std::printf(", cpu thread %.0f%%", 100.0 * (cpu_cpu - cpu_cpu0) / dt);
+-      char gov[160];
++      char gov[384];
+       nwii::runtime::governor_report(gov, sizeof gov, dt);
+       std::printf(", idle sleeps %.0f/s (%.0f%% of the time)%s\n",
+                   (sleeps - sleeps0) / dt, (sleep_us - sleep_us0) / dt / 1e4, gov);
+diff --color -ruN -x '*.orig' -x '*.rej' base/nWiiRuntime/src/core/os_hle_stubs.cpp threads/nWiiRuntime/src/core/os_hle_stubs.cpp
+--- base/nWiiRuntime/src/core/os_hle_stubs.cpp	2026-10-29 13:19:23.550849010 -0500
++++ threads/nWiiRuntime/src/core/os_hle_stubs.cpp	2026-10-31 06:55:31.990640166 -0500
+@@ -13,6 +13,7 @@
+ #include <thread>
+ #include <algorithm>
+ #include "runtime/event_scheduler.h"
++#include "../hle/ax/ax_hle.h"
+ 
+ using namespace nwii::runtime;
+ 
+@@ -265,6 +266,9 @@
+ 
+ // ", busy max .. ms, clock x.. , slip .. ms, interp ../s" for the periodic
+ // NWII_FPS / Switch fps_log lines; resets the per-report maxima.
++void GX_WGPIPE_Flush();  // gx.cpp
++int GX_WgpStatsLine(char *buf, int size, double dt);  // gx.cpp
++
+ void governor_report(char *buf, size_t n, double dt) {
+   static uint64_t interp0 = 0;
+   const uint64_t interp = g_interp_calls.load(std::memory_order_relaxed);
+@@ -275,6 +279,14 @@
+                 (unsigned long long)(g_gov_slip_us.load(std::memory_order_relaxed) / 1000),
+                 dt > 0 ? (interp - interp0) / dt : 0.0);
+   interp0 = interp;
++  // R8: AX command lists (where they mix, cost, CPU-thread waits).
++  const size_t used = std::strlen(buf);
++  if (used + 1 < n)
++    ax::stats_line(buf + used, (int)(n - used));
++  // R8 threads: GX write-gather buffer (FIFO writes and hand-overs per second).
++  const size_t used2 = std::strlen(buf);
++  if (used2 + 1 < n)
++    GX_WgpStatsLine(buf + used2, (int)(n - used2), dt);
+ }
+ 
+ void CPUContext::governor_step(uint64_t wall) const {
+@@ -352,6 +364,9 @@
+ }
+ 
+ void idle_wait(CPUContext &ctx) {
++  // R8 threads: hand the guest's gathered GX FIFO bytes to the host before
++  // the guest idles (see the write-gather buffer in gx.cpp).
++  GX_WGPIPE_Flush();
+   if (!CPUContext::wall_clock_tb())
+     return;
+   ctx.note_idle();
+diff --color -ruN -x '*.orig' -x '*.rej' base/nWiiRuntime/src/hle/ax/ax_async.cpp threads/nWiiRuntime/src/hle/ax/ax_async.cpp
+--- base/nWiiRuntime/src/hle/ax/ax_async.cpp	1969-12-31 19:00:00.000000000 -0500
++++ threads/nWiiRuntime/src/hle/ax/ax_async.cpp	2026-10-31 08:19:55.026255788 -0500
+@@ -0,0 +1,601 @@
++// R8 (threads): where the AX command list runs.
++//
++// On the Wii the DSP mixes beside the CPU: the AX library mails it the list
++// address and carries on; the DSP answers DSP_SYNC when the frame is mixed
++// (hw_dsp.cpp posts it 0.1 ms of guest time after the list mail). r7b mixed
++// the whole list on the CPU thread inside the mailbox write, ~1000 times a
++// second counting the other AX interrupts; on the Switch the CPU thread is the
++// bottleneck and cores 0/2 have room.
++//
++// NWII_AX_THREAD
++//   2 (default)  the list runs on the AX thread (Switch: core 2) and DSP_SYNC
++//                goes out when the mix is done, at 0.1 ms of guest time or
++//                later (at the latest with DSP_YIELD, 1 ms): like the real
++//                DSP, which answers once it has mixed. The CPU thread does not
++//                wait for the mix (measured on citron: ~150 us per list).
++//   1            the list runs on the AX thread, but the DSP_SYNC event waits
++//                for it at exactly 0.1 ms, the r7b mail timing.
++//   0            inline in the mailbox write, as r7b.
++// In 1 and 2, if the AX thread has not even started the list when the CPU
++// thread needs it, the CPU thread mixes it itself (never worse than inline).
++// Rule that makes 1 and 2 exact: between the list mail and DSP_SYNC/YIELD the guest
++// does not touch what the list reads or writes (voice blocks, aux and output
++// buffers, sample data). The AX library is written for a DSP that is busy for
++// a while, so it does not; NWII_AX_HAZARD=1 (PC, x86-64 Linux) checks it with
++// page protection, NWII_AX_VERIFY=1 checks the optimized mixer against the
++// r7b one (ax_hle_ref.cpp) on every list.
++#include "ax_hle.h"
++
++#include "runtime/cpu_context.h"
++#include "runtime/event_scheduler.h"
++#include "runtime/nwii_env.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <thread>
++
++#ifdef __SWITCH__
++#include <switch.h>
++#include <pthread.h>
++#include "../../platform/switch/switch_platform.h"
++#endif
++
++#if defined(__linux__) && defined(__x86_64__)
++#define NWII_AX_HAZARD_SUPPORTED 1
++#include <signal.h>
++#include <sys/mman.h>
++#include <ucontext.h>
++#include <unistd.h>
++#endif
++
++namespace nwii::runtime {
++extern MMU *g_mmu;
++extern CPUContext *g_ctx_ptr;
++}  // namespace nwii::runtime
++
++namespace nwii::runtime::ax {
++namespace {
++
++using clk = std::chrono::steady_clock;
++
++uint64_t now_ns() {
++  return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
++             clk::now().time_since_epoch())
++      .count();
++}
++
++bool env_on(const char *v) { return v && v[0] && v[0] != '0'; }
++
++// Switches are read on first use, not at static-init time: on the Switch the
++// debug.toml NWII_* values are put in the environment by early_init().
++struct Opts {
++  bool verify, ref_mixer, hazard;
++  int mode;
++};
++const Opts &opts() {
++  static const Opts o = [] {
++    Opts r{};
++    r.verify = env_on(std::getenv("NWII_AX_VERIFY"));
++    // NWII_AX_MIXER=ref: mix with the r7b scalar code (timing comparisons only).
++    const char *m = std::getenv("NWII_AX_MIXER");
++    r.ref_mixer = m && std::strcmp(m, "ref") == 0;
++#ifdef NWII_AX_HAZARD_SUPPORTED
++    r.hazard = env_on(std::getenv("NWII_AX_HAZARD"));
++#endif
++    const char *e = std::getenv("NWII_AX_THREAD");
++    r.mode = (!e || !e[0]) ? 2 : std::clamp(std::atoi(e), 0, 2);
++    if (r.hazard || r.verify) r.mode = 0;  // both mix inline, at the mail write
++    return r;
++  }();
++  return o;
++}
++
++// ---- stats (for the [FPS] / fps_log line) ----
++std::atomic<uint64_t> s_lists{0}, s_mix_ns{0}, s_mix_max_ns{0}, s_wait_ns{0}, s_waits{0};
++// R9: audio DMA passes that found the last list still in flight (and waited).
++std::atomic<uint64_t> s_dma_waits{0};
++
++// ---- NWII_AX_VERIFY: optimized mixer vs the r7b reference ----
++struct Verify {
++  std::unordered_map<const uint8_t *, uint8_t> overlay;
++  RangeLog wlog;
++  std::vector<uint8_t> sa, sb;
++  uint64_t lists = 0, bad_lists = 0, bad_bytes = 0, extra_bytes = 0, bad_state = 0,
++           bad_ret = 0;
++};
++Verify *g_v = nullptr;
++
++bool run_verified(uint32_t addr, uint16_t size) {
++  if (!g_v) g_v = new Verify;
++  Verify &v = *g_v;
++  v.overlay.clear();
++  ref::g_overlay = &v.overlay;
++  const bool pr = ref::run_command_list(addr, size);
++  v.wlog.clear();
++  g_write_log = &v.wlog;
++  const bool pn = run_command_list(addr, size);
++  g_write_log = nullptr;
++  uint64_t bad = 0, extra = 0;
++  for (const auto &[p, b] : v.overlay)
++    if (*p != b) ++bad;
++  for (const auto &[p, n] : v.wlog)
++    for (uint32_t i = 0; i < n; ++i)
++      if (!v.overlay.count(p + i)) ++extra;
++  ref::state_bytes(v.sa);
++  state_bytes(v.sb);
++  const bool state_ok = v.sa == v.sb;
++  ++v.lists;
++  if (bad || extra || !state_ok || pr != pn) {
++    ++v.bad_lists;
++    if (v.bad_lists <= 10)
++      std::printf("[AXV] MISMATCH list #%llu @%08x: %llu bytes differ, %llu extra bytes "
++                  "written, state %s, produced ref=%d new=%d\n",
++                  (unsigned long long)v.lists, addr, (unsigned long long)bad,
++                  (unsigned long long)extra, state_ok ? "same" : "DIFFERS", pr, pn);
++    // Keep comparing from the reference's state.
++    if (!state_ok) std::printf("[AXV] (state differs: later lists may differ too)\n");
++  }
++  v.bad_bytes += bad;
++  v.extra_bytes += extra;
++  v.bad_state += !state_ok;
++  v.bad_ret += pr != pn;
++  if (v.lists % 3000 == 0)
++    std::printf("[AXV] %llu lists checked, %llu differ (bytes %llu, extra %llu, state %llu, "
++                "ret %llu), %zu bytes written by the last list\n",
++                (unsigned long long)v.lists, (unsigned long long)v.bad_lists,
++                (unsigned long long)v.bad_bytes, (unsigned long long)v.extra_bytes,
++                (unsigned long long)v.bad_state, (unsigned long long)v.bad_ret,
++                v.overlay.size());
++  return pn;
++}
++
++// Mixes one list (already copied out of guest memory unless verifying).
++bool run_one(uint32_t addr, uint16_t size, const uint16_t *list, uint32_t n) {
++  const uint64_t t0 = now_ns();
++  const bool produced = opts().verify       ? run_verified(addr, size)
++                        : opts().ref_mixer ? ref::run_command_list(addr, size)
++                                      : run_loaded_list(list, n);
++  const uint64_t dt = now_ns() - t0;
++  s_lists.fetch_add(1, std::memory_order_relaxed);
++  s_mix_ns.fetch_add(dt, std::memory_order_relaxed);
++  if (dt > s_mix_max_ns.load(std::memory_order_relaxed))
++    s_mix_max_ns.store(dt, std::memory_order_relaxed);
++  return produced;
++}
++
++bool run_inline(uint32_t addr, uint16_t size) {
++  uint16_t list[kMaxListWords];
++  const uint32_t n = load_command_list(addr, size, list);
++  return run_one(addr, size, list, n);
++}
++
++// ---- the AX thread ----
++// One list at a time in one slot. The CPU thread posts it and wakes the AX
++// thread; whoever claims the slot first mixes it. If the AX thread has not
++// started by the time the CPU thread needs the result (the host is busy and
++// did not schedule it), the CPU thread mixes the list itself: never slower
++// than inline, apart from the wake-up call.
++enum Slot : uint32_t { kEmpty, kPosted, kRunning, kStolen, kDone };
++struct Worker {
++  std::mutex m;
++  std::condition_variable cv_job, cv_done;
++  uint32_t addr = 0;
++  uint16_t size = 0;
++  uint16_t list[kMaxListWords];  // the list, copied at the mail write
++  uint32_t n = 0;
++  uint64_t seq_req = 0;  // written by the CPU thread under m
++  std::atomic<uint32_t> slot{kEmpty};
++  bool produced = false;  // valid once slot == kDone (release/acquire on slot)
++
++  void loop() {
++#ifdef __SWITCH__
++    // Homebrew gets cores 0-2: the main (render) thread runs on the default
++    // core 0, the CPU thread on core 1 (switch_platform.cpp); audio takes 2.
++    u64 allowed = 0;
++    svcGetInfo(&allowed, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
++    int core = -1;
++    for (int c : {2, 0})
++      if ((allowed & (1ull << c)) &&
++          R_SUCCEEDED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, c, 1u << c))) {
++        core = c;
++        break;
++      }
++    std::printf("[NX] AX thread on core %d (allowed mask 0x%llx)\n", core,
++                (unsigned long long)allowed);
++    nx::note_thread(nx::kThreadAx);
++#endif
++    uint64_t seen = 0;
++    for (;;) {
++      uint32_t a, n_words;
++      uint16_t s;
++      {
++        std::unique_lock<std::mutex> lk(m);
++        cv_job.wait(lk, [&] { return seq_req != seen; });
++        seen = seq_req;
++        // Claim under m: a new list is only posted under m, so addr/size
++        // belong to the list in the slot.
++        uint32_t expect = kPosted;
++        if (!slot.compare_exchange_strong(expect, kRunning, std::memory_order_acquire))
++          continue;  // the CPU thread took it
++        a = addr;
++        s = size;
++        n_words = n;
++      }
++      produced = run_one(a, s, list, n_words);
++      {
++        std::lock_guard<std::mutex> lk(m);
++        slot.store(kDone, std::memory_order_release);
++      }
++      cv_done.notify_one();
++    }
++  }
++};
++Worker *g_w = nullptr;  // never destroyed: the thread runs until exit
++std::atomic<uint64_t> s_steals{0};
++
++Worker &worker() {
++  if (!g_w) {
++    g_w = new Worker;
++#ifdef __SWITCH__
++    // Explicit stack (std::thread cannot size it on libnx).
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    pthread_attr_setstacksize(&attr, 256 * 1024);
++    pthread_t th;
++    pthread_create(
++        &th, &attr,
++        [](void *) -> void * {
++          g_w->loop();
++          return nullptr;
++        },
++        nullptr);
++    pthread_detach(th);
++#else
++    std::thread([] { g_w->loop(); }).detach();
++#endif
++    std::printf("[AX] command lists run on their own thread (NWII_AX_THREAD=%d%s)\n", opts().mode,
++                opts().mode == 2 ? ": DSP_SYNC slides" : "");
++  }
++  return *g_w;
++}
++
++bool s_inline_produced = false;
++
++#ifdef NWII_AX_HAZARD_SUPPORTED
++// ---- NWII_AX_HAZARD: does the guest touch the DSP's data inside the window?
++// The list is mixed inline with read/write logs. Pages holding bytes the list
++// wrote become PROT_NONE, pages holding only bytes it read PROT_READ, until
++// NWII_AX_HAZARD_US (default 1000 = up to DSP_YIELD) of guest time later. A
++// fault on a byte the list wrote (read or write) or a write to a byte it read
++// is a hazard: with the AX thread that access could see / clobber a half-done
++// mix. Faults on other bytes of those pages are let through by single-stepping
++// the instruction with the page unprotected.
++namespace hz {
++constexpr long kPage = 4096;
++struct Rng {
++  uintptr_t lo, hi;  // [lo, hi)
++};
++std::vector<Rng> g_out, g_in;  // merged, sorted; only read inside the window
++struct Pg {
++  uintptr_t page;
++  int prot;
++};
++std::vector<Pg> g_pages;
++volatile sig_atomic_t g_armed = 0;
++uintptr_t g_m1_lo, g_m1_hi, g_m2_lo, g_m2_hi;
++RangeLog g_rlog, g_wlog;
++
++constexpr int kMaxHits = 4096;
++struct Hit {
++  uintptr_t addr, rip;
++  uint32_t guest_pc, guest_lr;
++  uint64_t tb;
++  uint8_t write, out, cpu_thread;
++};
++uint32_t g_list_addr = 0, g_list_bytes = 0;
++uint64_t g_submit_tb = 0;
++Hit g_hits[kMaxHits];
++std::atomic<int> g_nhits{0};
++std::atomic<uint64_t> g_faults{0}, g_hit_total{0};
++// R9: set while the audio DMA reads its frame behind dma_read_barrier(): an
++// access to the window's bytes then is synchronized with the mix (with the AX
++// thread it waits for it), so it is counted apart, not as a hazard.
++volatile sig_atomic_t g_synced = 0;
++std::atomic<uint64_t> g_synced_total{0};
++uint64_t g_windows = 0, g_hit_windows = 0;
++std::thread::id g_cpu_tid;
++thread_local uintptr_t t_step_pages[4];
++thread_local int t_nstep = 0;
++
++bool in_ranges(const std::vector<Rng> &v, uintptr_t a) {
++  auto it = std::upper_bound(v.begin(), v.end(), a,
++                             [](uintptr_t x, const Rng &r) { return x < r.lo; });
++  return it != v.begin() && a < (it - 1)->hi;
++}
++
++int page_prot(uintptr_t page) {
++  auto it = std::lower_bound(g_pages.begin(), g_pages.end(), page,
++                             [](const Pg &p, uintptr_t x) { return p.page < x; });
++  return it != g_pages.end() && it->page == page ? it->prot : -1;
++}
++
++uint32_t guest_addr(uintptr_t a) {
++  if (a >= g_m1_lo && a < g_m1_hi) return (uint32_t)(a - g_m1_lo) | 0x80000000u;
++  if (a >= g_m2_lo && a < g_m2_hi) return (uint32_t)(a - g_m2_lo) | 0x90000000u;
++  return 0;
++}
++
++void on_segv(int, siginfo_t *si, void *uc_) {
++  ucontext_t *uc = (ucontext_t *)uc_;
++  const uintptr_t a = (uintptr_t)si->si_addr;
++  const uintptr_t page = a & ~(uintptr_t)(kPage - 1);
++  const bool ours = (a >= g_m1_lo - kPage && a < g_m1_hi + kPage) ||
++                    (a >= g_m2_lo - kPage && a < g_m2_hi + kPage);
++  if (!ours) {
++    signal(SIGSEGV, SIG_DFL);  // a real crash: let it happen
++    return;
++  }
++  g_faults.fetch_add(1, std::memory_order_relaxed);
++  const int prot = g_armed ? page_prot(page) : -1;
++  if (prot >= 0) {
++    const bool write = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
++    const bool out = in_ranges(g_out, a);
++    if ((out || (write && in_ranges(g_in, a))) && g_synced &&
++        std::this_thread::get_id() == g_cpu_tid) {
++      g_synced_total.fetch_add(1, std::memory_order_relaxed);
++    } else if (out || (write && in_ranges(g_in, a))) {
++      g_hit_total.fetch_add(1, std::memory_order_relaxed);
++      const int i = g_nhits.fetch_add(1, std::memory_order_relaxed);
++      if (i < kMaxHits) {
++        CPUContext *c = g_ctx_ptr;
++        g_hits[i] = {a, (uintptr_t)uc->uc_mcontext.gregs[REG_RIP], c ? c->pc : 0,
++                     c ? c->lr : 0, c ? c->tb_cached : 0, (uint8_t)write, (uint8_t)out,
++                     (uint8_t)(std::this_thread::get_id() == g_cpu_tid)};
++      }
++    }
++  }
++  mprotect((void *)page, kPage, PROT_READ | PROT_WRITE);
++  if (prot >= 0 && t_nstep < 4) {
++    t_step_pages[t_nstep++] = page;
++    uc->uc_mcontext.gregs[REG_EFL] |= 0x100;  // trap after this instruction
++  }
++}
++
++void on_trap(int, siginfo_t *, void *uc_) {
++  ucontext_t *uc = (ucontext_t *)uc_;
++  uc->uc_mcontext.gregs[REG_EFL] &= ~0x100;
++  for (int i = 0; i < t_nstep; ++i) {
++    const int prot = g_armed ? page_prot(t_step_pages[i]) : -1;
++    if (prot >= 0) mprotect((void *)t_step_pages[i], kPage, prot);
++  }
++  t_nstep = 0;
++}
++
++void install() {
++  static bool done = false;
++  if (done) return;
++  done = true;
++  g_cpu_tid = std::this_thread::get_id();
++  g_m1_lo = (uintptr_t)g_mmu->mem1.data();
++  g_m1_hi = g_m1_lo + g_mmu->mem1.size();
++  g_m2_lo = (uintptr_t)g_mmu->mem2.data();
++  g_m2_hi = g_m2_lo + g_mmu->mem2.size();
++  struct sigaction sa {};
++  sa.sa_sigaction = on_segv;
++  sa.sa_flags = SA_SIGINFO | SA_NODEFER;
++  sigemptyset(&sa.sa_mask);
++  sigaction(SIGSEGV, &sa, nullptr);
++  sa.sa_sigaction = on_trap;
++  sigaction(SIGTRAP, &sa, nullptr);
++  std::printf("[AXH] hazard checker on: guarding the DSP's data for %s us of guest time "
++              "after each list\n",
++              NWII_ENV("NWII_AX_HAZARD_US") ? NWII_ENV("NWII_AX_HAZARD_US") : "1000");
++}
++
++std::vector<Rng> merge(RangeLog &log) {
++  std::vector<Rng> v;
++  v.reserve(log.size());
++  for (auto &[p, n] : log) v.push_back({(uintptr_t)p, (uintptr_t)p + n});
++  std::sort(v.begin(), v.end(), [](const Rng &a, const Rng &b) { return a.lo < b.lo; });
++  std::vector<Rng> m;
++  for (const Rng &r : v) {
++    if (!m.empty() && r.lo <= m.back().hi) m.back().hi = std::max(m.back().hi, r.hi);
++    else m.push_back(r);
++  }
++  return m;
++}
++
++void disarm();
++
++void arm() {
++  g_out = merge(g_wlog);
++  g_in = merge(g_rlog);
++  g_pages.clear();
++  auto add = [](const std::vector<Rng> &v, int prot) {
++    for (const Rng &r : v)
++      for (uintptr_t pg = r.lo & ~(uintptr_t)(kPage - 1); pg < r.hi; pg += kPage)
++        g_pages.push_back({pg, prot});
++  };
++  add(g_out, PROT_NONE);
++  add(g_in, PROT_READ);
++  std::sort(g_pages.begin(), g_pages.end(), [](const Pg &a, const Pg &b) {
++    return a.page != b.page ? a.page < b.page : a.prot < b.prot;  // PROT_NONE first
++  });
++  g_pages.erase(std::unique(g_pages.begin(), g_pages.end(),
++                            [](const Pg &a, const Pg &b) { return a.page == b.page; }),
++                g_pages.end());
++  g_nhits.store(0);
++  g_armed = 1;
++  for (const Pg &p : g_pages) mprotect((void *)p.page, kPage, p.prot);
++  ++g_windows;
++}
++
++void disarm() {
++  if (!g_armed) return;
++  g_armed = 0;
++  for (const Pg &p : g_pages) mprotect((void *)p.page, kPage, PROT_READ | PROT_WRITE);
++  const int n = std::min(g_nhits.load(), kMaxHits);
++  if (n) {
++    ++g_hit_windows;
++    if (g_hit_windows <= 20)
++      for (int i = 0; i < n && i < 6; ++i) {
++        const Hit &h = g_hits[i];
++        std::printf("[AXH] HAZARD window %llu (list %08x+%x): %s %s byte %08x (%s) at +%.1f us "
++                    "rip=%p pc=%08x lr=%08x\n",
++                    (unsigned long long)g_windows, g_list_addr, g_list_bytes,
++                    h.cpu_thread ? "cpu thread" : "other thread", h.write ? "wrote" : "read",
++                    guest_addr(h.addr), h.out ? "the list writes it" : "the list reads it",
++                    (double)(int64_t)(h.tb - g_submit_tb) * 1e6 / g_ctx_ptr->tb_freq,
++                    (void *)h.rip, h.guest_pc, h.guest_lr);
++      }
++  }
++  if (g_windows % 3000 == 0)
++    std::printf("[AXH] %llu windows, %llu with hazards (%llu hazard accesses), %llu page "
++                "faults, last window %zu pages, %llu accesses by the audio DMA behind its "
++                "barrier\n",
++                (unsigned long long)g_windows, (unsigned long long)g_hit_windows,
++                (unsigned long long)g_hit_total.load(), (unsigned long long)g_faults.load(),
++                g_pages.size(), (unsigned long long)g_synced_total.load());
++}
++
++void submit_guarded(uint32_t addr, uint16_t size) {
++  install();
++  disarm();  // a new list before the old window closed
++  g_list_addr = addr;
++  g_list_bytes = size * 2u;
++  g_submit_tb = g_ctx_ptr->read_timebase();
++  g_rlog.clear();
++  g_wlog.clear();
++  g_read_log = &g_rlog;
++  g_write_log = &g_wlog;
++  s_inline_produced = run_inline(addr, size);
++  if (uint8_t *p = g_mmu->get_ptr(addr))  // the list words it used
++    g_rlog.push_back({p, last_list_words_used() * 2u});
++  g_read_log = nullptr;
++  g_write_log = nullptr;
++  arm();
++  static const uint64_t us = [] {
++    const char *e = NWII_ENV("NWII_AX_HAZARD_US");
++    return e ? (uint64_t)std::atoll(e) : 1000ull;
++  }();
++  EventScheduler::get().schedule_after(us * g_ctx_ptr->tb_freq / 1000000,
++                                       [](CPUContext &, uint64_t) { disarm(); });
++}
++}  // namespace hz
++#endif
++
++}  // namespace
++
++bool async_enabled() { return opts().mode != 0; }
++bool sync_slides() { return opts().mode == 2; }
++
++// Time of the first list: the first stats report counts from here.
++static std::atomic<uint64_t> s_first_ns{0};
++
++void submit(uint32_t addr, uint16_t size_words) {
++  if (!s_first_ns.load(std::memory_order_relaxed))
++    s_first_ns.store(now_ns(), std::memory_order_relaxed);
++#ifdef NWII_AX_HAZARD_SUPPORTED
++  if (opts().hazard) {
++    hz::submit_guarded(addr, size_words);
++    return;
++  }
++#endif
++  if (opts().mode == 0) {
++    s_inline_produced = run_inline(addr, size_words);
++    return;
++  }
++  Worker &w = worker();
++  finish();  // one list at a time (normally finished long ago)
++  {
++    std::lock_guard<std::mutex> lk(w.m);
++    w.addr = addr;
++    w.size = size_words;
++    w.n = load_command_list(addr, size_words, w.list);
++    w.slot.store(kPosted, std::memory_order_release);
++    ++w.seq_req;
++  }
++  w.cv_job.notify_one();
++}
++
++bool done() {
++  if (opts().mode == 0 || !g_w) return true;
++  const uint32_t s = g_w->slot.load(std::memory_order_acquire);
++  return s == kDone || s == kEmpty;
++}
++
++bool finish() {
++  if (opts().mode == 0 || !g_w) return s_inline_produced;
++  Worker &w = *g_w;
++  uint32_t s = w.slot.load(std::memory_order_acquire);
++  if (s == kEmpty || s == kDone) return w.produced;
++  if (s == kPosted && w.slot.compare_exchange_strong(s, kStolen, std::memory_order_acquire)) {
++    w.produced = run_one(w.addr, w.size, w.list, w.n);  // written by this thread
++    w.slot.store(kDone, std::memory_order_release);
++    s_steals.fetch_add(1, std::memory_order_relaxed);
++    return w.produced;
++  }
++  // The AX thread is mixing it: a mix is ~10-100 us; spin briefly, then sleep.
++  const uint64_t t0 = now_ns();
++  for (int i = 0; i < 200 && w.slot.load(std::memory_order_acquire) != kDone; ++i)
++    std::this_thread::yield();
++  if (w.slot.load(std::memory_order_acquire) != kDone) {
++    std::unique_lock<std::mutex> lk(w.m);
++    w.cv_done.wait(lk, [&] { return w.slot.load(std::memory_order_acquire) == kDone; });
++  }
++  s_wait_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
++  s_waits.fetch_add(1, std::memory_order_relaxed);
++  return w.produced;
++}
++
++void dma_read_barrier() {
++#ifdef NWII_AX_HAZARD_SUPPORTED
++  if (opts().hazard) {
++    // Inline in this mode: the frame is mixed already. Mark the DMA's reads
++    // (made right after this call, same thread) as synchronized; the next
++    // poll of the CPU thread clears the mark.
++    hz::g_synced = 1;
++    EventScheduler::get().schedule_after(0, [](CPUContext &, uint64_t) { hz::g_synced = 0; });
++    return;
++  }
++#endif
++  if (opts().mode == 0 || !g_w || done()) return;
++  s_dma_waits.fetch_add(1, std::memory_order_relaxed);
++  finish();
++}
++
++void stats_line(char *buf, int size) {
++  static uint64_t l0 = 0, m0 = 0, w0 = 0, n0 = 0, st0 = 0, dw0 = 0;
++  static uint64_t t0 = 0;
++  const uint64_t t = now_ns();
++  if (!t0) t0 = s_first_ns.load(std::memory_order_relaxed);  // first report: since the first list
++  const double dt = t0 && t > t0 ? (t - t0) / 1e9 : 0.0;
++  const uint64_t l = s_lists.load(), m = s_mix_ns.load(), w = s_wait_ns.load(),
++                 n = s_waits.load();
++  const uint64_t mx = s_mix_max_ns.exchange(0);
++  const uint64_t st = s_steals.load();
++  const uint64_t dw = s_dma_waits.load();
++  const uint64_t dl = l - l0;
++  std::snprintf(buf, size,
++                ", ax %s %.0f lists/s mix %.1f us (max %.0f) wait %.0f us/s (%.0f/s) "
++                "inline %.0f/s dma-wait %.1f/s",
++                opts().mode == 0 ? "inline" : "thread", dt > 0 ? dl / dt : 0.0,
++                dl ? (m - m0) / 1e3 / dl : 0.0, mx / 1e3, dt > 0 ? (w - w0) / 1e3 / dt : 0.0,
++                dt > 0 ? (n - n0) / dt : 0.0, dt > 0 ? (st - st0) / dt : 0.0,
++                dt > 0 ? (dw - dw0) / dt : 0.0);
++  dw0 = dw;
++  st0 = st;
++  l0 = l;
++  m0 = m;
++  w0 = w;
++  n0 = n;
++  t0 = t;
++}
++
++}  // namespace nwii::runtime::ax
+diff --color -ruN -x '*.orig' -x '*.rej' base/nWiiRuntime/src/hle/ax/ax_hle.cpp threads/nWiiRuntime/src/hle/ax/ax_hle.cpp
+--- base/nWiiRuntime/src/hle/ax/ax_hle.cpp	2026-10-22 13:34:27.783947040 -0500
++++ threads/nWiiRuntime/src/hle/ax/ax_hle.cpp	2026-10-31 06:55:31.990932475 -0500
+@@ -11,26 +11,67 @@
+ extern MMU *g_mmu;
+ }
+ 
++// R8: same algorithm as the r7b scalar mixer (ax_hle_ref.cpp), bit for bit.
++// What changed is how it touches memory and the volume loops:
++//  - guest memory is read and written in blocks through host pointers (one
++//    bounds check per block instead of one per 16-bit word); a block that is
++//    not contiguous host memory falls back to the per-word path;
++//  - the DSP accelerator reads sample bytes straight from MEM1/MEM2;
++//  - a voice block is written back only where it changed, and not at all when
++//    the voice is stopped (the old code rewrote all 0x12C bytes of every PB);
++//    same memory contents afterwards, and a voice the guest edits while the
++//    AX thread runs is never overwritten with a stale copy;
++//  - envelope and bus mixing (per-sample volume ramp, clamp, accumulate) use
++//    8-lane GCC vectors (SSE2 on PC, NEON on the Switch). Every product fits
++//    in 32 bits (int16 x uint16), so the int32 lanes equal the int64 math.
++
+ namespace nwii::runtime::ax {
++
++RangeLog *g_write_log = nullptr;
++RangeLog *g_read_log = nullptr;
++
+ namespace {
+ 
+ constexpr int kFrame = 96;     // samples per 3 ms frame at 32 kHz
+ constexpr int kWmFrame = 18;   // Wii Remote speaker samples per frame
+ constexpr int kMaxVoices = 512;
+ 
++typedef int32_t v8si __attribute__((vector_size(32)));
++typedef int16_t v8hi __attribute__((vector_size(16)));
++static_assert(kFrame % 8 == 0);
++
+ // ---- guest memory (big-endian, physical or cached addresses) ----
+ 
+ uint8_t *mem(uint32_t addr) { return g_mmu ? g_mmu->get_ptr(addr) : nullptr; }
+ 
++// Host pointer for [addr, addr + bytes) if it is one contiguous host block
++// (what the per-word path would touch), else nullptr.
++uint8_t *span(uint32_t addr, uint32_t bytes) {
++  uint8_t *p = mem(addr);
++  if (!p) return nullptr;
++  uint8_t *q = mem(addr + bytes - 1);
++  return q == p + (bytes - 1) ? p : nullptr;
++}
++
++inline void log_w(uint8_t *p, uint32_t n) {
++  if (__builtin_expect(g_write_log != nullptr, 0)) g_write_log->push_back({p, n});
++}
++inline void log_r(uint8_t *p, uint32_t n) {
++  if (__builtin_expect(g_read_log != nullptr, 0)) g_read_log->push_back({p, n});
++}
++
+ uint16_t rd16(uint32_t a) {
+-  const uint8_t *p = mem(a);
+-  return p ? (uint16_t)((p[0] << 8) | p[1]) : 0;
++  uint8_t *p = mem(a);
++  if (!p) return 0;
++  log_r(p, 2);
++  return (uint16_t)((p[0] << 8) | p[1]);
+ }
+ 
+ void wr16(uint32_t a, uint16_t v) {
+   if (uint8_t *p = mem(a)) {
+     p[0] = (uint8_t)(v >> 8);
+     p[1] = (uint8_t)v;
++    log_w(p, 2);
+   }
+ }
+ 
+@@ -41,18 +82,87 @@
+   wr16(a + 2, (uint16_t)v);
+ }
+ 
++inline uint16_t be16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
++inline void put16(uint8_t *p, uint16_t v) {
++  p[0] = (uint8_t)(v >> 8);
++  p[1] = (uint8_t)v;
++}
++
++void load16(uint32_t addr, uint16_t *dst, int n) {
++  if (uint8_t *p = span(addr, n * 2)) {
++    log_r(p, n * 2);
++    for (int i = 0; i < n; ++i) dst[i] = be16(p + i * 2);
++  } else {
++    for (int i = 0; i < n; ++i) dst[i] = rd16(addr + i * 2);
++  }
++}
++
++void load32(uint32_t addr, int32_t *dst, int n) {
++  if (uint8_t *p = span(addr, n * 4)) {
++    log_r(p, n * 4);
++    for (int i = 0; i < n; ++i) {
++      uint32_t v;
++      std::memcpy(&v, p + i * 4, 4);
++      dst[i] = (int32_t)__builtin_bswap32(v);
++    }
++  } else {
++    for (int i = 0; i < n; ++i) dst[i] = rd32(addr + i * 4);
++  }
++}
++
++void store32(uint32_t addr, const int32_t *src, int n) {
++  if (uint8_t *p = span(addr, n * 4)) {
++    for (int i = 0; i < n; ++i) {
++      const uint32_t v = __builtin_bswap32((uint32_t)src[i]);
++      std::memcpy(p + i * 4, &v, 4);
++    }
++    log_w(p, n * 4);
++  } else {
++    for (int i = 0; i < n; ++i) wr32(addr + i * 4, src[i]);
++  }
++}
++
+ // The DSP accelerator sees "ARAM" addresses; on Wii those are physical RAM
+-// addresses, MEM2 when bit 28 is set.
+-uint8_t aram8(uint32_t a) {
+-  const uint8_t *p = (a & 0x10000000) ? mem(0x10000000 | (a & 0x03FFFFFF))
+-                                      : mem(a & 0x01FFFFFF);
+-  return p ? *p : 0;
++// addresses, MEM2 when bit 28 is set. Same result as get_ptr() on
++// 0x10000000|(a & 0x03FFFFFF) (always inside MEM2) or a & 0x01FFFFFF (MEM1
++// below 24 MiB, else unmapped = 0).
++uint8_t *g_m1 = nullptr, *g_m2 = nullptr;
++constexpr uint32_t kMem1Bytes = 24u * 1024 * 1024;
++
++inline uint8_t aram8(uint32_t a) {
++  if (a & 0x10000000) {
++    if (__builtin_expect(g_read_log != nullptr, 0)) log_r(g_m2 + (a & 0x03FFFFFF), 1);
++    return g_m2[a & 0x03FFFFFF];
++  }
++  const uint32_t o = a & 0x01FFFFFF;
++  if (o >= kMem1Bytes) return 0;
++  if (__builtin_expect(g_read_log != nullptr, 0)) log_r(g_m1 + o, 1);
++  return g_m1[o];
+ }
+ 
+-int16_t clamp16(int64_t v) {
++inline int16_t clamp16(int64_t v) {
+   return (int16_t)std::clamp<int64_t>(v, -0x8000, 0x7FFF);
+ }
+ 
++inline v8si clamp16v(v8si v) {
++  const v8si lo = {-0x8000, -0x8000, -0x8000, -0x8000, -0x8000, -0x8000, -0x8000, -0x8000};
++  const v8si hi = {0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF};
++  v = v < lo ? lo : v;
++  return v > hi ? hi : v;
++}
++
++inline v8si load8(const int16_t *p) {
++  v8hi h;
++  std::memcpy(&h, p, sizeof h);
++  return __builtin_convertvector(h, v8si);
++}
++
++// Per-sample 16-bit volume v0, v0+d, v0+2d, ... (mod 2^16) for lanes 0..7.
++inline v8si ramp8(uint16_t v0, uint16_t d) {
++  const v8si idx = {0, 1, 2, 3, 4, 5, 6, 7};
++  return (idx * (int32_t)d + (int32_t)v0) & 0xFFFF;
++}
++
+ // ---- voice parameter block (AXPBWii, 0x4cc52064 layout: no `updates`) ----
+ // Indices are in 16-bit words.
+ enum PB : int {
+@@ -133,7 +243,7 @@
+     }
+   }
+ 
+-  int16_t read_sample(const int16_t *coefs) {
++  inline int16_t read_sample(const int16_t *coefs) {
+     if (stopped)
+       return 0;
+     const unsigned decode = (format >> 2) & 3;
+@@ -187,8 +297,8 @@
+ // Sample-rate conversion. No DSP-ROM polyphase table ships with the runtime,
+ // so polyphase falls back to linear, as Dolphin does without dsp_coef.bin.
+ template <typename Input>
+-uint32_t resample(Input &&input, int16_t *out, int count, uint16_t *last,
+-                  uint32_t pos, uint32_t ratio, uint16_t type) {
++inline uint32_t resample(Input &&input, int16_t *out, int count, uint16_t *last,
++                         uint32_t pos, uint32_t ratio, uint16_t type) {
+   if (type == SRC_NEAREST) {
+     for (int i = 0; i < count; ++i)
+       out[i] = input();
+@@ -227,7 +337,7 @@
+ // ---- mixing buses ----
+ 
+ struct Buses {
+-  int32_t main_l[kFrame], main_r[kFrame], main_s[kFrame];
++  alignas(32) int32_t main_l[kFrame], main_r[kFrame], main_s[kFrame];
+   int32_t auxa_l[kFrame], auxa_r[kFrame], auxa_s[kFrame];
+   int32_t auxb_l[kFrame], auxb_r[kFrame], auxb_s[kFrame];
+   int32_t auxc_l[kFrame], auxc_r[kFrame], auxc_s[kFrame];
+@@ -248,18 +358,38 @@
+   }
+ }
+ 
++// out[i] += clamp16((in[i] * volume_i) >> 15), volume_i = v0 + i*delta.
+ void mix_add(int32_t *out, const int16_t *in, uint16_t *pb, int vol_idx, int dpop_idx,
+              bool ramp) {
+-  uint16_t volume = pb[vol_idx];
++  const uint16_t v0 = pb[vol_idx];
+   const uint16_t delta = ramp ? pb[vol_idx + 1] : 0;
+-  int16_t last = 0;
+-  for (int i = 0; i < kFrame; ++i) {
+-    last = clamp16(((int64_t)in[i] * volume) >> 15);
+-    out[i] += last;
+-    volume += delta;
++  v8si vol = ramp8(v0, delta);
++  const int32_t step8 = (int32_t)(uint16_t)(delta * 8);
++  for (int i = 0; i < kFrame; i += 8) {
++    const v8si r = clamp16v((load8(in + i) * vol) >> 15);
++    v8si o;
++    std::memcpy(&o, out + i, sizeof o);
++    o += r;
++    std::memcpy(out + i, &o, sizeof o);
++    vol = (vol + step8) & 0xFFFF;
++  }
++  const uint16_t vlast = (uint16_t)(v0 + (kFrame - 1) * delta);
++  pb[vol_idx] = (uint16_t)(v0 + kFrame * delta);
++  pb[dpop_idx] = (uint16_t)clamp16(((int32_t)in[kFrame - 1] * vlast) >> 15);
++}
++
++// Volume envelope (unsigned on Wii): s[i] = clamp16((s[i] * env_i) >> 15).
++void envelope(int16_t *s, uint16_t *pb) {
++  const uint16_t e0 = pb[VOL_ENV], d = pb[VOL_ENV_DELTA];
++  v8si env = ramp8(e0, d);
++  const int32_t step8 = (int32_t)(uint16_t)(d * 8);
++  for (int i = 0; i < kFrame; i += 8) {
++    const v8si r = clamp16v((load8(s + i) * env) >> 15);
++    const v8hi h = __builtin_convertvector(r, v8hi);
++    std::memcpy(s + i, &h, sizeof h);
++    env = (env + step8) & 0xFFFF;
+   }
+-  pb[vol_idx] = volume;
+-  pb[dpop_idx] = (uint16_t)last;
++  pb[VOL_ENV] = (uint16_t)(e0 + kFrame * d);
+ }
+ 
+ void low_pass(int16_t *s, uint16_t *pb) {
+@@ -295,9 +425,6 @@
+ }
+ 
+ void process_voice(uint16_t *pb) {
+-  if (pb[RUNNING] != 1)
+-    return;
+-
+   Accelerator acc;
+   acc.pb = pb;
+   acc.start = hilo(pb, LOOP_HI) & 0x3FFFFFFF;
+@@ -313,7 +440,7 @@
+   for (int i = 0; i < 16; ++i)
+     coefs[i] = (int16_t)pb[ADPCM_COEFS + i];
+ 
+-  int16_t s[kFrame];
++  alignas(16) int16_t s[kFrame];
+   const uint32_t pos = resample([&] { return acc.read_sample(coefs); }, s, kFrame,
+                                 &pb[SRC_LAST], pb[SRC_FRAC], hilo(pb, SRC_RATIO_HI),
+                                 pb[SRC_TYPE]);
+@@ -324,11 +451,7 @@
+   pb[ADPCM_YN2] = (uint16_t)acc.yn2;
+   pb[ADPCM_PRED_SCALE] = acc.pred_scale;
+ 
+-  // Volume envelope (unsigned on Wii).
+-  for (int i = 0; i < kFrame; ++i) {
+-    s[i] = clamp16(((int32_t)s[i] * (int32_t)pb[VOL_ENV]) >> 15);
+-    pb[VOL_ENV] = (uint16_t)(pb[VOL_ENV] + pb[VOL_ENV_DELTA]);
+-  }
++  envelope(s, pb);
+ 
+   if (pb[LPF_ON])
+     low_pass(s, pb);
+@@ -363,13 +486,31 @@
+ }
+ 
+ void process_pb_list(uint32_t pb_addr) {
+-  uint16_t pb[PB_WORDS];
++  uint16_t pb[PB_WORDS], orig[PB_WORDS];
+   for (int n = 0; pb_addr && n < kMaxVoices; ++n) {
+-    for (int i = 0; i < PB_WORDS; ++i)
+-      pb[i] = rd16(pb_addr + i * 2);
+-    process_voice(pb);
+-    for (int i = 0; i < PB_WORDS; ++i)
+-      wr16(pb_addr + i * 2, pb[i]);
++    uint8_t *p = span(pb_addr, PB_WORDS * 2);
++    if (p) {
++      log_r(p, PB_WORDS * 2);
++      for (int i = 0; i < PB_WORDS; ++i)
++        pb[i] = be16(p + i * 2);
++    } else {
++      for (int i = 0; i < PB_WORDS; ++i)
++        pb[i] = rd16(pb_addr + i * 2);
++    }
++    if (pb[RUNNING] == 1) {
++      std::memcpy(orig, pb, sizeof pb);
++      process_voice(pb);
++      // Write back what changed (the rest already holds these values).
++      for (int i = 0; i < PB_WORDS; ++i) {
++        if (pb[i] == orig[i]) continue;
++        if (p) {
++          put16(p + i * 2, pb[i]);
++          log_w(p + i * 2, 2);
++        } else {
++          wr16(pb_addr + i * 2, pb[i]);
++        }
++      }
++    }
+     pb_addr = hilo(pb, NEXT_HI);
+   }
+ }
+@@ -388,36 +529,36 @@
+       {g_bus.wm[3], kWmFrame}, {g_bus.wm[4], kWmFrame}, {g_bus.wm[5], kWmFrame},
+       {g_bus.wm[6], kWmFrame}, {g_bus.wm[7], kWmFrame},
+   };
++  uint16_t w[60];
++  load16(init_addr, w, 60);
+   for (int i = 0; i < 20; ++i) {
+-    const uint32_t a = init_addr + i * 6;
+-    const int32_t value = rd32(a);
+-    const int16_t delta = (int16_t)rd16(a + 4);
++    const int32_t value = (int32_t)(((uint32_t)w[i * 3] << 16) | w[i * 3 + 1]);
++    const int16_t delta = (int16_t)w[i * 3 + 2];
+     for (int j = 0; j < bufs[i].count; ++j)
+       bufs[i].buf[j] = value ? value + j * delta : 0;
+   }
+ }
+ 
+ void add_to_lr(uint32_t addr, bool neg) {
++  int32_t v[kFrame];
++  load32(addr, v, kFrame);
+   for (int i = 0; i < kFrame; ++i) {
+-    int32_t v = rd32(addr + i * 4);
+-    if (neg)
+-      v = -v;
+-    g_bus.main_l[i] += v;
+-    g_bus.main_r[i] += v;
++    const int32_t x = neg ? -v[i] : v[i];
++    g_bus.main_l[i] += x;
++    g_bus.main_r[i] += x;
+   }
+ }
+ 
+ void add_sub_to_lr(uint32_t addr) {
++  int32_t v[2 * kFrame];
++  load32(addr, v, 2 * kFrame);
+   for (int i = 0; i < kFrame; ++i)
+-    g_bus.main_l[i] += rd32(addr + i * 4);
++    g_bus.main_l[i] += v[i];
+   for (int i = 0; i < kFrame; ++i)
+-    g_bus.main_r[i] -= rd32(addr + kFrame * 4 + i * 4);
++    g_bus.main_r[i] -= v[kFrame + i];
+ }
+ 
+-void write_bus(uint32_t addr, const int32_t *bus) {
+-  for (int i = 0; i < kFrame; ++i)
+-    wr32(addr + i * 4, bus[i]);
+-}
++void write_bus(uint32_t addr, const int32_t *bus) { store32(addr, bus, kFrame); }
+ 
+ // Send an aux bus to the CPU (effects run there) and mix back what the CPU
+ // returned for it last frame.
+@@ -431,10 +572,12 @@
+   if (write_addr)
+     for (int c = 0; c < 3; ++c)
+       write_bus(write_addr + c * kFrame * 4, aux[id][c]);
++  int32_t in[3 * kFrame];
++  load32(read_addr, in, 3 * kFrame);
+   int32_t *main[3] = {g_bus.main_l, g_bus.main_r, g_bus.main_s};
+   for (int c = 0; c < 3; ++c)
+     for (int i = 0; i < kFrame; ++i)
+-      main[c][i] += (int32_t)(((int64_t)rd32(read_addr + (c * kFrame + i) * 4) * ramp[i]) >> 15);
++      main[c][i] += (int32_t)(((int64_t)in[c * kFrame + i] * ramp[i]) >> 15);
+ }
+ 
+ void upload_aux_mix_lrsc(int id, const uint32_t *addr, uint16_t volume) {
+@@ -450,9 +593,12 @@
+   volume_ramp(ramp, g_last_aux_volume[id], volume);
+   g_last_aux_volume[id] = volume;
+   int32_t *dest[4] = {g_bus.main_l, g_bus.main_r, g_bus.main_s, g_bus.auxc_l};
+-  for (int m = 0; m < 4; ++m)
++  int32_t in[kFrame];
++  for (int m = 0; m < 4; ++m) {
++    load32(addr[2 + m], in, kFrame);
+     for (int i = 0; i < kFrame; ++i)
+-      dest[m][i] += (int32_t)(((int64_t)rd32(addr[2 + m] + i * 4) * ramp[i]) >> 15);
++      dest[m][i] += (int32_t)(((int64_t)in[i] * ramp[i]) >> 15);
++  }
+ }
+ 
+ void compressor(uint16_t threshold, uint16_t release_frames, uint32_t table) {
+@@ -471,10 +617,11 @@
+   } else {
+     return;
+   }
++  uint16_t coef[kFrame];
++  load16(table + offset, coef, kFrame);
+   for (int i = 0; i < kFrame; ++i) {
+-    const uint16_t coef = rd16(table + offset + i * 2);
+-    g_bus.main_l[i] = (int32_t)(((int64_t)g_bus.main_l[i] * coef) >> 15);
+-    g_bus.main_r[i] = (int32_t)(((int64_t)g_bus.main_r[i] * coef) >> 15);
++    g_bus.main_l[i] = (int32_t)(((int64_t)g_bus.main_l[i] * coef[i]) >> 15);
++    g_bus.main_r[i] = (int32_t)(((int64_t)g_bus.main_r[i] * coef[i]) >> 15);
+   }
+ }
+ 
+@@ -486,28 +633,70 @@
+   if (dpl2)
+     write_bus(surround_addr + kFrame * 4, g_bus.auxc_l);
+   // Interleaved R, L as 16-bit big-endian: the layout AI DMA plays.
++  uint8_t *p = span(lr_addr, kFrame * 4);
+   for (int i = 0; i < kFrame; ++i) {
+     const int16_t l = clamp16(((int64_t)g_bus.main_l[i] * ramp[i]) >> 15);
+     const int16_t r = clamp16(((int64_t)g_bus.main_r[i] * ramp[i]) >> 15);
+-    wr16(lr_addr + i * 4, (uint16_t)r);
+-    wr16(lr_addr + i * 4 + 2, (uint16_t)l);
++    if (p) {
++      put16(p + i * 4, (uint16_t)r);
++      put16(p + i * 4 + 2, (uint16_t)l);
++    } else {
++      wr16(lr_addr + i * 4, (uint16_t)r);
++      wr16(lr_addr + i * 4 + 2, (uint16_t)l);
++    }
+   }
++  if (p) log_w(p, kFrame * 4);
+ }
+ 
+ void wm_output(const uint32_t *addr) {
+-  for (int m = 0; m < 4; ++m)
+-    for (int j = 0; j < kWmFrame; ++j)
+-      wr16(addr[m] + j * 2, (uint16_t)clamp16(g_bus.wm[m * 2][j]));
++  for (int m = 0; m < 4; ++m) {
++    uint8_t *p = span(addr[m], kWmFrame * 2);
++    for (int j = 0; j < kWmFrame; ++j) {
++      const uint16_t v = (uint16_t)clamp16(g_bus.wm[m * 2][j]);
++      if (p) put16(p + j * 2, v);
++      else wr16(addr[m] + j * 2, v);
++    }
++    if (p) log_w(p, kWmFrame * 2);
++  }
+ }
+ 
+ }  // namespace
+ 
++void state_bytes(std::vector<uint8_t> &out) {
++  out.clear();
++  auto put = [&](const void *p, size_t n) {
++    out.insert(out.end(), (const uint8_t *)p, (const uint8_t *)p + n);
++  };
++  put(&g_bus, sizeof g_bus);
++  put(&g_last_main_volume, sizeof g_last_main_volume);
++  put(g_last_aux_volume, sizeof g_last_aux_volume);
++  put(&g_compressor_pos, sizeof g_compressor_pos);
++}
++
++uint32_t load_command_list(uint32_t addr, uint16_t size_words, uint16_t *out) {
++  const uint32_t n = std::min<uint32_t>(size_words, kMaxListWords);
++  RangeLog *rl = g_read_log;
++  g_read_log = nullptr;  // only the words the list uses count (logged below)
++  load16(addr, out, (int)n);
++  g_read_log = rl;
++  return n;
++}
++
+ bool run_command_list(uint32_t addr, uint16_t size_words) {
+-  uint16_t list[512];
+-  const uint32_t n = std::min<uint32_t>(size_words, 512);
+-  for (uint32_t i = 0; i < n; ++i)
+-    list[i] = rd16(addr + i * 2);
++  uint16_t list[kMaxListWords];
++  const uint32_t n = load_command_list(addr, size_words, list);
++  return run_loaded_list(list, n) ;
++}
+ 
++// Words of the last list up to its END (for the hazard checker's read log).
++static uint32_t s_list_used = 0;
++uint32_t last_list_words_used() { return s_list_used; }
++
++bool run_loaded_list(const uint16_t *list, uint32_t n) {
++  if (!g_mmu)
++    return false;
++  g_m1 = g_mmu->mem1.data();
++  g_m2 = g_mmu->mem2.data();
+   bool produced = false;
+   uint32_t i = 0;
+   auto arg = [&]() -> uint16_t { return i < n ? list[i++] : 0; };
+@@ -572,16 +761,19 @@
+       break;
+     }
+     case 0x0E:  // END
++      s_list_used = i;
+       return produced;
+     default: {
+       static int warned = 0;
+       if (warned++ < 8)
+         std::cout << "[AX] unknown command 0x" << std::hex << cmd << " at word " << std::dec
+                   << (i - 1) << "\n";
++      s_list_used = i;
+       return produced;
+     }
+     }
+   }
++  s_list_used = i;
+   return produced;
+ }
+ 
+diff --color -ruN -x '*.orig' -x '*.rej' base/nWiiRuntime/src/hle/ax/ax_hle.h threads/nWiiRuntime/src/hle/ax/ax_hle.h
+--- base/nWiiRuntime/src/hle/ax/ax_hle.h	2026-10-22 13:30:26.315138297 -0500
++++ threads/nWiiRuntime/src/hle/ax/ax_hle.h	2026-10-31 08:19:41.830012589 -0500
+@@ -8,13 +8,69 @@
+ // buses, and write the 32 kHz stereo frame back to RAM, where AI DMA picks it
+ // up. Semantics follow Dolphin's AXWii HLE for the 0x4cc52064 microcode
+ // layout (the one NSMBW ships).
++//
++// R8 (threads): the list can run on its own host thread (ax_async.cpp), like
++// the real DSP runs beside the CPU; the mixer works on host pointers and the
++// per-sample volume loops are vectorized. Output is bit-exact with the r7b
++// scalar mixer, kept as ax::ref (ax_hle_ref.cpp) for NWII_AX_VERIFY=1.
+ #pragma once
+ #include <cstdint>
++#include <unordered_map>
++#include <utility>
++#include <vector>
+ 
+ namespace nwii::runtime::ax {
+ 
+ // Runs one command list of `size_words` 16-bit words at `addr`.
+ // Returns true if the list produced an output frame (OUTPUT command).
+ bool run_command_list(uint32_t addr, uint16_t size_words);
++// The same in two steps: copy the list out of guest memory (on the CPU thread,
++// at the mail write: the AX library starts on the next list in the buffer
++// right after the mail), then run the copy (on the AX thread).
++constexpr uint32_t kMaxListWords = 512;
++uint32_t load_command_list(uint32_t addr, uint16_t size_words, uint16_t *out);
++bool run_loaded_list(const uint16_t *list, uint32_t n);
++// Words of the last list up to and including its END command.
++uint32_t last_list_words_used();
++
++// Mixer state that carries over between lists (buses, volume ramps,
++// compressor), as raw bytes: compared against ref:: by NWII_AX_VERIFY.
++void state_bytes(std::vector<uint8_t> &out);
++
++// Debug hooks (nullptr in normal play). Every byte range of guest memory the
++// mixer writes / reads is appended as (host pointer, length).
++using RangeLog = std::vector<std::pair<uint8_t *, uint32_t>>;
++extern RangeLog *g_write_log;
++extern RangeLog *g_read_log;   // reads of inputs only (list, aux, samples, PBs)
++
++namespace ref {
++// The r7b scalar mixer. Reads guest memory through `g_overlay` and writes only
++// to it (never to guest memory).
++extern std::unordered_map<const uint8_t *, uint8_t> *g_overlay;
++bool run_command_list(uint32_t addr, uint16_t size_words);
++void state_bytes(std::vector<uint8_t> &out);
++}  // namespace ref
++
++// ---- ax_async.cpp: where the list runs ------------------------------------
++// NWII_AX_THREAD=0 runs the list on the CPU thread at the mail write, as r7b.
++// Default (2): the list runs on the AX thread and the DSP's "frame done" mail
++// (DSP_SYNC) goes out when it is mixed. See ax_async.cpp for the rules.
++bool async_enabled();
++// Mode 2: DSP_SYNC waits for the mix (up to DSP_YIELD) instead of going out at 0.1 ms.
++bool sync_slides();
++// Starts processing (or, inline mode, processes) the list. Called on the CPU
++// thread from the DSP mailbox write.
++void submit(uint32_t addr, uint16_t size_words);
++// True once the list submitted last has finished (always true inline).
++bool done();
++// Waits for the list submitted last; returns its run_command_list() result.
++bool finish();
++// R9 threads: the audio DMA is about to read guest memory (the frame it plays).
++// If a list is still being mixed on the AX thread, wait for it first, so the
++// DMA reads exactly what it reads with the inline mix (where the list is done
++// at the mail write). Rare: normally the DMA plays a buffer mixed long before.
++void dma_read_barrier();
++// Stats for the [FPS] line: lists/s, mixer us/list, CPU-thread wait us/s.
++void stats_line(char *buf, int size);
+ 
+ }  // namespace nwii::runtime::ax
+diff --color -ruN -x '*.orig' -x '*.rej' base/nWiiRuntime/src/hle/ax/ax_hle_ref.cpp threads/nWiiRuntime/src/hle/ax/ax_hle_ref.cpp
+--- base/nWiiRuntime/src/hle/ax/ax_hle_ref.cpp	1969-12-31 19:00:00.000000000 -0500
++++ threads/nWiiRuntime/src/hle/ax/ax_hle_ref.cpp	2026-10-31 06:55:31.991252613 -0500
+@@ -0,0 +1,619 @@
++// R8: reference copy of the original scalar AX HLE (r7b ax_hle.cpp), kept
++// only for NWII_AX_VERIFY=1. It runs before the optimized mixer on the same
++// command list and never writes guest memory: its writes go to an overlay that
++// its own reads see. With no overlay (NWII_AX_MIXER=ref, for timing A/B)
++// it is the plain r7b mixer on guest memory. The caller then compares the overlay with what the
++// optimized mixer wrote, byte for byte, plus the mixer state (buses, ramps).
++#include "ax_hle.h"
++#include <unordered_map>
++
++#include "runtime/cpu_context.h"
++#include "runtime/nwii_env.h"
++
++#include <algorithm>
++#include <cstring>
++#include <iostream>
++#include <vector>
++
++namespace nwii::runtime {
++extern MMU *g_mmu;
++}
++
++namespace nwii::runtime::ax::ref {
++std::unordered_map<const uint8_t *, uint8_t> *g_overlay = nullptr;
++namespace {
++
++constexpr int kFrame = 96;     // samples per 3 ms frame at 32 kHz
++constexpr int kWmFrame = 18;   // Wii Remote speaker samples per frame
++constexpr int kMaxVoices = 512;
++
++// ---- guest memory (big-endian, physical or cached addresses) ----
++
++uint8_t *mem(uint32_t addr) { return g_mmu ? g_mmu->get_ptr(addr) : nullptr; }
++
++uint8_t ov_rd(const uint8_t *p) {
++  if (!g_overlay) return *p;  // NWII_AX_MIXER=ref: plain r7b mixer
++  auto it = g_overlay->find(p);
++  return it != g_overlay->end() ? it->second : *p;
++}
++
++uint16_t rd16(uint32_t a) {
++  const uint8_t *p = mem(a);
++  return p ? (uint16_t)((ov_rd(p) << 8) | ov_rd(p + 1)) : 0;
++}
++
++void wr16(uint32_t a, uint16_t v) {
++  if (uint8_t *p = mem(a)) {
++    if (!g_overlay) {
++      p[0] = (uint8_t)(v >> 8);
++      p[1] = (uint8_t)v;
++      return;
++    }
++    (*g_overlay)[p] = (uint8_t)(v >> 8);
++    (*g_overlay)[p + 1] = (uint8_t)v;
++  }
++}
++
++int32_t rd32(uint32_t a) { return (int32_t)(((uint32_t)rd16(a) << 16) | rd16(a + 2)); }
++
++void wr32(uint32_t a, int32_t v) {
++  wr16(a, (uint16_t)((uint32_t)v >> 16));
++  wr16(a + 2, (uint16_t)v);
++}
++
++// The DSP accelerator sees "ARAM" addresses; on Wii those are physical RAM
++// addresses, MEM2 when bit 28 is set.
++uint8_t aram8(uint32_t a) {
++  const uint8_t *p = (a & 0x10000000) ? mem(0x10000000 | (a & 0x03FFFFFF))
++                                      : mem(a & 0x01FFFFFF);
++  return p ? *p : 0;
++}
++
++int16_t clamp16(int64_t v) {
++  return (int16_t)std::clamp<int64_t>(v, -0x8000, 0x7FFF);
++}
++
++// ---- voice parameter block (AXPBWii, 0x4cc52064 layout: no `updates`) ----
++// Indices are in 16-bit words.
++enum PB : int {
++  NEXT_HI = 0x00, NEXT_LO = 0x01,
++  SRC_TYPE = 0x04, COEF_SELECT = 0x05,
++  MIX_CTRL_HI = 0x06, MIX_CTRL_LO = 0x07,
++  RUNNING = 0x08, IS_STREAM = 0x09,
++  // mixer: {volume, delta} pairs
++  MIX_MAIN_L = 0x0A, MIX_MAIN_R = 0x0C, MIX_AUXA_L = 0x0E, MIX_AUXA_R = 0x10,
++  MIX_AUXB_L = 0x12, MIX_AUXB_R = 0x14, MIX_AUXC_L = 0x16, MIX_AUXC_R = 0x18,
++  MIX_MAIN_S = 0x1A, MIX_AUXA_S = 0x1C, MIX_AUXB_S = 0x1E, MIX_AUXC_S = 0x20,
++  // de-pop: last sample sent to each bus
++  DPOP_MAIN_L = 0x29, DPOP_AUXA_L = 0x2A, DPOP_AUXB_L = 0x2B, DPOP_AUXC_L = 0x2C,
++  DPOP_MAIN_R = 0x2D, DPOP_AUXA_R = 0x2E, DPOP_AUXB_R = 0x2F, DPOP_AUXC_R = 0x30,
++  DPOP_MAIN_S = 0x31, DPOP_AUXA_S = 0x32, DPOP_AUXB_S = 0x33, DPOP_AUXC_S = 0x34,
++  VOL_ENV = 0x35, VOL_ENV_DELTA = 0x36,
++  LOOPING = 0x37, SAMPLE_FORMAT = 0x38,
++  LOOP_HI = 0x39, LOOP_LO = 0x3A, END_HI = 0x3B, END_LO = 0x3C,
++  CUR_HI = 0x3D, CUR_LO = 0x3E,
++  ADPCM_COEFS = 0x3F,  // 16 words
++  ADPCM_GAIN = 0x4F, ADPCM_PRED_SCALE = 0x50, ADPCM_YN1 = 0x51, ADPCM_YN2 = 0x52,
++  SRC_RATIO_HI = 0x53, SRC_RATIO_LO = 0x54, SRC_FRAC = 0x55,
++  SRC_LAST = 0x56,  // 4 words
++  LOOP_PRED_SCALE = 0x5A, LOOP_YN1 = 0x5B, LOOP_YN2 = 0x5C,
++  LPF_ON = 0x5D, LPF_YN1 = 0x5E, LPF_A0 = 0x5F, LPF_B0 = 0x60,
++  BQ_ON = 0x61, BQ_XN1 = 0x62, BQ_XN2 = 0x63, BQ_YN1 = 0x64, BQ_YN2 = 0x65,
++  BQ_B0 = 0x66, BQ_B1 = 0x67, BQ_B2 = 0x68, BQ_A1 = 0x69, BQ_A2 = 0x6A,
++  PB_WORDS = 0x96,
++};
++
++enum : uint16_t { SRC_POLYPHASE = 0, SRC_LINEAR = 1, SRC_NEAREST = 2 };
++
++uint32_t hilo(const uint16_t *pb, int hi) { return ((uint32_t)pb[hi] << 16) | pb[hi + 1]; }
++
++// ---- DSP accelerator: sample fetch + ADPCM/PCM decode with loop handling ----
++
++struct Accelerator {
++  uint32_t start = 0, end = 0, cur = 0;
++  uint16_t format = 0;
++  int16_t yn1 = 0, yn2 = 0, gain = 0;
++  uint16_t pred_scale = 0;
++  bool stopped = false;
++  uint16_t *pb = nullptr;
++
++  void set_yn2(int16_t v) {
++    yn2 = v;
++    stopped = false;
++  }
++
++  uint16_t current_sample() const {
++    switch (format & 3) {
++    case 0: {  // 4-bit
++      uint16_t v = aram8(cur >> 1);
++      return (cur & 1) ? (v & 0xF) : (v >> 4);
++    }
++    case 1:  // 8-bit
++      return aram8(cur);
++    case 2:  // 16-bit
++      return (uint16_t)((aram8(cur * 2) << 8) | aram8(cur * 2 + 1));
++    default:
++      return 0;
++    }
++  }
++
++  // Reached the end address: loop or stop the voice.
++  void on_end() {
++    if (pb[LOOPING]) {
++      pred_scale = pb[LOOP_PRED_SCALE] & 0x7F;
++      if (pb[IS_STREAM] != 1) {
++        yn1 = (int16_t)pb[LOOP_YN1];
++        set_yn2((int16_t)pb[LOOP_YN2]);
++      } else {
++        // Streams keep decoding history across the loop seam.
++        set_yn2(yn2);
++      }
++    } else {
++      pb[RUNNING] = 0;
++    }
++  }
++
++  int16_t read_sample(const int16_t *coefs) {
++    if (stopped)
++      return 0;
++    const unsigned decode = (format >> 2) & 3;
++    const unsigned gain_scale = (format >> 4) & 3;
++    int16_t raw = (int16_t)current_sample();
++    const int ci = (pred_scale >> 4) & 7;
++    const int32_t c1 = coefs[ci * 2], c2 = coefs[ci * 2 + 1];
++    int16_t val = 0;
++    uint32_t step = 0;
++    if (decode == 0) {  // DSP-ADPCM
++      raw &= 0xF;
++      const int32_t scale = 1 << (pred_scale & 0xF);
++      if (raw >= 8)
++        raw -= 16;
++      const int32_t v = scale * raw + ((0x400 + c1 * yn1 + c2 * yn2) >> 11);
++      val = clamp16(v);
++      step = 2;
++      yn2 = yn1;
++      yn1 = val;
++      cur += 1;
++      if ((end & 0xF) == 0 && cur == end) {
++        cur = start + 1;
++      } else if ((end & 0xF) == 1 && cur == end - 1) {
++        cur = start;
++      } else if ((cur & 15) == 0) {  // next 8-byte frame header
++        pred_scale = aram8((cur & ~15u) >> 1);
++        cur += 2;
++        step += 2;
++      }
++    } else {  // PCM (the MMIO input variants never occur in AX voices)
++      const int shift = gain_scale == 0 ? 11 : gain_scale == 2 ? 16 : 0;
++      const int32_t v = ((int32_t)gain * raw >> shift) + ((c1 * yn1) >> shift) +
++                        ((c2 * yn2) >> shift);
++      val = (int16_t)v;
++      yn2 = yn1;
++      yn1 = val;
++      step = 2;
++      if (decode != 1)
++        cur += 1;
++    }
++    if (cur == end + step - 1) {
++      cur = start;
++      stopped = true;
++      on_end();
++    }
++    cur &= 0xBFFFFFFF;
++    return val;
++  }
++};
++
++// Sample-rate conversion. No DSP-ROM polyphase table ships with the runtime,
++// so polyphase falls back to linear, as Dolphin does without dsp_coef.bin.
++template <typename Input>
++uint32_t resample(Input &&input, int16_t *out, int count, uint16_t *last,
++                  uint32_t pos, uint32_t ratio, uint16_t type) {
++  if (type == SRC_NEAREST) {
++    for (int i = 0; i < count; ++i)
++      out[i] = input();
++    for (int i = 0; i < 4; ++i)
++      last[i] = (uint16_t)out[count - 4 + i];
++    return pos;
++  }
++  int16_t t[4];
++  uint32_t idx = 0;
++  for (int i = 0; i < 4; ++i)
++    t[idx++ & 3] = (int16_t)last[i];
++  for (int i = 0; i < count; ++i) {
++    pos += ratio;
++    while (pos >= 0x10000) {
++      t[idx++ & 3] = input();
++      pos -= 0x10000;
++    }
++    const uint16_t frac = pos & 0xFFFF;
++    if (frac) {
++      const int32_t s0 = t[idx++ & 3];
++      const int32_t s1 = t[idx++ & 3];
++      out[i] = (int16_t)((s0 * (uint16_t)-frac + s1 * frac) >> 16);
++      idx += 2;
++    } else {
++      out[i] = t[idx++ & 3];
++      idx += 3;
++    }
++  }
++  last[3] = (uint16_t)t[--idx & 3];
++  last[2] = (uint16_t)t[--idx & 3];
++  last[1] = (uint16_t)t[--idx & 3];
++  last[0] = (uint16_t)t[--idx & 3];
++  return pos;
++}
++
++// ---- mixing buses ----
++
++struct Buses {
++  int32_t main_l[kFrame], main_r[kFrame], main_s[kFrame];
++  int32_t auxa_l[kFrame], auxa_r[kFrame], auxa_s[kFrame];
++  int32_t auxb_l[kFrame], auxb_r[kFrame], auxb_s[kFrame];
++  int32_t auxc_l[kFrame], auxc_r[kFrame], auxc_s[kFrame];
++  int32_t wm[8][kWmFrame];  // main0, aux0, main1, aux1, ... (remote speakers)
++};
++
++Buses g_bus;
++uint16_t g_last_main_volume = 0x8000;
++uint16_t g_last_aux_volume[3] = {0x8000, 0x8000, 0x8000};
++uint16_t g_compressor_pos = 0;
++
++void volume_ramp(uint16_t *out, uint16_t from, uint16_t to) {
++  float v = from;
++  const float step = ((int)to - (int)from) / (float)kFrame;
++  for (int i = 0; i < kFrame; ++i) {
++    v += step;
++    out[i] = (uint16_t)v;
++  }
++}
++
++void mix_add(int32_t *out, const int16_t *in, uint16_t *pb, int vol_idx, int dpop_idx,
++             bool ramp) {
++  uint16_t volume = pb[vol_idx];
++  const uint16_t delta = ramp ? pb[vol_idx + 1] : 0;
++  int16_t last = 0;
++  for (int i = 0; i < kFrame; ++i) {
++    last = clamp16(((int64_t)in[i] * volume) >> 15);
++    out[i] += last;
++    volume += delta;
++  }
++  pb[vol_idx] = volume;
++  pb[dpop_idx] = (uint16_t)last;
++}
++
++void low_pass(int16_t *s, uint16_t *pb) {
++  int16_t yn1 = (int16_t)pb[LPF_YN1];
++  const int32_t a0 = pb[LPF_A0], b0 = (int16_t)pb[LPF_B0];
++  for (int i = 0; i < kFrame; ++i)
++    yn1 = s[i] = clamp16((a0 * s[i] + b0 * yn1) >> 15);
++  pb[LPF_YN1] = (uint16_t)yn1;
++}
++
++void biquad(int16_t *s, uint16_t *pb) {
++  int16_t xn1 = (int16_t)pb[BQ_XN1], xn2 = (int16_t)pb[BQ_XN2];
++  int16_t yn1 = (int16_t)pb[BQ_YN1], yn2 = (int16_t)pb[BQ_YN2];
++  const int32_t b0 = (int16_t)pb[BQ_B0], b1 = (int16_t)pb[BQ_B1], b2 = (int16_t)pb[BQ_B2];
++  const int32_t a1 = (int16_t)pb[BQ_A1], a2 = (int16_t)pb[BQ_A2];
++  for (int i = 0; i < kFrame; ++i) {
++    const int16_t xn0 = s[i];
++    int64_t t = (int64_t)b0 * xn0 + (int64_t)b1 * xn1 + (int64_t)b2 * xn2 +
++                (int64_t)a1 * yn1 + (int64_t)a2 * yn2;
++    t <<= 2;
++    t += (t & 0x10000) ? 0x8000 : 0x7FFF;
++    const int16_t yn0 = clamp16(t >> 16);
++    xn2 = xn1;
++    yn2 = yn1;
++    xn1 = xn0;
++    yn1 = yn0;
++    s[i] = yn0;
++  }
++  pb[BQ_XN1] = (uint16_t)xn1;
++  pb[BQ_XN2] = (uint16_t)xn2;
++  pb[BQ_YN1] = (uint16_t)yn1;
++  pb[BQ_YN2] = (uint16_t)yn2;
++}
++
++void process_voice(uint16_t *pb) {
++  if (pb[RUNNING] != 1)
++    return;
++
++  Accelerator acc;
++  acc.pb = pb;
++  acc.start = hilo(pb, LOOP_HI) & 0x3FFFFFFF;
++  acc.end = hilo(pb, END_HI) & 0x3FFFFFFF;
++  acc.cur = hilo(pb, CUR_HI) & 0xBFFFFFFF;
++  acc.format = pb[SAMPLE_FORMAT];
++  acc.yn1 = (int16_t)pb[ADPCM_YN1];
++  acc.set_yn2((int16_t)pb[ADPCM_YN2]);
++  acc.gain = (int16_t)pb[ADPCM_GAIN];
++  acc.pred_scale = pb[ADPCM_PRED_SCALE] & 0x7F;
++
++  int16_t coefs[16];
++  for (int i = 0; i < 16; ++i)
++    coefs[i] = (int16_t)pb[ADPCM_COEFS + i];
++
++  int16_t s[kFrame];
++  const uint32_t pos = resample([&] { return acc.read_sample(coefs); }, s, kFrame,
++                                &pb[SRC_LAST], pb[SRC_FRAC], hilo(pb, SRC_RATIO_HI),
++                                pb[SRC_TYPE]);
++  pb[SRC_FRAC] = (uint16_t)pos;
++  pb[CUR_HI] = (uint16_t)(acc.cur >> 16);
++  pb[CUR_LO] = (uint16_t)acc.cur;
++  pb[ADPCM_YN1] = (uint16_t)acc.yn1;
++  pb[ADPCM_YN2] = (uint16_t)acc.yn2;
++  pb[ADPCM_PRED_SCALE] = acc.pred_scale;
++
++  // Volume envelope (unsigned on Wii).
++  for (int i = 0; i < kFrame; ++i) {
++    s[i] = clamp16(((int32_t)s[i] * (int32_t)pb[VOL_ENV]) >> 15);
++    pb[VOL_ENV] = (uint16_t)(pb[VOL_ENV] + pb[VOL_ENV_DELTA]);
++  }
++
++  if (pb[LPF_ON])
++    low_pass(s, pb);
++  if (pb[BQ_ON])
++    biquad(s, pb);
++
++  // Mixer control bits (AXWii): per bus "on" bit and a combined on+ramp bit.
++  const uint32_t mc = hilo(pb, MIX_CTRL_HI);
++  struct Route {
++    int32_t *bus;
++    int vol, dpop;
++    uint32_t on, ramp;
++  };
++  const Route routes[] = {
++      {g_bus.main_l, MIX_MAIN_L, DPOP_MAIN_L, 0x00000001 | 0x00000004, 0x00000004},
++      {g_bus.main_r, MIX_MAIN_R, DPOP_MAIN_R, 0x00000002 | 0x00000004, 0x00000004},
++      {g_bus.main_s, MIX_MAIN_S, DPOP_MAIN_S, 0x00000008 | 0x00000010, 0x00000010},
++      {g_bus.auxa_l, MIX_AUXA_L, DPOP_AUXA_L, 0x00010000 | 0x00040000, 0x00040000},
++      {g_bus.auxa_r, MIX_AUXA_R, DPOP_AUXA_R, 0x00020000 | 0x00040000, 0x00040000},
++      {g_bus.auxa_s, MIX_AUXA_S, DPOP_AUXA_S, 0x00080000 | 0x00100000, 0x00100000},
++      {g_bus.auxb_l, MIX_AUXB_L, DPOP_AUXB_L, 0x00200000 | 0x00800000, 0x00800000},
++      {g_bus.auxb_r, MIX_AUXB_R, DPOP_AUXB_R, 0x00400000 | 0x00800000, 0x00800000},
++      {g_bus.auxb_s, MIX_AUXB_S, DPOP_AUXB_S, 0x01000000 | 0x02000000, 0x02000000},
++      {g_bus.auxc_l, MIX_AUXC_L, DPOP_AUXC_L, 0x04000000 | 0x10000000, 0x10000000},
++      {g_bus.auxc_r, MIX_AUXC_R, DPOP_AUXC_R, 0x08000000 | 0x10000000, 0x10000000},
++      {g_bus.auxc_s, MIX_AUXC_S, DPOP_AUXC_S, 0x20000000 | 0x40000000, 0x40000000},
++  };
++  for (const Route &r : routes)
++    if (mc & r.on)
++      mix_add(r.bus, s, pb, r.vol, r.dpop, (mc & r.ramp) != 0);
++  // Wii Remote speaker output (pb remote fields) is not emulated.
++}
++
++void process_pb_list(uint32_t pb_addr) {
++  uint16_t pb[PB_WORDS];
++  for (int n = 0; pb_addr && n < kMaxVoices; ++n) {
++    for (int i = 0; i < PB_WORDS; ++i)
++      pb[i] = rd16(pb_addr + i * 2);
++    process_voice(pb);
++    for (int i = 0; i < PB_WORDS; ++i)
++      wr16(pb_addr + i * 2, pb[i]);
++    pb_addr = hilo(pb, NEXT_HI);
++  }
++}
++
++void setup(uint32_t init_addr) {
++  struct Desc {
++    int32_t *buf;
++    int count;
++  };
++  const Desc bufs[20] = {
++      {g_bus.main_l, kFrame}, {g_bus.main_r, kFrame}, {g_bus.main_s, kFrame},
++      {g_bus.auxa_l, kFrame}, {g_bus.auxa_r, kFrame}, {g_bus.auxa_s, kFrame},
++      {g_bus.auxb_l, kFrame}, {g_bus.auxb_r, kFrame}, {g_bus.auxb_s, kFrame},
++      {g_bus.auxc_l, kFrame}, {g_bus.auxc_r, kFrame}, {g_bus.auxc_s, kFrame},
++      {g_bus.wm[0], kWmFrame}, {g_bus.wm[1], kWmFrame}, {g_bus.wm[2], kWmFrame},
++      {g_bus.wm[3], kWmFrame}, {g_bus.wm[4], kWmFrame}, {g_bus.wm[5], kWmFrame},
++      {g_bus.wm[6], kWmFrame}, {g_bus.wm[7], kWmFrame},
++  };
++  for (int i = 0; i < 20; ++i) {
++    const uint32_t a = init_addr + i * 6;
++    const int32_t value = rd32(a);
++    const int16_t delta = (int16_t)rd16(a + 4);
++    for (int j = 0; j < bufs[i].count; ++j)
++      bufs[i].buf[j] = value ? value + j * delta : 0;
++  }
++}
++
++void add_to_lr(uint32_t addr, bool neg) {
++  for (int i = 0; i < kFrame; ++i) {
++    int32_t v = rd32(addr + i * 4);
++    if (neg)
++      v = -v;
++    g_bus.main_l[i] += v;
++    g_bus.main_r[i] += v;
++  }
++}
++
++void add_sub_to_lr(uint32_t addr) {
++  for (int i = 0; i < kFrame; ++i)
++    g_bus.main_l[i] += rd32(addr + i * 4);
++  for (int i = 0; i < kFrame; ++i)
++    g_bus.main_r[i] -= rd32(addr + kFrame * 4 + i * 4);
++}
++
++void write_bus(uint32_t addr, const int32_t *bus) {
++  for (int i = 0; i < kFrame; ++i)
++    wr32(addr + i * 4, bus[i]);
++}
++
++// Send an aux bus to the CPU (effects run there) and mix back what the CPU
++// returned for it last frame.
++void mix_aux(int id, uint32_t write_addr, uint32_t read_addr, uint16_t volume) {
++  uint16_t ramp[kFrame];
++  volume_ramp(ramp, g_last_aux_volume[id], volume);
++  g_last_aux_volume[id] = volume;
++  int32_t *aux[3][3] = {{g_bus.auxa_l, g_bus.auxa_r, g_bus.auxa_s},
++                        {g_bus.auxb_l, g_bus.auxb_r, g_bus.auxb_s},
++                        {g_bus.auxc_l, g_bus.auxc_r, g_bus.auxc_s}};
++  if (write_addr)
++    for (int c = 0; c < 3; ++c)
++      write_bus(write_addr + c * kFrame * 4, aux[id][c]);
++  int32_t *main[3] = {g_bus.main_l, g_bus.main_r, g_bus.main_s};
++  for (int c = 0; c < 3; ++c)
++    for (int i = 0; i < kFrame; ++i)
++      main[c][i] += (int32_t)(((int64_t)rd32(read_addr + (c * kFrame + i) * 4) * ramp[i]) >> 15);
++}
++
++void upload_aux_mix_lrsc(int id, const uint32_t *addr, uint16_t volume) {
++  int32_t *l = id ? g_bus.auxb_l : g_bus.auxa_l;
++  int32_t *r = id ? g_bus.auxb_r : g_bus.auxa_r;
++  int32_t *s = id ? g_bus.auxb_s : g_bus.auxa_s;
++  int32_t *c = id ? g_bus.auxc_s : g_bus.auxc_r;
++  write_bus(addr[0], l);
++  write_bus(addr[0] + kFrame * 4, r);
++  write_bus(addr[0] + 2 * kFrame * 4, s);
++  write_bus(addr[1], c);
++  uint16_t ramp[kFrame];
++  volume_ramp(ramp, g_last_aux_volume[id], volume);
++  g_last_aux_volume[id] = volume;
++  int32_t *dest[4] = {g_bus.main_l, g_bus.main_r, g_bus.main_s, g_bus.auxc_l};
++  for (int m = 0; m < 4; ++m)
++    for (int i = 0; i < kFrame; ++i)
++      dest[m][i] += (int32_t)(((int64_t)rd32(addr[2 + m] + i * 4) * ramp[i]) >> 15);
++}
++
++void compressor(uint16_t threshold, uint16_t release_frames, uint32_t table) {
++  bool triggered = false;
++  for (int i = 0; i < kFrame && !triggered; ++i)
++    triggered = std::abs(g_bus.main_l[i]) > threshold || std::abs(g_bus.main_r[i]) > threshold;
++  const uint32_t frame_bytes = kFrame * 2;
++  uint32_t offset;
++  if (triggered) {
++    offset = g_compressor_pos * frame_bytes;
++    g_compressor_pos = release_frames;
++  } else if (g_compressor_pos) {
++    --g_compressor_pos;
++    constexpr uint32_t kAttackEntries = 11;
++    offset = (kAttackEntries + g_compressor_pos) * frame_bytes;
++  } else {
++    return;
++  }
++  for (int i = 0; i < kFrame; ++i) {
++    const uint16_t coef = rd16(table + offset + i * 2);
++    g_bus.main_l[i] = (int32_t)(((int64_t)g_bus.main_l[i] * coef) >> 15);
++    g_bus.main_r[i] = (int32_t)(((int64_t)g_bus.main_r[i] * coef) >> 15);
++  }
++}
++
++void output(uint32_t lr_addr, uint32_t surround_addr, uint16_t volume, bool dpl2) {
++  uint16_t ramp[kFrame];
++  volume_ramp(ramp, g_last_main_volume, volume);
++  g_last_main_volume = volume;
++  write_bus(surround_addr, g_bus.main_s);
++  if (dpl2)
++    write_bus(surround_addr + kFrame * 4, g_bus.auxc_l);
++  // Interleaved R, L as 16-bit big-endian: the layout AI DMA plays.
++  for (int i = 0; i < kFrame; ++i) {
++    const int16_t l = clamp16(((int64_t)g_bus.main_l[i] * ramp[i]) >> 15);
++    const int16_t r = clamp16(((int64_t)g_bus.main_r[i] * ramp[i]) >> 15);
++    wr16(lr_addr + i * 4, (uint16_t)r);
++    wr16(lr_addr + i * 4 + 2, (uint16_t)l);
++  }
++}
++
++void wm_output(const uint32_t *addr) {
++  for (int m = 0; m < 4; ++m)
++    for (int j = 0; j < kWmFrame; ++j)
++      wr16(addr[m] + j * 2, (uint16_t)clamp16(g_bus.wm[m * 2][j]));
++}
++
++}  // namespace
++
++void state_bytes(std::vector<uint8_t> &out) {
++  out.clear();
++  auto put = [&](const void *p, size_t n) {
++    out.insert(out.end(), (const uint8_t *)p, (const uint8_t *)p + n);
++  };
++  put(&g_bus, sizeof g_bus);
++  put(&g_last_main_volume, sizeof g_last_main_volume);
++  put(g_last_aux_volume, sizeof g_last_aux_volume);
++  put(&g_compressor_pos, sizeof g_compressor_pos);
++}
++
++bool run_command_list(uint32_t addr, uint16_t size_words) {
++  uint16_t list[512];
++  const uint32_t n = std::min<uint32_t>(size_words, 512);
++  for (uint32_t i = 0; i < n; ++i)
++    list[i] = rd16(addr + i * 2);
++
++  bool produced = false;
++  uint32_t i = 0;
++  auto arg = [&]() -> uint16_t { return i < n ? list[i++] : 0; };
++  auto arg32 = [&]() -> uint32_t {
++    const uint32_t hi = arg();
++    return (hi << 16) | arg();
++  };
++  while (i < n) {
++    const uint16_t cmd = arg();
++    switch (cmd) {
++    case 0x00:  // SETUP
++      setup(arg32());
++      break;
++    case 0x01:  // ADD_TO_LR
++    case 0x02:  // SUB_TO_LR
++      add_to_lr(arg32(), cmd == 0x02);
++      break;
++    case 0x03:  // ADD_SUB_TO_LR
++      add_sub_to_lr(arg32());
++      break;
++    case 0x04:  // PROCESS
++      process_pb_list(arg32());
++      break;
++    case 0x05:  // MIX_AUXA
++    case 0x06:  // MIX_AUXB
++    case 0x07: {  // MIX_AUXC
++      const uint16_t volume = arg();
++      const uint32_t write_addr = arg32();
++      const uint32_t read_addr = arg32();
++      mix_aux(cmd - 0x05, write_addr, read_addr, volume);
++      break;
++    }
++    case 0x08:  // UPL_AUXA_MIX_LRSC
++    case 0x09: {  // UPL_AUXB_MIX_LRSC
++      const uint16_t volume = arg();
++      uint32_t a[6];
++      for (uint32_t &x : a)
++        x = arg32();
++      upload_aux_mix_lrsc(cmd == 0x09, a, volume);
++      break;
++    }
++    case 0x0A: {  // COMPRESSOR
++      const uint16_t threshold = arg();
++      const uint16_t frames = arg();
++      compressor(threshold, frames, arg32());
++      break;
++    }
++    case 0x0B:  // OUTPUT
++    case 0x0C: {  // OUTPUT_DPL2
++      const uint16_t volume = arg();
++      const uint32_t surround = arg32();
++      const uint32_t lr = arg32();
++      output(lr, surround, volume, cmd == 0x0C);
++      produced = true;
++      break;
++    }
++    case 0x0D: {  // WM_OUTPUT
++      uint32_t a[4];
++      for (uint32_t &x : a)
++        x = arg32();
++      wm_output(a);
++      break;
++    }
++    case 0x0E:  // END
++      return produced;
++    default: {
++      static int warned = 0;
++      if (warned++ < 8)
++        std::cout << "[AX] unknown command 0x" << std::hex << cmd << " at word " << std::dec
++                  << (i - 1) << "\n";
++      return produced;
++    }
++    }
++  }
++  return produced;
++}
++
++}  // namespace nwii::runtime::ax::ref
+diff --color -ruN -x '*.orig' -x '*.rej' base/nWiiRuntime/src/hle/gx.cpp threads/nWiiRuntime/src/hle/gx.cpp
+--- base/nWiiRuntime/src/hle/gx.cpp	2026-10-31 03:38:55.953281535 -0500
++++ threads/nWiiRuntime/src/hle/gx.cpp	2026-10-31 07:44:05.266017119 -0500
+@@ -928,16 +928,248 @@
+ bool g_early_gx_sync = NWII_ENV("NWII_LATE_SYNC") == nullptr;
+ static bool s_bp_armed = false;
+ 
++namespace hw { extern bool g_wgp_redirect_on; }  // hw_pi.cpp
++
++// ---- R8 threads: write-gather buffer on the guest thread ---------------------
++// Every GXPosition/GXColor/... call wrote its 1-8 bytes straight into
++// g_hw_fifo under g_fifo_mutex (an atomic exchange + vector growth per call,
++// ~6% of the CPU thread). Like the real write-gather pipe, the bytes now
++// collect in a small buffer of the guest thread and go into g_hw_fifo in one
++// piece. Order and content of the stream are unchanged; only the moment the
++// host can see the bytes moves, and the host takes the FIFO at arbitrary
++// moments anyway (1 ms polls), so every stream the host can observe now is
++// one it could already observe before. The buffer is handed over:
++//   - when it is full;
++//   - after every possible BP command, i.e. 4 bytes after any 0x61 byte, so a
++//     BP (frame end = XFB copy, EFB copy, draw done, tokens) is visible to
++//     the host at the same moment as before;
++//   - when the guest idles (idle_wait).
++// The redirect test (FIFO pointed at a display list buffer in RAM) is a flag
++// kept by the PI/CP register writes instead of two calls per write.
++// NWII_WGP_DIRECT=1 restores the direct per-write path. The debug captures
++// (NWII_GXDUMP/NWII_WGSEG/NWII_WGTRACE) always use the direct path.
++// Guest thread only (all GX_WGPIPE_* callers are: MMIO writes, GX seams, the
++// CP FIFO drain of an MMIO write).
++//
++// R9 threads: which BPs force a hand-over. r8 threads handed the buffer over
++// after every possible BP (any 0x61 byte + 4), which in practice meant every
++// ~13 bytes (vertex data is full of 0x61 bytes and every draw sets BP
++// registers): ~290 000 locks of g_fifo_mutex per second, contended by the host
++// thread that takes the FIFO. Now (default) only the BPs whose host processing
++// can feed back into the guest are handed over at once:
++//   0x45 (draw done) 0x47/0x48 (tokens): the PE is signalled early, on this
++//        thread, right after the write; the host must own everything before
++//        it, as before;
++//   0x52 (EFB/XFB copy): the copy into guest RAM / the frame end (and the
++//        r8:memory frame count, which counts at that hand-over).
++// Every other byte (vertices, CP/XF loads, other BPs) waits until the buffer
++// is full (2 KB), the next such BP, or the guest idles. That is 1:1 for the
++// same reason the buffer is: the stream is the same, only the moment the host
++// can see a byte moves, and the host takes the FIFO at arbitrary moments
++// anyway. No other BP makes the host do anything the guest can observe (CP
++// status registers are not driven by the host). NWII_WGP_FLUSH=bp restores
++// the r8 rule (hand over after every possible BP).
++static constexpr uint32_t kWgCap = 2048;
++alignas(64) static uint8_t s_wg[kWgCap];
++static uint32_t s_wg_n = 0;
++// Bit k set: a possible BP command completes when k more bytes are appended.
++static uint32_t s_wg_bp = 0;
++// Same, for possible BPs whose register byte (the one after 0x61) is one that
++// must be handed over at once (see above).
++static uint32_t s_wg_crit = 0;
++static std::atomic<uint64_t> s_wg_writes{0}, s_wg_flushes{0}, s_wg_bytes{0};
++
++static inline bool wgp_gather() {
++    static const bool g = !wgp_debug() && NWII_ENV("NWII_WGP_DIRECT") == nullptr;
++    return g;
++}
++static inline bool wgp_flush_every_bp() {
++    static const bool b = [] {
++        const char *e = NWII_ENV("NWII_WGP_FLUSH");
++        return e && std::strcmp(e, "bp") == 0;
++    }();
++    return b;
++}
++static inline bool wg_crit_reg(uint8_t r) {
++    return r == 0x52 || r == 0x45 || r == 0x47 || r == 0x48;
++}
++
++// NWII_WGP_CHECK=<prefix> (debug, PC: read at start-up): every gathered write
++// is also recorded, at the moment it is made, as the direct path would have
++// pushed it (<prefix>.w), and every hand-over to g_hw_fifo is recorded too
++// (<prefix>.f); the two files (first 512 MB) must be equal up to the bytes
++// still buffered at exit. After each write it also checks the BP rule (no
++// complete 0x61 + 4 bytes left in the buffer) and the cached redirect flag
++// against the full register test ([WGP] check lines).
++static FILE *wg_check_open(const char *ext) {
++    const char *p = NWII_ENV("NWII_WGP_CHECK");
++    if (!p) return nullptr;
++    char path[1024];
++    std::snprintf(path, sizeof path, "%s.%s", p, ext);
++    return std::fopen(path, "wb");
++}
++static FILE *s_wcheck = wg_check_open("w");    // the writes, as made
++static FILE *s_wcheck_f = wg_check_open("f");  // what the flushes handed over
++static size_t s_wcheck_n = 0, s_wcheck_fn = 0;
++static uint64_t s_wcheck_bad = 0, s_wcheck_calls = 0;
++static NWII_NOINLINE void wg_check(uint64_t v, int k) {
++    uint8_t b[8];
++    for (int i = 0; i < k; ++i) b[i] = (v >> ((k - 1 - i) * 8)) & 0xFF;
++    if (s_wcheck_n < (512u << 20)) {
++        std::fwrite(b, 1, k, s_wcheck);
++        s_wcheck_n += k;
++    }
++    ++s_wcheck_calls;
++}
++// Called before the write: the cached redirect flag must match the full test.
++static uint64_t s_wcheck_redir = 0, s_wcheck_redir_bad = 0;
++static NWII_NOINLINE void wg_check_redirect() {
++    uint32_t base, end, wptr;
++    nwii::runtime::hw::pi_fifo_get(base, end, wptr);
++    const uint32_t cp_base = nwii::runtime::hw::cp_fifo_base_reg();
++    const bool on = base != 0 && (base & 0x03FFFFFF) != (cp_base & 0x03FFFFFF);
++    if (on) ++s_wcheck_redir;
++    if (on != hw::g_wgp_redirect_on && s_wcheck_redir_bad++ < 8)
++        std::printf("[WGP] check: redirect flag %d, registers say %d\n",
++                    (int)hw::g_wgp_redirect_on, (int)on);
++}
++// Called after the write: a complete BP still in the buffer is a violation
++// (only the BPs of wg_crit_reg, unless NWII_WGP_FLUSH=bp).
++static NWII_NOINLINE void wg_check_after() {
++    for (uint32_t i = 0; i + 4 < s_wg_n; ++i)
++        if (s_wg[i] == 0x61 && (wgp_flush_every_bp() || wg_crit_reg(s_wg[i + 1]))) {
++            if (s_wcheck_bad++ < 8)
++                std::printf("[WGP] check: BP left in buffer at %u of %u\n", i, s_wg_n);
++            break;
++        }
++    if ((s_wcheck_calls & 0xFFFFFF) == 0) {
++        std::printf("[WGP] check: %llu writes, %zu bytes recorded, %llu BP rule violations, "
++                    "%llu redirected writes, %llu redirect flag mismatches\n",
++                    (unsigned long long)s_wcheck_calls, s_wcheck_n,
++                    (unsigned long long)s_wcheck_bad, (unsigned long long)s_wcheck_redir,
++                    (unsigned long long)s_wcheck_redir_bad);
++        std::fflush(s_wcheck);
++        std::fflush(s_wcheck_f);
++    }
++}
++
++// R8 memory + threads: an XFB copy (BP 0x52, bit 14) in the buffer is counted
++// in s_fifo_frames by the flush that hands it over, under the same lock, as
++// the direct path counts it when it pushes it; s_wg_full asks the writer to
++// wait for the host afterwards (FifoWaitForHost).
++static bool s_wg_xfb = false, s_wg_full = false;
++
++static NWII_NOINLINE void wg_flush_now() {
++    {
++        std::lock_guard<FifoLock> lock(g_fifo_mutex);
++        g_hw_fifo.insert(g_hw_fifo.end(), s_wg, s_wg + s_wg_n);
++        if (s_wg_xfb) {
++            s_wg_xfb = false;
++            const uint32_t max = FifoMaxFrames();
++            s_wg_full = ++s_fifo_frames >= max && max != 0;
++        }
++    }
++    if (__builtin_expect(s_wcheck_f != nullptr, 0) && s_wcheck_fn < (512u << 20)) {
++        std::fwrite(s_wg, 1, s_wg_n, s_wcheck_f);
++        s_wcheck_fn += s_wg_n;
++    }
++    s_wg_flushes.store(s_wg_flushes.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
++    s_wg_bytes.store(s_wg_bytes.load(std::memory_order_relaxed) + s_wg_n, std::memory_order_relaxed);
++    s_wg_n = 0;
++}
++
++void GX_WGPIPE_Flush() {
++    if (s_wg_n) wg_flush_now();
++}
++
++// Appends one byte (room for it must exist) and applies the BP rule.
++static inline void wg_byte(uint8_t b) {
++    s_wg[s_wg_n++] = b;
++    s_wg_bp >>= 1;
++    s_wg_crit >>= 1;
++    const bool bp_done = (wgp_flush_every_bp() ? s_wg_bp : s_wg_crit) & 1;
++    s_wg_bp &= ~1u;
++    s_wg_crit &= ~1u;
++    // b follows a 0x61 (that candidate now completes in 3 bytes): its register.
++    if ((s_wg_bp & (1u << 3)) && wg_crit_reg(b)) s_wg_crit |= 1u << 3;
++    if (b == 0x61) s_wg_bp |= 1u << 4;
++    if (bp_done) wg_flush_now();
++}
++
++static inline void wg_room(uint32_t k) {
++    if (__builtin_expect(s_wg_n + k > kWgCap, 0)) wg_flush_now();
++}
++
++static inline void wg_count() {
++    s_wg_writes.store(s_wg_writes.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
++}
++
++// Big-endian bytes of `v` (k of them, most significant first).
++static inline void wg_bytes_be(uint64_t v, int k) {
++    wg_room(k);
++    for (int s = (k - 1) * 8; s >= 0; s -= 8) wg_byte((v >> s) & 0xFF);
++}
++
++// Any byte of v equal to 0x61?
++static inline bool has_0x61(uint32_t v) {
++    const uint32_t x = v ^ 0x61616161u;
++    return ((x - 0x01010101u) & ~x & 0x80808080u) != 0;
++}
++
++static inline void wg_word(uint32_t v) {
++    wg_room(4);
++    if (__builtin_expect((s_wg_bp != 0) | has_0x61(v), 0)) {
++        wg_bytes_be(v, 4);
++        return;
++    }
++    const uint32_t be = __builtin_bswap32(v);
++    std::memcpy(s_wg + s_wg_n, &be, 4);
++    s_wg_n += 4;
++}
++
++// R9 threads: the common write (gathering on, no debug capture or check, FIFO
++// not redirected to RAM, no possible BP pending, not a 0x61 byte, room left)
++// in a few instructions. Exactly what the general path below does in that
++// case; NWII_WGP_CHECK / NWII_SAMPLE always take the general path.
++static inline bool wgp_fast() {
++    static const bool f = wgp_gather() && s_wcheck == nullptr && NWII_ENV("NWII_SAMPLE") == nullptr;
++    return f;
++}
++
+ void GX_WGPIPE_Write8(uint8_t val) {
+-    if (wgp_redirect(val)) { s_bp_armed = false; return; }
++    if (__builtin_expect(wgp_fast() && !hw::g_wgp_redirect_on && s_wg_bp == 0 && val != 0x61 &&
++                             s_wg_n < kWgCap, 1)) {
++        s_bp_armed = false;
++        s_wg[s_wg_n++] = val;
++        wg_count();
++        return;
++    }
++    if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
++    if (__builtin_expect(hw::g_wgp_redirect_on, 0) && wgp_redirect(val)) { s_bp_armed = false; return; }
+     s_bp_armed = (val == 0x61);
++    if (__builtin_expect(wgp_gather(), 1)) {
++        wg_count();
++        if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check(val, 1);
++        wg_room(1);
++        wg_byte(val);
++        if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_after();
++        return;
++    }
+     std::lock_guard<FifoLock> lock(g_fifo_mutex);
+     wgp_push(val);
+ }
+ 
+ void GX_WGPIPE_Write16(uint16_t val) {
++    if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     s_bp_armed = false;
+-    if (wgp_redirect(val >> 8)) { wgp_redirect(val & 0xFF); return; }
++    if (__builtin_expect(hw::g_wgp_redirect_on, 0) && wgp_redirect(val >> 8)) { wgp_redirect(val & 0xFF); return; }
++    if (__builtin_expect(wgp_gather(), 1)) {
++        wg_count();
++        if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check(val, 2);
++        wg_bytes_be(val, 2);
++        if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_after();
++        return;
++    }
+     std::lock_guard<FifoLock> lock(g_fifo_mutex);
+     wgp_push(val >> 8);
+     wgp_push(val & 0xFF);
+@@ -948,15 +1180,28 @@
+ void GX_WGPIPE_Write32(uint32_t val) { wgp_write32(val, true); }
+ 
+ static void wgp_write32(uint32_t val, bool is_int) {
++    // Fast path (see wgp_fast): no BP armed, so this word is no BP and no XFB
++    // copy, nothing to signal early; s_wg_full is only ever set and consumed
++    // inside the call that writes an XFB copy word.
++    if (__builtin_expect(wgp_fast() && !hw::g_wgp_redirect_on && !s_bp_armed && s_wg_bp == 0 &&
++                             !has_0x61(val) && s_wg_n <= kWgCap - 4, 1)) {
++        const uint32_t be = __builtin_bswap32(val);
++        std::memcpy(s_wg + s_wg_n, &be, 4);
++        s_wg_n += 4;
++        wg_count();
++        return;
++    }
++    if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     bool bp = s_bp_armed && is_int;
+     s_bp_armed = false;
+-    if (wgp_redirect(val >> 24)) {
++    if (__builtin_expect(hw::g_wgp_redirect_on, 0) && wgp_redirect(val >> 24)) {
+         wgp_redirect((val >> 16) & 0xFF);
+         wgp_redirect((val >> 8) & 0xFF);
+         wgp_redirect(val & 0xFF);
+         return;
+     }
+-    if (NWII_ENV("NWII_SAMPLE")) {
++    static const bool s_sample = NWII_ENV("NWII_SAMPLE") != nullptr;
++    if (__builtin_expect(s_sample, 0)) {
+         static uint64_t n = 0;
+         ++n;
+         if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000 ||
+@@ -965,7 +1210,21 @@
+                       << " fifo_bytes=" << g_hw_fifo.size() << "\n";
+     }
+     bool full = false;
+-    {
++    if (__builtin_expect(wgp_gather(), 1)) {
++        // A BP (0x61 + this word) is handed over by wg_byte's BP rule before
++        // the PE is signalled below, as the direct path pushes it first.
++        wg_count();
++        if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check(val, 4);
++        // BP 0x52 with bit 14: the copy to the XFB that ends a game frame. The
++        // BP rule hands this word over within wg_word (0x61 came just before),
++        // and that flush counts it (room first, so no earlier flush can).
++        wg_room(4);
++        if (bp && (val >> 24) == 0x52 && (val & 0x4000)) s_wg_xfb = true;
++        wg_word(val);
++        if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_after();
++        full = s_wg_full;
++        s_wg_full = false;
++    } else {
+         std::lock_guard<FifoLock> lock(g_fifo_mutex);
+         wgp_push4(val);
+         // BP 0x52 with bit 14: the copy to the XFB that ends a game frame.
+@@ -992,17 +1251,42 @@
+ }
+ 
+ void GX_WGPIPE_WriteF64(double val) {
++    if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     s_bp_armed = false;
+     union { double d; uint64_t i; } u; u.d = val;
+-    if (wgp_redirect((u.i >> 56) & 0xFF)) {
++    if (__builtin_expect(hw::g_wgp_redirect_on, 0) && wgp_redirect((u.i >> 56) & 0xFF)) {
+         for (int s = 48; s >= 0; s -= 8)
+             wgp_redirect((u.i >> s) & 0xFF);
+         return;
+     }
++    if (__builtin_expect(wgp_gather(), 1)) {
++        wg_count();
++        if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check(u.i, 8);
++        wg_bytes_be(u.i, 8);
++        if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_after();
++        return;
++    }
+     std::lock_guard<FifoLock> lock(g_fifo_mutex);
+     for (int s = 56; s >= 0; s -= 8)
+         wgp_push((u.i >> s) & 0xFF);
+ }
+ 
++// ", wgp N writes/s M flushes/s" for the NWII_FPS / fps_log stats line.
++int GX_WgpStatsLine(char *buf, int size, double dt) {
++    static uint64_t w0 = 0, f0 = 0, b0 = 0;
++    const uint64_t w = s_wg_writes.load(std::memory_order_relaxed);
++    const uint64_t f = s_wg_flushes.load(std::memory_order_relaxed);
++    const uint64_t b = s_wg_bytes.load(std::memory_order_relaxed);
++    int r = 0;
++    if (!wgp_gather())
++        r = std::snprintf(buf, size, ", wgp direct");
++    else if (dt > 0)
++        r = std::snprintf(buf, size, ", wgp %.0fk writes/s %.0fk flushes/s (%.0f B)",
++                          (w - w0) / dt / 1000, (f - f0) / dt / 1000,
++                          f > f0 ? double(b - b0) / double(f - f0) : 0.0);
++    w0 = w; f0 = f; b0 = b;
++    return r;
++}
++
+ } 
+ uint64_t g_prof_decode_us_accum = 0;
+diff --color -ruN -x '*.orig' -x '*.rej' base/nWiiRuntime/src/hw/hw_cp.cpp threads/nWiiRuntime/src/hw/hw_cp.cpp
+--- base/nWiiRuntime/src/hw/hw_cp.cpp	2026-10-21 20:21:15.082104067 -0500
++++ threads/nWiiRuntime/src/hw/hw_cp.cpp	2026-10-31 06:55:31.991681879 -0500
+@@ -65,6 +65,7 @@
+ }
+ 
+ uint32_t cp_fifo_base_reg() { return g_cp_fifo_base; }
++void wgp_redirect_update();  // hw_pi.cpp
+ 
+ static int cp_debug_count = 0;
+ void register_cp(MMIODispatcher &dispatcher) {
+@@ -99,7 +100,7 @@
+                 process_cp_fifo(); 
+             }
+             else if (addr == 0xCC000004) { g_cp_clear = val; }
+-            else if (addr >= 0xCC000020 && addr <= 0xCC000022) { write_reg32(addr, val, g_cp_fifo_base); }
++            else if (addr >= 0xCC000020 && addr <= 0xCC000022) { write_reg32(addr, val, g_cp_fifo_base); wgp_redirect_update(); }
+             else if (addr >= 0xCC000024 && addr <= 0xCC000026) { write_reg32(addr, val, g_cp_fifo_end); }
+             else if (addr >= 0xCC000028 && addr <= 0xCC00002A) { write_reg32(addr, val, g_cp_fifo_hi); }
+             else if (addr >= 0xCC00002C && addr <= 0xCC00002E) { write_reg32(addr, val, g_cp_fifo_lo); }
+diff --color -ruN -x '*.orig' -x '*.rej' base/nWiiRuntime/src/hw/hw_dsp.cpp threads/nWiiRuntime/src/hw/hw_dsp.cpp
+--- base/nWiiRuntime/src/hw/hw_dsp.cpp	2026-10-22 13:57:43.649653003 -0500
++++ threads/nWiiRuntime/src/hw/hw_dsp.cpp	2026-10-31 08:19:41.831138230 -0500
+@@ -111,6 +111,62 @@
+     });
+ }
+ 
++// ---- AX command lists (R8: may mix on the AX thread, see ax_async.cpp) ----
++// DSP_SYNC ("frame mixed") goes out 0.1 ms of guest time after the list mail,
++// DSP_YIELD ("list done") 1 ms after it, as in r7b. With the AX thread
++// (default, NWII_AX_THREAD=2) the SYNC event re-checks every 25 us until the
++// mix is done, like the real DSP, which answers when it has mixed the frame;
++// it is never later than the YIELD, which always follows it. =1 makes the
++// SYNC event wait for the mix at exactly 0.1 ms instead.
++static bool s_ax_sync_pending = false;
++static uint64_t s_ax_seq = 0;  // lists submitted (the events below belong to one)
++
++static void dsp_push_mail_now(uint32_t mail) {
++    s_dsp_mails.push_back(mail);
++    dsp_present_next_mail();
++}
++
++static void ax_deliver_sync() {
++    s_ax_sync_pending = false;
++    if (ax::finish())
++        dsp_push_mail_now(0xDCD10004u);  // DSP_SYNC: the list produced a frame
++}
++
++static void ax_sync_check(uint64_t seq) {
++    if (!s_ax_sync_pending || seq != s_ax_seq)
++        return;
++    static const bool slide = ax::sync_slides();  // one parser: ax_async.cpp opts()
++    if (slide && !ax::done()) {
++        EventScheduler::get().schedule_after(
++            g_ctx_ptr->tb_freq / 40000, [seq](CPUContext &, uint64_t) { ax_sync_check(seq); });
++        return;
++    }
++    ax_deliver_sync();
++}
++
++static void ax_submit_list(uint32_t addr, uint16_t size) {
++    const uint64_t ms = g_ctx_ptr->tb_freq / 1000;
++    if (!ax::async_enabled()) {  // inline: exactly the r7b sequence
++        ax::submit(addr, size);
++        if (ax::finish())
++            dsp_post_mail(0xDCD10004u, ms / 10);  // DSP_SYNC
++        dsp_post_mail(0xDCD10002u, ms);           // DSP_YIELD
++        return;
++    }
++    if (s_ax_sync_pending)
++        ax_deliver_sync();  // overload: a new list before the last one's SYNC
++    ax::submit(addr, size);
++    s_ax_sync_pending = true;
++    const uint64_t seq = ++s_ax_seq;
++    EventScheduler::get().schedule_after(
++        ms / 10, [seq](CPUContext &, uint64_t) { ax_sync_check(seq); });
++    EventScheduler::get().schedule_after(ms, [seq](CPUContext &, uint64_t) {
++        if (s_ax_sync_pending && seq == s_ax_seq)
++            ax_deliver_sync();  // the SYNC always comes before its YIELD
++        dsp_push_mail_now(0xDCD10002u);  // DSP_YIELD
++    });
++}
++
+ // ---- Audio output ----
+ // AX writes each 3 ms frame as interleaved R,L 16-bit big-endian samples;
+ // audio DMA plays them at 32 kHz. Played frames go into a ring the host audio
+@@ -234,8 +290,10 @@
+ static void adma_start_pass() {
+     s_adma_pass_blocks = adma_control & 0x7FFF;
+     s_adma_pass_start = EventScheduler::get().now();
+-    if (s_adma_rearmed || ++s_adma_stale_passes > 8)
++    if (s_adma_rearmed || ++s_adma_stale_passes > 8) {
++        ax::dma_read_barrier();  // R9 threads: never read a frame being mixed
+         audio_push_from_ram(adma_addr, s_adma_pass_blocks * 8);
++    }
+     if (s_adma_rearmed)
+         s_adma_stale_passes = 0;
+     s_adma_rearmed = false;
+@@ -343,9 +401,10 @@
+                     const uint64_t ms = g_ctx_ptr->tb_freq / 1000;
+                     auto reply = [ms](uint16_t lo) { dsp_post_mail(0xDCD10000u | lo, ms); };
+                     if (s_ax_state == 1) {
+-                        if (!g_ax_legacy && ax::run_command_list(mail, s_cmdlist_size))
+-                            dsp_post_mail(0xDCD10004u, ms / 10);  // DSP_SYNC
+-                        reply(0x0002);  // DSP_YIELD
++                        if (!g_ax_legacy)
++                            ax_submit_list(mail, s_cmdlist_size);  // SYNC + YIELD
++                        else
++                            reply(0x0002);  // DSP_YIELD
+                         s_ax_state = 2;
+                     } else if ((mail & 0xFFFF0000u) == 0xBABE0000u) {
+                         s_cmdlist_size = mail & 0xFFFF;
+diff --color -ruN -x '*.orig' -x '*.rej' base/nWiiRuntime/src/hw/hw_pi.cpp threads/nWiiRuntime/src/hw/hw_pi.cpp
+--- base/nWiiRuntime/src/hw/hw_pi.cpp	2026-10-21 20:21:15.082173406 -0500
++++ threads/nWiiRuntime/src/hw/hw_pi.cpp	2026-10-31 06:55:31.992140459 -0500
+@@ -23,6 +23,17 @@
+ }
+ void pi_fifo_set_wptr(uint32_t wptr) { pi_fifo_wptr = wptr; }
+ 
++// R8 threads: whether GX FIFO writes go to RAM (PI FIFO base set and not the
++// CP FIFO, i.e. a display list being built) -- the first two tests of
++// wgp_redirect (gx.cpp), kept up to date at every write of either base
++// register so the write path tests one flag instead of making two calls.
++bool g_wgp_redirect_on = false;
++void wgp_redirect_update() {
++    const uint32_t cp_base = cp_fifo_base_reg();
++    g_wgp_redirect_on = pi_fifo_base != 0 &&
++                        (pi_fifo_base & 0x03FFFFFF) != (cp_base & 0x03FFFFFF);
++}
++
+ void register_pi(MMIODispatcher& dispatcher) {{
+     dispatcher.register_region(0xCC003000, 0xCC0030FF,
+         [](uint32_t addr) -> uint32_t {
+@@ -47,7 +58,7 @@
+                               << " -> 0x" << val << std::dec << std::endl;
+                 pi_intmr = val;
+             }
+-            if (addr == 0xCC00300C) pi_fifo_base = val;
++            if (addr == 0xCC00300C) { pi_fifo_base = val; wgp_redirect_update(); }
+             if (addr == 0xCC003010) pi_fifo_end = val;
+             if (addr == 0xCC003014) pi_fifo_wptr = val;
+         }
+diff --color -ruN -x '*.orig' -x '*.rej' base/nWiiRuntime/src/platform/switch/switch_platform.cpp threads/nWiiRuntime/src/platform/switch/switch_platform.cpp
+--- base/nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-10-31 03:38:55.966958404 -0500
++++ threads/nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-10-31 06:55:39.105763843 -0500
+@@ -196,6 +196,7 @@
+     const bool keeps_zero = key == "NWII_HOST_FPS" || key == "NWII_SHADER_PREWARM" ||
+                             key == "NWII_SHADERCACHE" || key == "NWII_NX_SIX_ROTATE" ||
+                             key == "NWII_SHADER_SSO" || key == "NWII_SHADER_PREWARM_DRAW" ||
++                            key == "NWII_AX_THREAD" || key == "NWII_NX_PIN_MAIN" ||
+                             key == "NWII_FIFO_MAX_FRAMES";
+     const bool off = lv.empty() || lv == "off" || lv == "false" || lv == "no" ||
+                      (lv == "0" && !keeps_zero);
+@@ -547,6 +548,7 @@
+ 
+ bool early_init(int *argc, char ***argv) {
+   choose_root(*argc, *argv);
++  note_thread(kThreadMain);
+   // An NRO gets no arguments (nxlink may pass some: then they win).
+   static const char *nx_argv[] = {"nsmbw", g_game_dir.c_str(), g_config.c_str(), nullptr};
+   if (*argc < 2) {
+@@ -580,6 +582,17 @@
+ 
+   setup_logging();
+   log_header();
++  // R8 thread layout (homebrew gets cores 0-2): main = render + GX + audio
++  // feed on core 0, recompiled CPU on core 1 (cpu_thread_start), AX mixer on
++  // core 2 (ax_async.cpp). Pin the main thread so it never lands on 1 or 2
++  // (debug.toml NWII_NX_PIN_MAIN = "0" leaves it on the default core).
++  if (!std::getenv("NWII_NX_PIN_MAIN") || std::getenv("NWII_NX_PIN_MAIN")[0] != '0') {
++    u64 allowed = 0;
++    svcGetInfo(&allowed, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
++    const Result rc = (allowed & 1) ? svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, 1) : 0;
++    std::printf("[NX] main thread on core 0: %s (allowed mask 0x%llx)\n",
++                R_SUCCEEDED(rc) ? "ok" : "failed", (unsigned long long)allowed);
++  }
+ 
+   if (!check_game_files()) return false;
+   if (!check_memory()) return false;
+@@ -592,7 +605,40 @@
+   return true;
+ }
+ 
++// R8: per-thread CPU time for fps_log ("threads main x% cpu y% ax z%"), from
++// the kernel's per-thread tick count (19.2 MHz).
++static std::atomic<Handle> g_thread_handles[kThreadSlots];
++static const char *const kThreadNames[kThreadSlots] = {"main", "cpu", "ax"};
++
++void note_thread(int slot) {
++  if (slot >= 0 && slot < kThreadSlots)
++    g_thread_handles[slot].store(threadGetCurHandle());
++}
++
++static void thread_report(char *buf, size_t n, double dt) {
++  static uint64_t last[kThreadSlots] = {};
++  static bool unsupported = false;  // citron: no per-thread tick count
++  size_t used = 0;
++  buf[0] = 0;
++  for (int i = 0; i < kThreadSlots && !unsupported; ++i) {
++    const Handle h = g_thread_handles[i].load();
++    u64 ticks = 0;
++    if (!h) continue;
++    if (R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, h, (u64)-1)) &&
++        R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCountDeprecated, h, (u64)-1))) {
++      unsupported = true;
++      break;
++    }
++    const double pct = last[i] ? 100.0 * (double)(ticks - last[i]) / 19200000.0 / dt : 0.0;
++    last[i] = ticks;
++    used += std::snprintf(buf + used, n - used, "%s %s %.0f%%", used ? "," : ", threads",
++                          kThreadNames[i], pct);
++    if (used >= n) break;
++  }
++}
++
+ void cpu_thread_start() {
++  note_thread(kThreadCpu);
+   // libnx starts every thread on the process' default core, where the main
+   // (render + audio feed) thread already runs; the recompiled CPU is the
+   // bottleneck and gets its own core.
+@@ -627,10 +673,11 @@
+       now - last_stat >= std::chrono::seconds(5)) {
+     const double dt = std::chrono::duration<double>(now - last_stat).count();
+     const uint64_t frames = g_stat_frames;
+-    char gov[160];
++    char gov[384], thr[96];
+     nwii::runtime::governor_report(gov, sizeof gov, dt);
+-    std::printf("[NX] game %.1f fps, host loop %.1f/s%s\n", (frames - last_frames) / dt,
+-                host_frames / dt, gov);
++    thread_report(thr, sizeof thr, dt);
++    std::printf("[NX] game %.1f fps, host loop %.1f/s%s%s\n", (frames - last_frames) / dt,
++                host_frames / dt, gov, thr);
+     log_memory("now");
+     last_frames = frames;
+     host_frames = 0;
+diff --color -ruN -x '*.orig' -x '*.rej' base/nWiiRuntime/src/platform/switch/switch_platform.h threads/nWiiRuntime/src/platform/switch/switch_platform.h
+--- base/nWiiRuntime/src/platform/switch/switch_platform.h	2026-10-29 12:04:07.693360925 -0500
++++ threads/nWiiRuntime/src/platform/switch/switch_platform.h	2026-10-31 06:55:31.992534849 -0500
+@@ -26,6 +26,11 @@
+ // True once cpu_thread_finished() ran.
+ bool cpu_thread_done();
+ 
++// R8: the calling thread is one of the threads fps_log reports CPU time for
++// (0 main/render, 1 recompiled CPU, 2 AX audio mixer).
++enum ThreadSlot { kThreadMain = 0, kThreadCpu = 1, kThreadAx = 2, kThreadSlots = 3 };
++void note_thread(int slot);
++
+ // Once per host frame: periodic log flush and (with NWII_LOG) fps/memory stats.
+ void frame_tick();
+ 

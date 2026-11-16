@@ -1,0 +1,797 @@
+diff --color -ruN ref/m6a/include/runtime/gx/fifo_parser.h nWiiRuntime_m6/include/runtime/gx/fifo_parser.h
+--- ref/m6a/include/runtime/gx/fifo_parser.h	2026-11-09 04:04:17.414974149 -0500
++++ nWiiRuntime_m6/include/runtime/gx/fifo_parser.h	2026-11-15 15:48:50.067527782 -0500
+@@ -100,6 +100,17 @@
+     // number the frame being parsed now will get; ReleaseRetired(min_live) frees
+     // what was retired while parsing frames < min_live - 1.
+     static void SetFrameSeq(uint64_t frame_seq);
++    // r40d NWII_D_PARSESTOP: with an index, Parse() stops right after the n-th XFB copy it notes (0: no
++    // limit); the bytes after it stay in `fifo` for the next call. StoppedAtXfb(): the last Parse() did.
++    static void SetStopAfterXfb(uint32_t n);
++    static bool StoppedAtXfb();
++    // r40d NWII_D_LIGHTPARSE: with an index, while Parse() has noted fewer than n XFB copies the
++    // frames being parsed are known to be dropped: their draws are not written (immediate draws
++    // skipped, display-list replays write only their register commands); every other command and
++    // all parser state are as in a full parse. 0: off. LightSkipped(): draws skipped so far.
++    static void SetDoomedXfb(uint32_t n);
++    static uint64_t LightSkipped();
++    static void LightTime(uint64_t& ns, uint64_t& frames);  // parse time spent in doomed frames, their count
+     static void ReleaseRetired(uint64_t min_live_seq);
+     static bool DLMemoOn();
+ 
+diff --color -ruN ref/m6a/src/hle/gx/fifo_parser.cpp nWiiRuntime_m6/src/hle/gx/fifo_parser.cpp
+--- ref/m6a/src/hle/gx/fifo_parser.cpp	2026-11-09 05:15:50.824329507 -0500
++++ nWiiRuntime_m6/src/hle/gx/fifo_parser.cpp	2026-11-15 15:48:50.071302877 -0500
+@@ -1,3 +1,4 @@
++#include <optional>
+ #include "runtime/nwii_env.h"
+ #include <iostream>
+ #include <vector>
+@@ -522,7 +523,39 @@
+         }
+     }
+ 
++    // r40d NWII_D_FASTDECODE=1: the same values without a float division per
++    // component: x / 2^s == x * 2^-s exactly (a power of two, results never
++    // denormal: |x| >= 1 or 0), and colour channels from tables filled with
++    // the very expressions below (c / 255.0f ...). NWII_D_FASTDECODE_CHECK=1
++    // decodes every draw again the old way and compares.
++    bool g_fastdec = false;
++    struct FastTabs {
++        float inv_pow2[32];
++        float c255[256], c63[64], c31[32], c15[16];
++        FastTabs() {
++            for (int s = 0; s < 32; ++s) inv_pow2[s] = 1.0f / (float)(1 << s);
++            for (int i = 0; i < 256; ++i) c255[i] = i / 255.0f;
++            for (int i = 0; i < 64; ++i) c63[i] = i / 63.0f;
++            for (int i = 0; i < 32; ++i) c31[i] = i / 31.0f;
++            for (int i = 0; i < 16; ++i) c15[i] = i / 15.0f;
++        }
++    };
++    const FastTabs s_fast_tabs;  // (filled at load; no guard on every use)
++    inline const FastTabs& Tabs() { return s_fast_tabs; }
+     inline float DecodeScalar(const uint8_t* p, VtxAttrType type, uint8_t shift) {
++        if (g_fastdec) {
++            const float inv = Tabs().inv_pow2[shift & 31];
++            switch (type) {
++                case VtxAttrType::U8:  return (float)p[0] * inv;
++                case VtxAttrType::S8:  return (float)(int8_t)p[0] * inv;
++                case VtxAttrType::U16: return (float)(uint16_t)((p[0] << 8) | p[1]) * inv;
++                case VtxAttrType::S16: return (float)(int16_t)((p[0] << 8) | p[1]) * inv;
++                default: {
++                    uint32_t v = ((uint32_t)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
++                    float f; std::memcpy(&f, &v, 4); return f;
++                }
++            }
++        }
+         switch (type) {
+             case VtxAttrType::U8:  return (float)p[0] / (float)(1 << shift);
+             case VtxAttrType::S8:  return (float)(int8_t)p[0] / (float)(1 << shift);
+@@ -589,7 +622,7 @@
+ 
+         const uint8_t* p = nwii::runtime::g_mmu->get_ptr(base);
+         if (!p) return true;
+-        float inv = 1.0f / (float)(1 << shift);
++        float inv = g_fastdec ? Tabs().inv_pow2[shift & 31] : 1.0f / (float)(1 << shift);  // r40d (same value)
+         for (int i = 0; i < ncomp; i++) {
+             const uint8_t* q = p + (size_t)sz * i;
+             switch (type) {
+@@ -619,6 +652,35 @@
+     }
+ 
+     void DecodeColor(const uint8_t* p, VtxAttrType clrType, float out[4]) {
++        if (g_fastdec) {  // r40d: same values from tables
++            const FastTabs& T = Tabs();
++            switch ((int)clrType) {
++                case 0: {
++                    uint16_t c = (p[0] << 8) | p[1];
++                    out[0] = T.c31[(c >> 11) & 0x1F]; out[1] = T.c63[(c >> 5) & 0x3F];
++                    out[2] = T.c31[c & 0x1F]; out[3] = 1.0f;
++                    return;
++                }
++                case 1: case 2:
++                    out[0] = T.c255[p[0]]; out[1] = T.c255[p[1]]; out[2] = T.c255[p[2]]; out[3] = 1.0f;
++                    return;
++                case 3: {
++                    uint16_t c = (p[0] << 8) | p[1];
++                    out[0] = T.c15[(c >> 12) & 0xF]; out[1] = T.c15[(c >> 8) & 0xF];
++                    out[2] = T.c15[(c >> 4) & 0xF]; out[3] = T.c15[c & 0xF];
++                    return;
++                }
++                case 4: {
++                    uint32_t c = (p[0] << 16) | (p[1] << 8) | p[2];
++                    out[0] = T.c63[(c >> 18) & 0x3F]; out[1] = T.c63[(c >> 12) & 0x3F];
++                    out[2] = T.c63[(c >> 6) & 0x3F]; out[3] = T.c63[c & 0x3F];
++                    return;
++                }
++                default:
++                    out[0] = T.c255[p[0]]; out[1] = T.c255[p[1]]; out[2] = T.c255[p[2]]; out[3] = T.c255[p[3]];
++                    return;
++            }
++        }
+         switch ((int)clrType) {
+             case 0: { 
+                 uint16_t c = (p[0] << 8) | p[1];
+@@ -700,6 +762,32 @@
+ 
+ static void ParseStream(const std::vector<uint8_t>& fifo, size_t& offset, std::vector<GXCommand>& commands, int depth);
+ static bool PreXf();
++// r40d NWII_D_LIGHTPARSE (see the header): s_doom_xfb = XFB copies below which the depth-0
++// stream is doomed; g_doomed = the command being parsed now is (set by ParseStream).
++static uint32_t s_doom_xfb = 0;
++static bool g_doomed = false;
++static uint64_t s_light_skipped = 0;
++static uint64_t s_light_ns = 0, s_light_frames = 0;  // r40d: parse time of the doomed part (diagnostic)
++static std::chrono::steady_clock::time_point s_parse_t0;
++// r40d NWII_D_EAGERDECODE (see ParseStream) / _CHECK.
++static bool EagerDecodeOn() {
++    static const bool on = [] { const char* e = NWII_ENV("NWII_D_EAGERDECODE"); return e && e[0] && e[0] != '0'; }();
++    return on;
++}
++static bool EagerCheckOn() {
++    static const bool on = NWII_ENV("NWII_D_EAGERDECODE_CHECK") != nullptr;
++    return on;
++}
++static uint64_t s_eager_draws = 0;
++static bool AllDirect(const VATSlot& v) {
++    auto ix = [](VtxAttrMask m) { return m == VtxAttrMask::Index8 || m == VtxAttrMask::Index16; };
++    if (ix(v.posMask) || ix(v.nrmMask) || ix(v.clrMask[0]) || ix(v.clrMask[1])) return false;
++    for (int t = 0; t < 8; ++t)
++        if (ix(v.texMask[t])) return false;
++    return true;
++}
++static bool VertsSame(const std::vector<VertexData>& a, const std::vector<VertexData>& b);
++static void DecodeDrawImpl(GXCommand& c);
+ 
+ 
+ 
+@@ -1010,6 +1098,10 @@
+                 if (ci + 6 < ncached)
+                     if (const DrawRaw* r6 = cached[ci + 6].raw.get())
+                         __builtin_prefetch((const char*)r6 - 8, 1);
++                if (g_doomed && depth == 0 && c0.type == GXCommandType::DrawPrimitive) {  // r40d
++                    ++s_light_skipped;
++                    continue;
++                }
+                 commands.push_back(c0);
+                 GXCommand& c = commands.back();
+                 // Replay parser-state side effects so main-stream commands
+@@ -1095,7 +1187,14 @@
+             RetireEntry(ne);  // (an entry under the same key whose content or state changed)
+             ne = DLCacheEntry{sh, ch, local, g_gx_drain_epoch, {}, {}, {}, 0, false, false};
+         }
+-        commands.insert(commands.end(), local.begin(), local.end());
++        if (g_doomed && depth == 0) {  // r40d NWII_D_LIGHTPARSE: the cache keeps the draws
++            for (const GXCommand& c : local) {
++                if (c.type == GXCommandType::DrawPrimitive) { ++s_light_skipped; continue; }
++                commands.push_back(c);
++            }
++        } else {
++            commands.insert(commands.end(), local.begin(), local.end());
++        }
+         auto dl1 = std::chrono::steady_clock::now();
+         const uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(dl1 - dl0).count();
+         g_prof_dl_us += us;
+@@ -1249,10 +1348,60 @@
+     return true;
+ }
+ 
++static bool FastDecodeOn() {
++    static const bool on = [] { const char* e = NWII_ENV("NWII_D_FASTDECODE"); return e && e[0] && e[0] != '0'; }();
++    return on;
++}
++static bool FastDecodeCheckOn() {
++    static const bool on = NWII_ENV("NWII_D_FASTDECODE_CHECK") != nullptr;
++    return on;
++}
++static bool VertsSame(const std::vector<VertexData>& a, const std::vector<VertexData>& b) {
++    if (a.size() != b.size()) return false;
++    auto feq = [](const float* x, const float* y, int k) { return std::memcmp(x, y, k * sizeof(float)) == 0; };
++    for (size_t i = 0; i < a.size(); ++i) {
++        const VertexData &x = a[i], &y = b[i];
++        if (!(feq(x.pos, y.pos, 3) && feq(x.norm, y.norm, 3) && feq(x.color, y.color, 4) &&
++              feq(&x.tex[0][0], &y.tex[0][0], 16) && feq(x.raw_pos, y.raw_pos, 3) &&
++              feq(x.raw_norm, y.raw_norm, 3) && x.has_raw_norm == y.has_raw_norm && x.has_pos == y.has_pos &&
++              x.has_norm == y.has_norm && x.pre_xf == y.pre_xf && x.has_color == y.has_color &&
++              std::memcmp(x.has_tex, y.has_tex, 8) == 0 && x.posMtxIdx == y.posMtxIdx &&
++              std::memcmp(x.texMtxIdx, y.texMtxIdx, 8) == 0))
++            return false;
++    }
++    return true;
++}
++static void DecodeDrawImpl(GXCommand& c);
+ void FifoParser::DecodeDraw(GXCommand& c) {
+     if (c.type != GXCommandType::DrawPrimitive || !c.raw || !c.vertices.empty() ||
+         c.shared_vertices)
+         return;
++    if (!FastDecodeOn()) { DecodeDrawImpl(c); return; }
++    // r40d NWII_D_FASTDECODE (see DecodeScalar).
++    HostPtr<DrawRaw> keep;
++    const bool chk = FastDecodeCheckOn();
++    if (chk) keep = c.raw;  // (the decode drops c.raw)
++    g_fastdec = true;
++    DecodeDrawImpl(c);
++    g_fastdec = false;
++    if (chk && keep) {
++        static uint64_t n = 0, bad = 0;
++        GXCommand t;
++        t.type = GXCommandType::DrawPrimitive;
++        t.prim_type = c.prim_type;
++        auto r2 = MakeHost<DrawRaw>(*keep);
++        r2->decoded.reset();
++        r2->no_decode_cache = true;
++        t.raw = r2;
++        DecodeDrawImpl(t);
++        const std::vector<VertexData>& got = c.shared_vertices ? static_cast<const std::vector<VertexData>&>(*c.shared_vertices) : c.vertices;
++        ++n;
++        if (!VertsSame(got, t.vertices)) ++bad;
++        if ((bad && bad <= 20 && !VertsSame(got, t.vertices)) || n % 200000 == 0)
++            printf("[D40DEC_CHECK] draws=%llu mismatches=%llu\n", (unsigned long long)n, (unsigned long long)bad);
++    }
++}
++static void DecodeDrawImpl(GXCommand& c) {
+     DrawRaw& r = *c.raw;
+     static const bool no_dcache = NWII_ENV("NWII_NODECODECACHE") != nullptr;
+     const bool cacheable = r.in_dl && !r.no_decode_cache && !no_dcache && !PreXf() &&
+@@ -1276,7 +1425,18 @@
+     size_t off = 0;
+     c.vertices.reserve(r.count);
+     for (uint32_t i = 0; i < r.count; i++) {
+-        VertexData vtx;
++        // r40d NWII_D_FASTDECODE: the vertex is built in place (no 200-byte
++        // copy per vertex; r.count was reserved, so no reallocation); a vertex
++        // that fails to decode is taken back out, as it was never pushed.
++        std::optional<VertexData> vtx_old;
++        const bool inplace = g_fastdec;
++        if (!inplace) vtx_old.emplace();
++        VertexData& vtx = inplace ? c.vertices.emplace_back() : *vtx_old;
++        struct PopIfFailed {
++            std::vector<VertexData>& v;
++            bool on, done = false;
++            ~PopIfFailed() { if (on && !done) v.pop_back(); }
++        } pop_if_failed{c.vertices, inplace};
+         vtx.posMtxIdx = r.defPosMtxIdx;
+         for (int t = 0; t < 8; t++)
+             vtx.texMtxIdx[t] = r.defTexMtxIdx[t];
+@@ -1413,7 +1573,8 @@
+             }
+             vtx.pre_xf = true;
+         }
+-        c.vertices.push_back(vtx);
++        if (!inplace) c.vertices.push_back(vtx);
++        pop_if_failed.done = true;
+     }
+     if (cacheable && c.vertices.size() == r.count) {
+         r.ranges.clear();
+@@ -1505,10 +1666,15 @@
+     size_t k = 0;  // next memo
+     const size_t nm = e.memo.size();
+     size_t next_draw = nm ? e.memo[0].ci : ncached;
++    const bool doomed = g_doomed;  // r40d NWII_D_LIGHTPARSE (ReplayMemo runs at depth 0)
+     for (size_t ci = 0; ci < ncached; ++ci) {
+         if (ci == next_draw) {
+             DLDrawMemo& m = e.memo[k++];
+             next_draw = k < nm ? e.memo[k].ci : ncached;
++            if (doomed) {  // a dropped frame's draw: not written, its memo left as it is
++                ++s_light_skipped;
++                continue;
++            }
+             if (k + 2 < nm) {
+                 const DLDrawMemo& m2 = e.memo[k + 2];
+                 __builtin_prefetch(&m2);
+@@ -1602,6 +1768,10 @@
+             ParseApplyMatrixWrite(c.reg, c.payload);
+         }
+     }
++    if (doomed) {  // r40d: the memos were not checked: nothing is known about the list's chunks
++        if (s_dlvalid && !list_ok) e.chunks_ok = false;
++        return;
++    }
+     if (s_dlvalid && !list_ok) {
+         // Every memo is valid now (checked or refreshed against this epoch's
+         // chunk hashes): remember the list's chunks and their hash.
+@@ -1624,10 +1794,20 @@
+     }
+ }
+ 
++static uint32_t s_stop_xfb = 0;  // r40d NWII_D_PARSESTOP (see the header)
++static bool s_stopped_xfb = false;
++void FifoParser::SetStopAfterXfb(uint32_t n) { s_stop_xfb = n; }
++void FifoParser::SetDoomedXfb(uint32_t n) { s_doom_xfb = n; }
++uint64_t FifoParser::LightSkipped() { return s_light_skipped; }
++void FifoParser::LightTime(uint64_t& ns, uint64_t& frames) { ns = s_light_ns; frames = s_light_frames; }
++bool FifoParser::StoppedAtXfb() { return s_stopped_xfb; }
+ void FifoParser::Parse(std::vector<uint8_t>& fifo, std::vector<GXCommand>& commands, Index* idx) {
++    s_stopped_xfb = false;
++    if (s_doom_xfb) s_parse_t0 = std::chrono::steady_clock::now();
+     s_pidx = idx;
+     Parse(fifo, commands);
+     s_pidx = nullptr;
++    g_doomed = false;
+ }
+ 
+ void FifoParser::Parse(std::vector<uint8_t>& fifo, std::vector<GXCommand>& commands) {
+@@ -1653,6 +1833,21 @@
+     } flush_notes{note, noted, commands};
+     while (offset < fifo_size) {
+         if (note) for (; noted < commands.size(); ++noted) NoteCmd(commands[noted], (uint32_t)noted);
++        // r40d NWII_D_PARSESTOP: stop right after the frame end the caller asked for (a whole
++        // command was parsed: the rest of the bytes start at a command boundary).
++        if (note && s_stop_xfb && s_pidx->xfb_copies.size() >= s_stop_xfb) {
++            s_stopped_xfb = true;
++            break;
++        }
++        if (depth == 0) {  // r40d
++            const bool was = g_doomed;
++            g_doomed = note && s_doom_xfb && s_pidx->xfb_copies.size() < s_doom_xfb;
++            if (was && !g_doomed) {
++                s_light_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                  std::chrono::steady_clock::now() - s_parse_t0).count();
++                s_light_frames += s_doom_xfb;
++            }
++        }
+         uint8_t cmd = fifo[offset];
+ 
+         if (cmd == 0x00) {
+@@ -1883,6 +2078,65 @@
+             size_t vsize = VertexSize(vat);
+             size_t need = 3 + (size_t)vtx_count * vsize;
+             if (offset + need > fifo_size) break; // incomplete: wait for more
++            if (depth == 0 && g_doomed) {  // r40d NWII_D_LIGHTPARSE: a dropped frame's draw
++                ++s_light_skipped;
++                offset += need;
++                continue;
++            }
++            if (depth == 0 && EagerDecodeOn() && !PreXf() && AllDirect(vat)) {
++                // r40d NWII_D_EAGERDECODE=1: a FIFO draw whose attributes are all direct
++                // decodes from its own bytes and the parser state of this moment only
++                // (no guest memory, no matrix snapshot: PreXf off), exactly what the
++                // deferred DecodeDraw would read from its DrawRaw: decode it now from a
++                // reused scratch DrawRaw instead of allocating one (and its byte copy)
++                // per draw. A draw whose decode stops short keeps a DrawRaw of its own.
++                static DrawRaw* const scratch = new DrawRaw;
++                DrawRaw& r = *scratch;
++                r.vat = vat;
++                r.defPosMtxIdx = s_ps.defPosMtxIdx;
++                std::memcpy(r.defTexMtxIdx, s_ps.defTexMtxIdx, 8);
++                r.need_normal = false;
++                r.have_snap_mtx = false;
++                r.snap_pos_bank.clear();
++                r.snap_nrm_bank.clear();
++                std::memcpy(r.arrayBase, s_ps.arrayBase, sizeof(r.arrayBase));
++                std::memcpy(r.arrayStride, s_ps.arrayStride, sizeof(r.arrayStride));
++                r.count = vtx_count;
++                r.bytes.assign(fifo.begin() + offset + 3, fifo.begin() + offset + need);
++                r.in_dl = false;
++                r.no_decode_cache = false;
++                r.decoded.reset();
++                r.ranges.clear();
++                r.ranges_hash = 0;
++                GXCommand c;
++                c.type = GXCommandType::DrawPrimitive;
++                c.prim_type = cmd & 0xF8;
++                c.raw = HostPtr<DrawRaw>(HostPtr<DrawRaw>(), scratch);  // not owning
++                FifoParser::DecodeDraw(c);
++                if (c.raw) c.raw = MakeHost<DrawRaw>(r);  // stopped short: as the deferred decode would
++                if (EagerCheckOn()) {
++                    static uint64_t n = 0, bad = 0;
++                    GXCommand t;
++                    t.type = GXCommandType::DrawPrimitive;
++                    t.prim_type = c.prim_type;
++                    t.raw = MakeHost<DrawRaw>(r);
++                    const bool fd = g_fastdec;
++                    g_fastdec = false;
++                    DecodeDrawImpl(t);
++                    g_fastdec = fd;
++                    ++n;
++                    if (!VertsSame(c.vertices, t.vertices) || (bool)c.raw != (bool)t.raw) ++bad;
++                    if (n % 200000 == 0 || (bad && bad <= 10 && !VertsSame(c.vertices, t.vertices)))
++                        printf("[D40EAGER_CHECK] draws=%llu mismatches=%llu\n", (unsigned long long)n,
++                               (unsigned long long)bad);
++                }
++                g_prof_draws++;
++                g_prof_draw_bytes += need;
++                ++s_eager_draws;
++                commands.push_back(std::move(c));
++                offset += need;
++                continue;
++            }
+ 
+             GXCommand c;
+             c.type = GXCommandType::DrawPrimitive;
+diff --color -ruN ref/m6a/src/hle/gx/renderer_gl.cpp nWiiRuntime_m6/src/hle/gx/renderer_gl.cpp
+--- ref/m6a/src/hle/gx/renderer_gl.cpp	2026-11-15 14:01:02.815458154 -0500
++++ nWiiRuntime_m6/src/hle/gx/renderer_gl.cpp	2026-11-15 15:48:50.074100502 -0500
+@@ -5892,6 +5892,53 @@
+   e.x_bb_ok = BBoxOf(e.xi, v, e.x_bb);
+ }
+ 
++// r40d NWII_D_FASTPREP=1: xf::Analyze and BBoxOf in ONE pass over the decoded
++// vertices (~200 bytes each, ~6 500 per frame of FIFO draws in agua_pinguino)
++// instead of two; the same Info (also when Analyze gives up half way) and the
++// same box. NWII_D_FASTPREP_CHECK=1 packs every draw the old way too and compares.
++static bool FastPrepOn() {
++  static const bool on = [] { const char *e = NWII_ENV("NWII_D_FASTPREP"); return e && e[0] && e[0] != '0'; }();
++  return on;
++}
++static bool FastPrepCheckOn() {
++  static const bool on = NWII_ENV("NWII_D_FASTPREP_CHECK") != nullptr;
++  return on;
++}
++static xf::Info AnalyzeBBox(const std::vector<VertexData> &v, bool &bb_ok, float bb[6]) {
++  xf::Info in;
++  bb_ok = false;
++  if (v.empty()) return in;
++  const VertexData &a = v[0];
++  in.hp = a.has_pos;
++  in.hn = a.has_norm;
++  in.hc = a.has_color;
++  in.tmask = xf::TexMask(a);
++  float b[6] = {a.pos[0], a.pos[1], a.pos[2], a.pos[0], a.pos[1], a.pos[2]};
++  bool finite = true;
++  for (const VertexData &x : v) {
++    if (x.pre_xf || x.has_pos != in.hp || x.has_norm != in.hn || x.has_color != in.hc ||
++        xf::TexMask(x) != in.tmask || xf::Rank(in.pos, in.npos, x.posMtxIdx) < 0)
++      return in;
++    for (int t = 0; t < 4; ++t)
++      if (xf::Rank(in.tex[t], in.ntex[t], x.texMtxIdx[t]) < 0) return in;
++    if (finite)
++      for (int k = 0; k < 3; ++k) {
++        if (!(x.pos[k] == x.pos[k]) || std::isinf(x.pos[k])) { finite = false; break; }
++        b[k] = std::min(b[k], x.pos[k]);
++        b[3 + k] = std::max(b[3 + k], x.pos[k]);
++      }
++  }
++  in.ranks = in.npos > 1 || in.ntex[0] > 1 || in.ntex[1] > 1 || in.ntex[2] > 1 || in.ntex[3] > 1;
++  in.stride = (uint8_t)(3 + (in.hn ? 3 : 0) + (in.hc ? 1 : 0) + 2 * __builtin_popcount(in.tmask) +
++                        (in.ranks ? 1 : 0));
++  in.ok = true;
++  if (in.hp && finite) {
++    std::memcpy(bb, b, sizeof b);
++    bb_ok = true;
++  }
++  return in;
++}
++
+ const void *GX_PrepDrawForRender(const GXCommand &cmd, std::vector<uint32_t> &pack) {
+   static thread_local bool t_flags = false;
+   if (!t_flags) { t_flags = true; InitFlags(); }
+@@ -5905,10 +5952,35 @@
+     const uint32_t n = (uint32_t)v.size();
+     if (!n || (cmd.prim_type & 0xF8) >= 0xA8) return nullptr;
+     xf::PackHdr h;
+-    h.xi = xf::Analyze(v);
++    if (FastPrepOn()) {  // r40d
++      h.xi = AnalyzeBBox(v, h.bb_ok, h.bb);
++      if (FastPrepCheckOn()) {
++        static uint64_t nchk = 0, bad = 0;
++        xf::PackHdr o;
++        o.xi = xf::Analyze(v);
++        o.bb_ok = BBoxOf(o.xi, v, o.bb);
++        ++nchk;
++        auto info_eq = [](const xf::Info &x, const xf::Info &y) {  // (pos/tex past the counts are not set)
++          if (x.ok != y.ok || x.hp != y.hp || x.hn != y.hn || x.hc != y.hc || x.ranks != y.ranks ||
++              x.tmask != y.tmask || x.stride != y.stride || x.npos != y.npos ||
++              std::memcmp(x.ntex, y.ntex, 4) || std::memcmp(x.pos, y.pos, x.npos))
++            return false;
++          for (int t = 0; t < 4; ++t)
++            if (std::memcmp(x.tex[t], y.tex[t], x.ntex[t])) return false;
++          return true;
++        };
++        const bool same = info_eq(o.xi, h.xi) && o.bb_ok == h.bb_ok &&
++                          (!o.bb_ok || std::memcmp(o.bb, h.bb, sizeof o.bb) == 0);
++        if (!same) ++bad;
++        if (nchk % 200000 == 0 || (!same && bad <= 10))
++          printf("[D40PREP_CHECK] draws=%llu mismatches=%llu\n", (unsigned long long)nchk, (unsigned long long)bad);
++      }
++    } else {
++      h.xi = xf::Analyze(v);
++      h.bb_ok = BBoxOf(h.xi, v, h.bb);  // r36r
++    }
+     h.n = n;
+     h.words = h.xi.ok ? n * h.xi.stride : 0;
+-    h.bb_ok = BBoxOf(h.xi, v, h.bb);  // r36r
+     const size_t off = pack.size();
+     pack.resize(off + xf::kPackHdrWords + h.words);
+     std::memcpy(pack.data() + off, &h, sizeof h);
+diff --color -ruN ref/m6a/src/hle/gx.cpp nWiiRuntime_m6/src/hle/gx.cpp
+--- ref/m6a/src/hle/gx.cpp	2026-11-15 14:01:36.337212689 -0500
++++ nWiiRuntime_m6/src/hle/gx.cpp	2026-11-15 15:48:50.077396076 -0500
+@@ -1,3 +1,4 @@
++#include <unordered_set>
+ #include "runtime/nwii_env.h"
+ #include <glad/glad.h>
+ 
+@@ -1321,6 +1322,35 @@
+ // so the packet's render_frees still holds. One backward pass over [0, D) does
+ // rcoal's marking (same rules as rcoal::Mark) and collects the kept commands;
+ // only those (~15 % of the dropped part) are moved.
++static uint64_t s_d_stops = 0;  // r40d NWII_D_PARSESTOP: parses stopped at a frame end
++static uint64_t s_d_counted = 0, s_d_seen = 0, s_d_left_max = 0;  // r40d: ends counted by the guest / noted by the parser
++// r40d NWII_D_LIGHTPARSE=1 (needs NWII_D_PARSESTOP and NWII_D_DROPFAST): when the
++// taken bytes hold P >= 2 frame ends, the first P-1 frames are dropped anyway
++// (only the last one is drawn): the parser does not write their draws (see
++// FifoParser::SetDoomedXfb), so a dropped frame costs its register commands only.
++// If fewer ends than expected are parsed (a miscount: should not happen, the guest
++// counts each XFB copy as it queues it), the frames parsed light so far are all
++// dropped, including the last one parsed (no frame handed over this time; their
++// kept writes wait in s_d_pre_carry for the next packet), and the light parse
++// goes on until enough ends are dropped: a frame without its draws is never drawn.
++// NWII_D_LIGHTPARSE_CHECK=1 (tests): full parse, counts how often the prediction
++// would have failed.
++static bool LightParseOn() {
++    static const bool on = [] {
++        const char *e = NWII_ENV("NWII_D_LIGHTPARSE");
++        const bool v = e && e[0] && e[0] != '0';
++        if (v) std::printf("[D40] parse ligero de los fotogramas que se tiran: NWII_D_LIGHTPARSE=1\n");
++        return v;
++    }();
++    return on;
++}
++static bool LightCheckOn() {
++    static const bool on = NWII_ENV("NWII_D_LIGHTPARSE_CHECK") != nullptr;
++    return on;
++}
++static uint32_t s_d_doom_left = 0;
++static std::vector<nwii::runtime::gx::GXCommand> s_d_pre_carry;
++static uint64_t s_d_light_calls = 0, s_d_light_fail = 0, s_d_light_noframe = 0;
+ namespace dfast {
+ static bool On() {
+     static const bool on = [] {
+@@ -1474,6 +1504,29 @@
+     if (CheckOn())
+         std::printf("[D40CHECK] lotes comprobados=%llu ordenes=%llu distintos=%llu\n", (unsigned long long)st_chk,
+                     (unsigned long long)st_chk_cmds, (unsigned long long)st_chk_bad);
++    if (s_d_stops || s_d_counted != s_d_seen) {
++        std::printf("[D40] parses detenidos en un final de fotograma: %llu | finales contados por el juego %llu,"
++                    " vistos por el parser %llu, resto sin parsear max %llu B\n", (unsigned long long)s_d_stops,
++                    (unsigned long long)s_d_counted, (unsigned long long)s_d_seen, (unsigned long long)s_d_left_max);
++        s_d_stops = 0;
++    }
++    s_d_left_max = 0;
++    if (s_d_light_calls || s_d_light_fail) {
++        static uint64_t sk0 = 0;
++        const uint64_t sk = nwii::runtime::gx::FifoParser::LightSkipped();
++        static uint64_t ln0 = 0, lf0 = 0;
++        uint64_t ln = 0, lf = 0;
++        nwii::runtime::gx::FifoParser::LightTime(ln, lf);
++        std::printf("[D40L] parse ligero: %.0f us por fotograma condenado (%llu)\n",
++                    lf > lf0 ? (ln - ln0) / 1000.0 / (double)(lf - lf0) : 0.0, (unsigned long long)(lf - lf0));
++        ln0 = ln; lf0 = lf;
++        std::printf("[D40L] parses con fotogramas condenados %llu, draws no escritos %llu, prediccion fallida %llu"
++                    " (sin entrega %llu)%s\n", (unsigned long long)s_d_light_calls, (unsigned long long)(sk - sk0),
++                    (unsigned long long)s_d_light_fail, (unsigned long long)s_d_light_noframe,
++                    LightParseOn() ? "" : " [solo comprobacion]");
++        sk0 = sk;
++        s_d_light_calls = s_d_light_fail = s_d_light_noframe = 0;
++    }
+     if (st_parts || st_old_parts)
+         std::printf("[D40] lotes con varios finales: barato %llu (fot. tirados %llu, ordenes %llu, conservadas %llu,"
+                     " %.0f us/lote) | viejo %llu (fot. tirados %llu, ordenes %llu, %.0f us/lote)\n",
+@@ -1487,6 +1540,27 @@
+ }
+ }  // namespace dfast
+ 
++// r40d NWII_D_PARSESTOP=1 (worker only): the parse stops right after the last
++// frame end the taken bytes hold (the guest counts them as it queues them,
++// s_fifo_frames); what follows (the next frame's start, often most of it when
++// the worker is late: 13-24 k commands in agua_pinguino) stays unparsed for the
++// next call instead of being parsed now and then moved out of the frame (the
++// "tail", one 128-byte move per command). The same commands reach the renderer
++// in the same order; only the parser state taken with the packet (CP/VAT/
++// arrays, BP seeds) is the one at the frame end instead of some way into the
++// next frame (as when no tail was parsed, which already happens).
++static bool ParseStopOn() {
++    static const bool on = [] {
++        const char *e = NWII_ENV("NWII_D_PARSESTOP");
++        const bool v = e && e[0] && e[0] != '0';
++        if (v) std::printf("[D40] parse hasta el ultimo final de fotograma: NWII_D_PARSESTOP=1\n");
++        return v;
++    }();
++    return on;
++}
++static uint32_t s_d_pend = 0;  // frame ends taken from the FIFO and not parsed yet (worker)
++static std::vector<uint8_t> s_d_spare;  // r40d: the guest's FIFO bytes taken by swap (worker)
++
+ // The preparing half of a drain (see above). Returns the packet a frame was
+ // produced into (nullptr: none yet): the one `acquire` returns (called once a frame end is
+ // parsed; `retracted`: it hands back a packet not rendered yet, whose
+@@ -1511,6 +1585,8 @@
+         if (!apply_now) {  // worker: still not taken by the render thread
+             s_held_frames += s_fifo_frames;
+             s_prep_pending.held += s_fifo_frames;
++            s_d_pend += s_fifo_frames;  // r40d
++            s_d_counted += s_fifo_frames;
+         }
+         s_fifo_frames = 0;  // every queued byte is taken below
+         if (s_parse_buf.empty()) {
+@@ -1518,15 +1594,29 @@
+             // ours (empty, capacity kept) for it to fill.
+             s_parse_buf.swap(g_hw_fifo);
+         } else if (!g_hw_fifo.empty()) {
+-            s_parse_buf.insert(s_parse_buf.end(), g_hw_fifo.begin(),
+-                               g_hw_fifo.end());
+-            g_hw_fifo.clear();
++            if (ParseStopOn() && !apply_now) {
++                // r40d: NWII_D_PARSESTOP leaves bytes in s_parse_buf on almost every
++                // call, so the copy below would run under g_fifo_mutex every time
++                // (the m5/Z22 priority inversion: the worker preempted on core 2
++                // holding this lock while the game spins for it; D06 hung like that).
++                // Take the guest's buffer with a swap (O(1)) and append it after
++                // unlocking; the guest gets our empty spare (capacity kept).
++                s_d_spare.swap(g_hw_fifo);
++            } else {
++                s_parse_buf.insert(s_parse_buf.end(), g_hw_fifo.begin(),
++                                   g_hw_fifo.end());
++                g_hw_fifo.clear();
++            }
+         }
+         // R8 memory: the guest's (now empty) buffer, see TrimBuffers. Rare:
+         // only after a backlog.
+         if (g_hw_fifo.capacity() > 4 * std::max<size_t>(s_hw_bytes.get(), 1u << 20))
+             TrimVec(g_hw_fifo, s_hw_bytes.get());
+     }
++    if (!s_d_spare.empty()) {  // r40d (see above): outside the lock
++        s_parse_buf.insert(s_parse_buf.end(), s_d_spare.begin(), s_d_spare.end());
++        s_d_spare.clear();
++    }
+     s_hw_bytes.note(s_parse_buf.size(), std::chrono::steady_clock::now());
+     st.mark(wprof::kLock);
+     if (s_parse_buf.empty()) return nullptr;
+@@ -1550,7 +1640,41 @@
+     PH(7);
+     const bool use_idx = PIndexOn();
+     nwii::runtime::gx::FifoParser::SetFrameSeq(s_prep_frames + 1);
++    const bool pstop = ParseStopOn() && use_idx && !apply_now;  // r40d
++    nwii::runtime::gx::FifoParser::SetStopAfterXfb(pstop ? s_d_pend : 0);
++    // r40d NWII_D_LIGHTPARSE: frame ends whose frames are known to be dropped.
++    const bool light = pstop && dfast::On() && RPrefixOn() && (LightParseOn() || LightCheckOn());
++    uint32_t doom = 0;
++    if (light) {
++        doom = std::max<uint32_t>(s_d_doom_left, s_d_pend >= 2 ? s_d_pend - 1 : 0);
++        if (doom) ++s_d_light_calls;
++        nwii::runtime::gx::FifoParser::SetDoomedXfb(LightParseOn() ? doom : 0);
++    }
+     nwii::runtime::gx::FifoParser::Parse(s_parse_buf, s_carry, use_idx ? &s_pindex : nullptr);
++    bool doom_fail = false;
++    if (light) {
++        nwii::runtime::gx::FifoParser::SetDoomedXfb(0);
++        const uint32_t ends = (uint32_t)s_pindex.xfb_copies.size();
++        if (doom && ends <= doom) {
++            ++s_d_light_fail;
++            doom_fail = LightParseOn();
++            s_d_doom_left = doom_fail ? doom - ends : 0;
++        } else {
++            s_d_doom_left = 0;
++        }
++    }
++    if (!apply_now && use_idx) {  // r40d: guest count vs parser (diagnostic, [D40])
++        s_d_seen += s_pindex.xfb_copies.size();
++        s_d_left_max = std::max<uint64_t>(s_d_left_max, s_parse_buf.size());
++    }
++    if (pstop) {
++        const uint32_t ends = (uint32_t)s_pindex.xfb_copies.size();
++        const bool stopped = nwii::runtime::gx::FifoParser::StoppedAtXfb();
++        if (stopped) ++s_d_stops;
++        // all bytes parsed: nothing counted is left (a miscount does not linger)
++        s_d_pend = (!stopped || ends >= s_d_pend) ? 0 : s_d_pend - ends;
++        nwii::runtime::gx::FifoParser::SetStopAfterXfb(0);
++    }
+     if (apply_now) {
+         // Same thread renders: the parser's register state reaches g_state
+         // at the end of every parse, as when the parser wrote it directly.
+@@ -1645,6 +1769,23 @@
+     }
+     PH(2);
+     st.mark(wprof::kScan);
++    if (doom_fail && last_frame_end >= 0) {
++        // r40d NWII_D_LIGHTPARSE miscount: every frame parsed up to the last end
++        // is dropped (some lack their draws); nothing is handed over.
++        const size_t E = (size_t)last_frame_end + 1;
++        dfast::DropPart(s_carry, E, s_d_pre_carry, s_prep_pending.dropped);
++        s_carry.erase(s_carry.begin(), s_carry.begin() + (ptrdiff_t)E);
++        size_t k = 0, w = 0;
++        while (k < s_carry_draws.size() && s_carry_draws[k] < E) ++k;
++        for (; k < s_carry_draws.size(); ++k) {
++            s_carry_ents[w] = s_carry_ents[k];
++            s_carry_draws[w++] = s_carry_draws[k] - (uint32_t)E;
++        }
++        s_carry_draws.resize(w);
++        s_carry_ents.resize(w);
++        ++s_d_light_noframe;
++        return nullptr;
++    }
+     if (last_frame_end < 0)
+         return nullptr;
+     bool retracted = false;
+@@ -1664,6 +1805,11 @@
+         pkt.pack.clear();
+     }
+     if (!retracted) pkt.pre.clear();  // r36r NWII_R_PREFIX: already rendered
++    if (!s_d_pre_carry.empty()) {  // r40d: frames dropped by a light-parse miscount (older than this batch)
++        pkt.pre.insert(pkt.pre.end(), std::make_move_iterator(s_d_pre_carry.begin()),
++                       std::make_move_iterator(s_d_pre_carry.end()));
++        s_d_pre_carry.clear();
++    }
+     // r36r NWII_R_PREFIX: a retracted packet's commands are in pkt.pre: the
+     // new frame takes the usual path below.
+     const bool retr_slow = retracted && !RPrefixOn();
+@@ -1878,6 +2024,78 @@
+         if (s_draw_entries[i] == nwii::runtime::gx::FifoParser::kEntryUnknown) s_todo.push_back((uint32_t)i);
+     const size_t nt = s_todo.size();
+     bool render_frees = true;
++    // r40d NWII_D_STATS=1 (diagnóstico): draws del fotograma por tipo ([D40S] cada ~2 s).
++    static const bool s_dstats = NWII_ENV("NWII_D_STATS") != nullptr;
++    if (s_dstats) {
++        static uint64_t f = 0, a = 0, t = 0, imm = 0, dl = 0, verts = 0, bytes = 0, hit = 0, cmds = 0, same = 0, idx = 0;
++        static std::unordered_set<uint64_t> *prev = new std::unordered_set<uint64_t>, *cur = new std::unordered_set<uint64_t>;
++        static auto last = std::chrono::steady_clock::now();
++        ++f; a += nd; t += nt; cmds += s_frame.size() - fstart;
++        cur->clear();
++        for (size_t q = 0; q < nt; ++q) {
++            const auto &c = *s_draws[s_todo[q]];
++            if (const auto *r = c.raw.get()) {
++                (r->in_dl ? dl : imm)++;
++                verts += r->count;
++                bytes += r->bytes.size();
++                if (r->decoded) ++hit;
++                if (!r->in_dl) {
++                    uint64_t h = 1469598103934665603ull;
++                    auto mix = [&](const void *p, size_t n) {
++                        const uint8_t *b = (const uint8_t *)p;
++                        for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
++                    };
++                    mix(r->bytes.data(), r->bytes.size());
++                    mix(&r->vat, sizeof r->vat);
++                    mix(&r->count, sizeof r->count);
++                    mix(&c.prim_type, 1);
++                    mix(&r->defPosMtxIdx, 1);
++                    mix(r->defTexMtxIdx, 8);
++                    const auto &v = r->vat;
++                    const bool ix = v.posMask == nwii::runtime::gx::VtxAttrMask::Index8 ||
++                                    v.posMask == nwii::runtime::gx::VtxAttrMask::Index16 ||
++                                    v.clrMask[0] == nwii::runtime::gx::VtxAttrMask::Index8 ||
++                                    v.clrMask[0] == nwii::runtime::gx::VtxAttrMask::Index16 ||
++                                    v.texMask[0] == nwii::runtime::gx::VtxAttrMask::Index8 ||
++                                    v.texMask[0] == nwii::runtime::gx::VtxAttrMask::Index16;
++                    if (ix) { ++idx; mix(r->arrayBase, sizeof r->arrayBase); mix(r->arrayStride, sizeof r->arrayStride); }
++                    cur->insert(h);
++                    if (prev->count(h)) ++same;
++                    {
++                        static std::map<std::string, uint64_t> sig;
++                        char b[160];
++                        int tm = 0, tx = 0;
++                        for (int k = 0; k < 8; ++k) { tm |= v.texMatIdx[k] << k; tx |= (v.texMask[k] != nwii::runtime::gx::VtxAttrMask::None) << k; }
++                        std::snprintf(b, sizeof b, "pmi%d tmi%02x pos%d/%d/%d/s%d nrm%d/%d clr%d/%d clr1_%d tex%02x t0:%d/%d/%d/s%d n=%u prim%02x",
++                                      v.posMatIdx, tm, (int)v.posMask, (int)v.posType, v.posElements, v.posShift,
++                                      (int)v.nrmMask, (int)v.nrmType, (int)v.clrMask[0], (int)v.clrType[0], (int)v.clrMask[1], tx,
++                                      (int)v.texMask[0], (int)v.texType[0], v.texElements[0], v.texShift[0], r->count, c.prim_type);
++                        ++sig[b];
++                        static uint64_t ns = 0;
++                        if (++ns % 200000 == 0) {
++                            std::vector<std::pair<uint64_t, std::string>> o;
++                            for (auto &kv : sig) o.push_back({kv.second, kv.first});
++                            std::sort(o.rbegin(), o.rend());
++                            for (size_t i = 0; i < o.size() && i < 12; ++i)
++                                std::printf("[D40V] %8llu %s\n", (unsigned long long)o[i].first, o[i].second.c_str());
++                            sig.clear();
++                        }
++                    }
++                }
++            }
++        }
++        std::swap(prev, cur);
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last >= std::chrono::seconds(2)) {
++            last = now;
++            std::printf("[D40S] por fotograma preparado: ordenes %.0f draws %.0f, sin entrada (todo) %.0f: inmediatos %.0f,"
++                        " de lista %.0f (con decodificado previo %.0f), vertices %.0f, bytes %.0f | inmediatos iguales a uno"
++                        " del fotograma anterior %.0f, con atributos indexados %.0f\n",
++                        cmds / (double)f, a / (double)f, t / (double)f, imm / (double)f, dl / (double)f, hit / (double)f,
++                        verts / (double)f, bytes / (double)f, same / (double)f, idx / (double)f);
++            f = a = t = imm = dl = verts = bytes = hit = cmds = same = idx = 0;
++        }
++    }
+     for (size_t t = 0; t < nt; ++t) {
+         const size_t i = s_todo[t];
+         if (t + 8 < nt) {

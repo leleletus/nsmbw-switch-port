@@ -1,0 +1,1512 @@
+diff --color -ruN r11base/nWiiRuntime/include/runtime/gx/fifo_parser.h r11a/nWiiRuntime/include/runtime/gx/fifo_parser.h
+--- r11base/nWiiRuntime/include/runtime/gx/fifo_parser.h	2026-11-08 08:51:13.446618808 -0500
++++ r11a/nWiiRuntime/include/runtime/gx/fifo_parser.h	2026-11-08 11:17:50.791314078 -0500
+@@ -49,8 +49,31 @@
+     uint64_t ranges_hash = 0;
+ };
+ 
++// R11 render worker: the parser's register state that the renderer reads from
++// g_state (CP registers, VAT, arrays, matrix indices) and the BP "seed" writes
++// of the commands parsed since the last hand-over. Taken on the parsing thread
++// together with a frame, applied to g_state on the render thread just before
++// that frame is rendered (see gx.cpp).
++struct ParseRenderState {
++    uint32_t cp[256];
++    VATSlot vat[8];
++    uint32_t arrayBase[16];
++    uint32_t arrayStride[16];
++    uint8_t defPosMtxIdx;
++    uint8_t defTexMtxIdx[8];
++    uint32_t seed_bp[256];      // valid where seed_mask is set
++    uint64_t seed_mask[4];
++    uint32_t seed_konst[4][2];  // TEV konst / colour register files (BP 0xE0-0xE7)
++    uint32_t seed_color[4][2];
++    uint8_t seed_kmask, seed_cmask;  // bit idx*2+half
++};
++
+ class FifoParser {
+ public:
++    // Parsing thread: copy the parser state and move the pending seeds out.
++    static void TakeRenderState(ParseRenderState& out);
++    // Render thread: store a taken state in g_state.
++    static void ApplyRenderState(const ParseRenderState& s);
+ 
+ 
+     static void Parse(std::vector<uint8_t>& fifo, std::vector<GXCommand>& commands);
+diff --color -ruN r11base/nWiiRuntime/src/core/main.cpp r11a/nWiiRuntime/src/core/main.cpp
+--- r11base/nWiiRuntime/src/core/main.cpp	2026-11-08 10:48:02.509275073 -0500
++++ r11a/nWiiRuntime/src/core/main.cpp	2026-11-08 11:22:36.731085898 -0500
+@@ -811,8 +811,14 @@
+           idle = true;
+           return;
+         }
+-        std::this_thread::sleep_for(
+-            std::min<clk::duration>(idle ? 4 * poll : poll, deadline - now));
++        // R11: with the render worker, wake as soon as it has a frame ready
++        // (up to the deadline); without it, sleep one poll interval.
++        extern void GX_HostWait(int64_t poll_us, int64_t max_us);
++        using std::chrono::duration_cast;
++        using std::chrono::microseconds;
++        GX_HostWait(duration_cast<microseconds>(
++                        std::min<clk::duration>(idle ? 4 * poll : poll, deadline - now)).count(),
++                    duration_cast<microseconds>(deadline - now).count());
+       }
+     };
+ 
+@@ -874,6 +880,14 @@
+         std::printf(", host thread %.0f%%", 100.0 * (host_cpu - host_cpu0) / dt);
+       if (cpu_cpu >= 0)
+         std::printf(", cpu thread %.0f%%", 100.0 * (cpu_cpu - cpu_cpu0) / dt);
++      {
++        // R11: the render worker (FIFO parse + decode), when it runs.
++        extern double GX_WorkerCpuSeconds();
++        static double gxw0 = -1;
++        const double gxw = GX_WorkerCpuSeconds();
++        if (gxw >= 0 && gxw0 >= 0) std::printf(", gx worker %.0f%%", 100.0 * (gxw - gxw0) / dt);
++        gxw0 = gxw;
++      }
+       char gov[384];
+       nwii::runtime::governor_report(gov, sizeof gov, dt);
+       std::printf(", idle sleeps %.0f/s (%.0f%% of the time)%s\n",
+@@ -1246,6 +1260,11 @@
+       perf_report();
+     }
+ 
++    // R11: stop the render worker while the GL context and the renderer
++    // still exist (it frees frames whose emit-cache entries return slots).
++    extern void GX_StopWorker();
++    GX_StopWorker();
++
+     if (!headless) {
+       if (audio_dev > 0) SDL_CloseAudioDevice(audio_dev);
+ #ifdef __SWITCH__
+diff --color -ruN r11base/nWiiRuntime/src/hle/gx/fifo_parser.cpp r11a/nWiiRuntime/src/hle/gx/fifo_parser.cpp
+--- r11base/nWiiRuntime/src/hle/gx/fifo_parser.cpp	2026-11-08 08:51:13.447296322 -0500
++++ r11a/nWiiRuntime/src/hle/gx/fifo_parser.cpp	2026-11-08 11:17:43.567114676 -0500
+@@ -27,6 +27,91 @@
+ 
+ extern GXState g_state;
+ 
++// ---- R11 render worker: parser-owned register state -------------------------
++// The parser used to keep the CP state (VAT, vertex arrays, matrix indices) in
++// g_state and to "seed" g_state.bp / the TEV register files with every BP write
++// it parsed, while the renderer reads g_state (shader hash: CP 0x50/0x60; BP
++// registers not yet re-applied in the frame) and writes it (BP applies). With
++// the parse of frame N+1 on another thread than the render of frame N, those
++// writes cannot go to g_state directly. The parser keeps its own copy (s_ps)
++// and records its seeds (s_seed); TakeRenderState hands both over and
++// ApplyRenderState (render thread) stores them in g_state right before the
++// frame is rendered -- exactly the values today's single-threaded drain left
++// there, since the drain parsed everything before rendering.
++namespace {
++struct ParseRegs {
++    uint32_t cp[256] = {};
++    VATSlot vat[8] = {};
++    uint32_t arrayBase[16] = {};
++    uint32_t arrayStride[16] = {};
++    uint8_t defPosMtxIdx = 0;
++    uint8_t defTexMtxIdx[8] = {};
++};
++ParseRegs s_ps;
++struct SeedDelta {
++    uint32_t bp[256];
++    uint64_t mask[4] = {};
++    uint32_t konst[4][2], color[4][2];
++    uint8_t kmask = 0, cmask = 0;  // bit idx*2+half
++};
++SeedDelta s_seed;
++// Same effect on g_state as `g_state.bp[reg] = val; StoreTevColorWrite(reg,
++// val);` once applied.
++inline void SeedWrite(uint8_t reg, uint32_t val) {
++    s_seed.bp[reg] = val;
++    s_seed.mask[reg >> 6] |= 1ull << (reg & 63);
++    if (reg < 0xE0 || reg > 0xE7) return;
++    const int idx = (reg - 0xE0) / 2, half = (reg - 0xE0) & 1;
++    if ((val >> 23) & 1) {
++        s_seed.konst[idx][half] = val;
++        s_seed.kmask |= 1u << (idx * 2 + half);
++    } else {
++        s_seed.color[idx][half] = val;
++        s_seed.cmask |= 1u << (idx * 2 + half);
++    }
++}
++}  // namespace
++
++void FifoParser::TakeRenderState(ParseRenderState& out) {
++    std::memcpy(out.cp, s_ps.cp, sizeof out.cp);
++    for (int i = 0; i < 8; ++i) out.vat[i] = s_ps.vat[i];
++    std::memcpy(out.arrayBase, s_ps.arrayBase, sizeof out.arrayBase);
++    std::memcpy(out.arrayStride, s_ps.arrayStride, sizeof out.arrayStride);
++    out.defPosMtxIdx = s_ps.defPosMtxIdx;
++    std::memcpy(out.defTexMtxIdx, s_ps.defTexMtxIdx, sizeof out.defTexMtxIdx);
++    for (int w = 0; w < 4; ++w) {
++        out.seed_mask[w] = s_seed.mask[w];
++        for (uint64_t m = s_seed.mask[w]; m; m &= m - 1) {
++            const int r = w * 64 + __builtin_ctzll(m);
++            out.seed_bp[r] = s_seed.bp[r];
++        }
++        s_seed.mask[w] = 0;
++    }
++    out.seed_kmask = s_seed.kmask;
++    out.seed_cmask = s_seed.cmask;
++    std::memcpy(out.seed_konst, s_seed.konst, sizeof out.seed_konst);
++    std::memcpy(out.seed_color, s_seed.color, sizeof out.seed_color);
++    s_seed.kmask = s_seed.cmask = 0;
++}
++
++void FifoParser::ApplyRenderState(const ParseRenderState& s) {
++    std::memcpy(g_state.cp, s.cp, sizeof g_state.cp);
++    for (int i = 0; i < 8; ++i) g_state.vat[i] = s.vat[i];
++    std::memcpy(g_state.arrayBase, s.arrayBase, sizeof g_state.arrayBase);
++    std::memcpy(g_state.arrayStride, s.arrayStride, sizeof g_state.arrayStride);
++    g_state.defPosMtxIdx = s.defPosMtxIdx;
++    std::memcpy(g_state.defTexMtxIdx, s.defTexMtxIdx, sizeof g_state.defTexMtxIdx);
++    for (int w = 0; w < 4; ++w)
++        for (uint64_t m = s.seed_mask[w]; m; m &= m - 1) {
++            const int r = w * 64 + __builtin_ctzll(m);
++            g_state.bp[r] = s.seed_bp[r];
++        }
++    for (int k = 0; k < 8; ++k) {
++        if (s.seed_kmask & (1u << k)) g_state.tevKonstReg[k / 2][k & 1] = s.seed_konst[k / 2][k & 1];
++        if (s.seed_cmask & (1u << k)) g_state.tevColorReg[k / 2][k & 1] = s.seed_color[k / 2][k & 1];
++    }
++}
++
+ // NWII_SKINDBG state (declared early so ParseCP/ParseBP in the anonymous
+ // namespace can reference it).
+ // Parse-time shadow of the XF matrix memory: matrix loads (direct 0x10 and
+@@ -90,7 +175,7 @@
+             uint32_t w;
+             std::memcpy(&w, &c.payload[i], 4);
+             const uint8_t cp = a == 0x1018 ? 0x30 : 0x40;
+-            g_state.cp[cp] = w;
++            s_ps.cp[cp] = w;
+             g_dlstate_dirty = true;
+             ParseCP(cp, w);
+         }
+@@ -135,10 +220,7 @@
+ 
+         // time. NWII_NOSEED=1 takes the Dolphin behaviour.
+         static const bool no_seed = NWII_ENV("NWII_NOSEED") != nullptr;
+-        if (!no_seed) {
+-            g_state.bp[reg] = val;
+-            StoreTevColorWrite(reg, val);
+-        }
++        if (!no_seed) SeedWrite(reg, val);  // R11: applied with the frame
+     }
+ 
+     void ApplyBPRegisterImpl(uint8_t reg, uint32_t val) {
+@@ -297,7 +379,7 @@
+ 
+     
+     void ParseCP(uint8_t reg, uint32_t val) {
+-        g_state.cp[reg] = val;
++        s_ps.cp[reg] = val;
+         g_dlstate_dirty = true;
+         if (g_skindbg && (reg == 0x50 || reg == 0x30 || reg == 0x60)) {
+             static uint32_t last50=0xFFFFFFFF, last30=0xFFFFFFFF, last60=0xFFFFFFFF;
+@@ -309,18 +391,18 @@
+             }
+         }
+         if (reg >= 0xA0 && reg <= 0xAF) {
+-            g_state.arrayBase[reg - 0xA0] = val & 0x3FFFFFFF;
++            s_ps.arrayBase[reg - 0xA0] = val & 0x3FFFFFFF;
+         } else if (reg >= 0xB0 && reg <= 0xBF) {
+-            g_state.arrayStride[reg - 0xB0] = val & 0xFF;
++            s_ps.arrayStride[reg - 0xB0] = val & 0xFF;
+         } else if (reg == 0x30) {
+             // Matrix index A: pos/normal (bits 0-5), tex0-3 (6-29).
+-            g_state.defPosMtxIdx = val & 0x3F;
++            s_ps.defPosMtxIdx = val & 0x3F;
+             for (int t = 0; t < 4; t++)
+-                g_state.defTexMtxIdx[t] = (val >> (6 + t * 6)) & 0x3F;
++                s_ps.defTexMtxIdx[t] = (val >> (6 + t * 6)) & 0x3F;
+             static const bool tmdbg = NWII_ENV("NWII_TEXMTXDBG") != nullptr;
+             if (tmdbg) {
+                 static uint32_t seen = 0;
+-                for (int t = 0; t < 4; t++) seen |= (1u << g_state.defTexMtxIdx[t]);
++                for (int t = 0; t < 4; t++) seen |= (1u << s_ps.defTexMtxIdx[t]);
+                 static auto t0 = std::chrono::steady_clock::now();
+                 auto now = std::chrono::steady_clock::now();
+                 if (std::chrono::duration_cast<std::chrono::seconds>(now - t0).count() >= 2) {
+@@ -334,11 +416,11 @@
+         } else if (reg == 0x40) {
+             // Matrix index B: tex4-7.
+             for (int t = 0; t < 4; t++)
+-                g_state.defTexMtxIdx[4 + t] = (val >> (t * 6)) & 0x3F;
++                s_ps.defTexMtxIdx[4 + t] = (val >> (t * 6)) & 0x3F;
+             static const bool tmdbg = NWII_ENV("NWII_TEXMTXDBG") != nullptr;
+             if (tmdbg) {
+                 static uint32_t seen = 0;
+-                for (int t = 0; t < 8; t++) seen |= (1u << g_state.defTexMtxIdx[t]);
++                for (int t = 0; t < 8; t++) seen |= (1u << s_ps.defTexMtxIdx[t]);
+                 static auto t0 = std::chrono::steady_clock::now();
+                 auto now = std::chrono::steady_clock::now();
+                 if (std::chrono::duration_cast<std::chrono::seconds>(now - t0).count() >= 2) {
+@@ -354,63 +436,63 @@
+             
+             
+             for (int i = 0; i < 8; i++) {
+-                g_state.vat[i].posMatIdx  = (val >> 0) & 1;
++                s_ps.vat[i].posMatIdx  = (val >> 0) & 1;
+                 for (int t = 0; t < 8; t++)
+-                    g_state.vat[i].texMatIdx[t] = (val >> (1 + t)) & 1;
+-                g_state.vat[i].posMask    = (VtxAttrMask)((val >> 9)  & 3);
+-                g_state.vat[i].nrmMask    = (VtxAttrMask)((val >> 11) & 3);
+-                g_state.vat[i].clrMask[0] = (VtxAttrMask)((val >> 13) & 3);
+-                g_state.vat[i].clrMask[1] = (VtxAttrMask)((val >> 15) & 3);
++                    s_ps.vat[i].texMatIdx[t] = (val >> (1 + t)) & 1;
++                s_ps.vat[i].posMask    = (VtxAttrMask)((val >> 9)  & 3);
++                s_ps.vat[i].nrmMask    = (VtxAttrMask)((val >> 11) & 3);
++                s_ps.vat[i].clrMask[0] = (VtxAttrMask)((val >> 13) & 3);
++                s_ps.vat[i].clrMask[1] = (VtxAttrMask)((val >> 15) & 3);
+             }
+         } else if (reg == 0x60) {
+             
+             for (int i = 0; i < 8; i++)
+                 for (int t = 0; t < 8; t++)
+-                    g_state.vat[i].texMask[t] = (VtxAttrMask)((val >> (t * 2)) & 3);
++                    s_ps.vat[i].texMask[t] = (VtxAttrMask)((val >> (t * 2)) & 3);
+         } else if (reg >= 0x70 && reg <= 0x77) {
+             
+             int i = reg - 0x70;
+-            g_state.vat[i].posElements  = (val >> 0)  & 1;
+-            g_state.vat[i].posType      = (VtxAttrType)((val >> 1) & 7);
+-            g_state.vat[i].posShift     = (val >> 4)  & 0x1F;
+-            g_state.vat[i].nrmElements  = (val >> 9)  & 1;
+-            g_state.vat[i].nrmType      = (VtxAttrType)((val >> 10) & 7);
+-            g_state.vat[i].clrElements[0] = (val >> 13) & 1;
+-            g_state.vat[i].clrType[0]   = (VtxAttrType)((val >> 14) & 7);
+-            g_state.vat[i].clrElements[1] = (val >> 17) & 1;
+-            g_state.vat[i].clrType[1]   = (VtxAttrType)((val >> 18) & 7);
+-            g_state.vat[i].texElements[0] = (val >> 21) & 1;
+-            g_state.vat[i].texType[0]   = (VtxAttrType)((val >> 22) & 7);
+-            g_state.vat[i].texShift[0]  = (val >> 25) & 0x1F;
++            s_ps.vat[i].posElements  = (val >> 0)  & 1;
++            s_ps.vat[i].posType      = (VtxAttrType)((val >> 1) & 7);
++            s_ps.vat[i].posShift     = (val >> 4)  & 0x1F;
++            s_ps.vat[i].nrmElements  = (val >> 9)  & 1;
++            s_ps.vat[i].nrmType      = (VtxAttrType)((val >> 10) & 7);
++            s_ps.vat[i].clrElements[0] = (val >> 13) & 1;
++            s_ps.vat[i].clrType[0]   = (VtxAttrType)((val >> 14) & 7);
++            s_ps.vat[i].clrElements[1] = (val >> 17) & 1;
++            s_ps.vat[i].clrType[1]   = (VtxAttrType)((val >> 18) & 7);
++            s_ps.vat[i].texElements[0] = (val >> 21) & 1;
++            s_ps.vat[i].texType[0]   = (VtxAttrType)((val >> 22) & 7);
++            s_ps.vat[i].texShift[0]  = (val >> 25) & 0x1F;
+             // Dolphin UVAT_group0 bit 31: NormalIndex3 (NBT by three indices).
+-            g_state.vat[i].nrmIndex3    = ((val >> 31) & 1) != 0;
++            s_ps.vat[i].nrmIndex3    = ((val >> 31) & 1) != 0;
+         } else if (reg >= 0x80 && reg <= 0x87) {
+             
+             int i = reg - 0x80;
+-            g_state.vat[i].texElements[1] = (val >> 0)  & 1;
+-            g_state.vat[i].texType[1]   = (VtxAttrType)((val >> 1) & 7);
+-            g_state.vat[i].texShift[1]  = (val >> 4)  & 0x1F;
+-            g_state.vat[i].texElements[2] = (val >> 9)  & 1;
+-            g_state.vat[i].texType[2]   = (VtxAttrType)((val >> 10) & 7);
+-            g_state.vat[i].texShift[2]  = (val >> 13) & 0x1F;
+-            g_state.vat[i].texElements[3] = (val >> 18) & 1;
+-            g_state.vat[i].texType[3]   = (VtxAttrType)((val >> 19) & 7);
+-            g_state.vat[i].texShift[3]  = (val >> 22) & 0x1F;
+-            g_state.vat[i].texElements[4] = (val >> 27) & 1;
+-            g_state.vat[i].texType[4]   = (VtxAttrType)((val >> 28) & 7);
++            s_ps.vat[i].texElements[1] = (val >> 0)  & 1;
++            s_ps.vat[i].texType[1]   = (VtxAttrType)((val >> 1) & 7);
++            s_ps.vat[i].texShift[1]  = (val >> 4)  & 0x1F;
++            s_ps.vat[i].texElements[2] = (val >> 9)  & 1;
++            s_ps.vat[i].texType[2]   = (VtxAttrType)((val >> 10) & 7);
++            s_ps.vat[i].texShift[2]  = (val >> 13) & 0x1F;
++            s_ps.vat[i].texElements[3] = (val >> 18) & 1;
++            s_ps.vat[i].texType[3]   = (VtxAttrType)((val >> 19) & 7);
++            s_ps.vat[i].texShift[3]  = (val >> 22) & 0x1F;
++            s_ps.vat[i].texElements[4] = (val >> 27) & 1;
++            s_ps.vat[i].texType[4]   = (VtxAttrType)((val >> 28) & 7);
+         } else if (reg >= 0x90 && reg <= 0x97) {
+             
+             int i = reg - 0x90;
+-            g_state.vat[i].texShift[4]  = (val >> 0)  & 0x1F;
+-            g_state.vat[i].texElements[5] = (val >> 5)  & 1;
+-            g_state.vat[i].texType[5]   = (VtxAttrType)((val >> 6) & 7);
+-            g_state.vat[i].texShift[5]  = (val >> 9)  & 0x1F;
+-            g_state.vat[i].texElements[6] = (val >> 14) & 1;
+-            g_state.vat[i].texType[6]   = (VtxAttrType)((val >> 15) & 7);
+-            g_state.vat[i].texShift[6]  = (val >> 18) & 0x1F;
+-            g_state.vat[i].texElements[7] = (val >> 23) & 1;
+-            g_state.vat[i].texType[7]   = (VtxAttrType)((val >> 24) & 7);
+-            g_state.vat[i].texShift[7]  = (val >> 27) & 0x1F;
++            s_ps.vat[i].texShift[4]  = (val >> 0)  & 0x1F;
++            s_ps.vat[i].texElements[5] = (val >> 5)  & 1;
++            s_ps.vat[i].texType[5]   = (VtxAttrType)((val >> 6) & 7);
++            s_ps.vat[i].texShift[5]  = (val >> 9)  & 0x1F;
++            s_ps.vat[i].texElements[6] = (val >> 14) & 1;
++            s_ps.vat[i].texType[6]   = (VtxAttrType)((val >> 15) & 7);
++            s_ps.vat[i].texShift[6]  = (val >> 18) & 0x1F;
++            s_ps.vat[i].texElements[7] = (val >> 23) & 1;
++            s_ps.vat[i].texType[7]   = (VtxAttrType)((val >> 24) & 7);
++            s_ps.vat[i].texShift[7]  = (val >> 27) & 0x1F;
+         }
+     }
+ 
+@@ -679,7 +761,7 @@
+     if (!g_dlstate_dirty) return s_hash;
+     g_dlstate_dirty = false;
+     uint64_t h = 14695981039346656037ull;
+-    for (int r = 0x30; r <= 0xBF; ++r) { h ^= g_state.cp[r]; h *= 1099511628211ull; }
++    for (int r = 0x30; r <= 0xBF; ++r) { h ^= s_ps.cp[r]; h *= 1099511628211ull; }
+     s_hash = h;
+     return h;
+ }
+@@ -783,8 +865,8 @@
+                     int array = 12 + ((c.val >> 24) & 0x3);
+                     int num = (c.val >> 16) & 0xFF;
+                     uint32_t index = c.val & 0xFFFF;
+-                    uint32_t base = g_state.arrayBase[array] +
+-                                    index * g_state.arrayStride[array];
++                    uint32_t base = s_ps.arrayBase[array] +
++                                    index * s_ps.arrayStride[array];
+                     for (int i = 0; i < num && i < (int)c.payload.size(); i++)
+                         c.payload[i] =
+                             nwii::runtime::g_mmu->read_f32(base + i * 4);
+@@ -1221,8 +1303,8 @@
+                 c.type = GXCommandType::BPRegister;
+                 c.val = merged;
+             } else {
+-                uint32_t merged = (g_state.cp[reg] & ~mask) | (val & mask);
+-                g_state.cp[reg] = merged;
++                uint32_t merged = (s_ps.cp[reg] & ~mask) | (val & mask);
++                s_ps.cp[reg] = merged;
+                 g_dlstate_dirty = true;
+                 ParseCP(reg, merged);
+                 c.type = GXCommandType::CPRegister;
+@@ -1251,8 +1333,8 @@
+                 c.val = 0x80000000u | ((uint32_t)(array - 12) << 24) |
+                         ((uint32_t)num << 16) | (index & 0xFFFF);
+                 c.payload.resize(num);
+-                uint32_t base = g_state.arrayBase[array] +
+-                                index * g_state.arrayStride[array];
++                uint32_t base = s_ps.arrayBase[array] +
++                                index * s_ps.arrayStride[array];
+                 for (int i = 0; i < num; i++)
+                     c.payload[i] = nwii::runtime::g_mmu->read_f32(base + i * 4);
+                 if (gx_trace()) {
+@@ -1260,7 +1342,7 @@
+                     if (ln++ < 24) {
+                         printf("[GXTRACE] LOAD_INDX arr=%d idx=%u xf=0x%03X n=%d base=0x%X stride=%u [",
+                                array, index, xf_addr, num, base,
+-                               g_state.arrayStride[array]);
++                               s_ps.arrayStride[array]);
+                         for (int i = 0; i < num && i < 8; i++)
+                             printf("%.3f ", c.payload[i]);
+                         printf("]\n");
+@@ -1375,7 +1457,7 @@
+             uint16_t vtx_count = (fifo[offset + 1] << 8) | fifo[offset + 2];
+             uint8_t vat_idx = cmd & 0x07;
+ 
+-            VATSlot& vat = g_state.vat[vat_idx];
++            VATSlot& vat = s_ps.vat[vat_idx];
+ 
+             // Vertex size is constant for a draw (every attribute is either
+             // direct with a fixed byte width or a fixed 1/2-byte index), so
+@@ -1392,8 +1474,8 @@
+             c.raw = MakeHost<DrawRaw>();
+             c.raw->in_dl = depth > 0;
+             c.raw->vat = vat;
+-            c.raw->defPosMtxIdx = g_state.defPosMtxIdx;
+-            std::memcpy(c.raw->defTexMtxIdx, g_state.defTexMtxIdx, 8);
++            c.raw->defPosMtxIdx = s_ps.defPosMtxIdx;
++            std::memcpy(c.raw->defTexMtxIdx, s_ps.defTexMtxIdx, 8);
+             // Snapshot this draw's position/normal matrix from the parse-time
+             // shadow, unless the draw carries a per-vertex matrix index (then
+             // each vertex may use a different matrix — fall back to live).
+@@ -1410,8 +1492,8 @@
+                     c.raw->snap_nrm_bank.assign(g_parse_nrmmtx, g_parse_nrmmtx + 96);
+                 }
+             } else {
+-                uint32_t pb = (uint32_t)g_state.defPosMtxIdx * 4;
+-                uint32_t nb = 3u * (g_state.defPosMtxIdx & 31);
++                uint32_t pb = (uint32_t)s_ps.defPosMtxIdx * 4;
++                uint32_t nb = 3u * (s_ps.defPosMtxIdx & 31);
+                 if (pb + 12 <= 256 && nb + 9 <= 96) {
+                     const float* pm = &g_parse_posmtx[pb];
+                     // Only trust the snapshot if the slot was actually written
+@@ -1429,15 +1511,16 @@
+             if (g_skindbg) {
+                 g_skin_draws_total++;
+                 if (vat.posMatIdx) g_skin_draws_pmidx++;
+-                if (g_state.defPosMtxIdx != 0) g_skin_defnz++;
++                if (s_ps.defPosMtxIdx != 0) g_skin_defnz++;
+                 if (c.raw->have_snap_mtx) g_skin_snapped++;
+             }
+             // Normals only matter when a colour channel is lit (XF 0x100e/0x100f
+             // bit1); decoding them otherwise is pure cost.
+-            c.raw->need_normal = ((g_state.xf[0x00E] >> 1) & 1) ||
+-                                 ((g_state.xf[0x00F] >> 1) & 1);
+-            std::memcpy(c.raw->arrayBase, g_state.arrayBase, sizeof(c.raw->arrayBase));
+-            std::memcpy(c.raw->arrayStride, g_state.arrayStride, sizeof(c.raw->arrayStride));
++            // R11: was read from g_state.xf (render-thread state); nothing
++            // reads need_normal (DecodeDraw always keeps normals).
++            c.raw->need_normal = false;
++            std::memcpy(c.raw->arrayBase, s_ps.arrayBase, sizeof(c.raw->arrayBase));
++            std::memcpy(c.raw->arrayStride, s_ps.arrayStride, sizeof(c.raw->arrayStride));
+             c.raw->count = vtx_count;
+             c.raw->bytes.assign(fifo.begin() + offset + 3, fifo.begin() + offset + need);
+             static const bool vatdbg = NWII_ENV("NWII_VATDBG") != nullptr;
+diff --color -ruN r11base/nWiiRuntime/src/hle/gx/renderer_gl.cpp r11a/nWiiRuntime/src/hle/gx/renderer_gl.cpp
+--- r11base/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-08 10:18:33.955086938 -0500
++++ r11a/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-08 11:22:27.964274583 -0500
+@@ -17,6 +17,7 @@
+ #include <string>
+ #include <deque>
+ #include <thread>
++#include <mutex>
+ #include <unordered_map>
+ #include <vector>
+ #ifdef __SWITCH__
+@@ -71,6 +72,7 @@
+ } // namespace nwii::runtime::gx
+ // Render profiling ([RPROF] in gx.cpp): GL draw calls and GX draws rendered.
+ uint64_t g_prof_gl_draws = 0, g_prof_gx_draws = 0;
++bool GX_OnRenderWorker();  // gx.cpp (R11)
+ // Batches that a texture upload would have drawn with the wrong texture
+ // before the texture cache got its own unit (see DrawPrimitive).
+ uint64_t g_prof_tex_bind_saves = 0;
+@@ -382,6 +384,26 @@
+ static inline void ArenaFree(uint32_t off, uint8_t cls) {
+   s_retired->push_back({s_frame, off, cls});
+ }
++// R11 render worker: an emit-cache entry dies with the last reference to its
++// decoded vertices, which can be dropped on the render worker (gx.cpp) when it
++// frees a rendered frame or replaces a stale decode. Its slot is then handed to
++// the render thread, which retires it at its next Render() (TakeDeferred): a
++// frame later than the slot's last use, so never too early.
++static std::mutex *s_defer_m = new std::mutex;
++static std::vector<std::pair<uint32_t, uint8_t>> *s_defer = new std::vector<std::pair<uint32_t, uint8_t>>;
++static inline void ArenaFreeAny(uint32_t off, uint8_t cls) {
++  if (!::GX_OnRenderWorker()) {
++    ArenaFree(off, cls);
++    return;
++  }
++  std::lock_guard<std::mutex> lk(*s_defer_m);
++  s_defer->push_back({off, cls});
++}
++static void TakeDeferred() {
++  std::lock_guard<std::mutex> lk(*s_defer_m);
++  for (const auto &d : *s_defer) ArenaFree(d.first, d.second);
++  s_defer->clear();
++}
+ // End of a Render(): fence everything drawn so far.
+ static void EndFrame() {
+   s_inflight->push_back({s_frame, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0), s_frame_v0,
+@@ -3358,7 +3380,7 @@
+   uint32_t slot_n = 0;
+   uint8_t cls = 0;
+   ~Entry() {
+-    if (slot >= 0) vbuf::ArenaFree((uint32_t)slot, cls);
++    if (slot >= 0) vbuf::ArenaFreeAny((uint32_t)slot, cls);  // R11: any thread
+   }
+ };
+ static bool On() {
+@@ -4031,6 +4053,7 @@
+     PrewarmPrograms();
+     vbuf::Init();
+     if (vbuf::s_on) {
++      vbuf::TakeDeferred();  // R11: slots of entries freed on the render worker
+       vbuf::Poll();
+       vbuf::Recycle();
+     }
+diff --color -ruN r11base/nWiiRuntime/src/hle/gx.cpp r11a/nWiiRuntime/src/hle/gx.cpp
+--- r11base/nWiiRuntime/src/hle/gx.cpp	2026-11-08 08:51:26.656872214 -0500
++++ r11a/nWiiRuntime/src/hle/gx.cpp	2026-11-08 12:03:12.374707427 -0500
+@@ -20,6 +20,12 @@
+ #include <mutex>
+ #include <atomic>
+ #include <thread>
++#include <condition_variable>
++#if defined(__SWITCH__)
++#include <switch.h>
++#include <pthread.h>
++#include "../platform/switch/switch_platform.h"
++#endif
+ #include <iterator>
+ #include <chrono>
+ #include <cstring>
+@@ -80,6 +86,11 @@
+ // the stall never happened. A host that keeps up takes the FIFO every 1 ms and
+ // never gets there. 0 disables it.
+ static uint32_t s_fifo_frames = 0;  // XFB copies queued in g_hw_fifo (g_fifo_mutex)
++// R11: XFB copies the render worker took from g_hw_fifo whose frame the render
++// thread has not taken yet (g_fifo_mutex; 0 without the worker). The guest
++// waits on the sum, so frames held by the worker still count as "not taken by
++// the host" and a stalled renderer stops the guest as before.
++static uint32_t s_held_frames = 0;
+ static std::atomic<std::thread::id> s_host_tid{};  // the thread that drains (ProcessGXFifo)
+ static std::atomic<uint64_t> s_fifo_waits{0}, s_fifo_wait_us{0};
+ static uint32_t FifoMaxFrames() {
+@@ -101,7 +112,7 @@
+     for (;;) {
+         {
+             std::lock_guard<FifoLock> lock(g_fifo_mutex);
+-            if (s_fifo_frames < max) break;
++            if (s_fifo_frames + s_held_frames < max) break;
+         }
+         if (!ctx->is_running.load(std::memory_order_relaxed)) break;
+         // A host that has not drained for this long is not coming back soon
+@@ -276,7 +287,8 @@
+ // NWII_R7PH=<pmu>: drain cost per rendered frame split by phase, in host
+ // thread cycles of perf PMU <pmu> (cpu_atom / cpu_core on hybrid Intel,
+ // cpu elsewhere; the thread must stay on that core type), or in thread CPU
+-// microseconds if the counter cannot be opened. Diagnostic only.
++// microseconds if the counter cannot be opened. Diagnostic only (it keeps
++// the drain on the render thread: no render worker).
+ #if defined(__linux__)
+ #include <linux/perf_event.h>
+ #include <sys/syscall.h>
+@@ -298,6 +310,36 @@
+     return (int)syscall(SYS_perf_event_open, &a, 0, -1, -1, 0);
+ }
+ #endif
++// (Read on first use: the Switch applies env.txt after static initialisation.)
++static const char *PhEnv() {
++    static const char *e = NWII_ENV("NWII_R7PH");
++    return e;
++}
++static bool PhOn() {
++    static const bool on = PhEnv() != nullptr;
++    return on;
++}
++static int PhFd() {
++    static const int fd = [] {
++#if defined(__linux__)
++        const char *e = PhEnv();
++        if (e && *e && std::strcmp(e, "1")) return PhOpenCycles(e);
++#endif
++        return -1;
++    }();
++    return fd;
++}
++static uint64_t PhNow() {
++#if defined(__linux__)
++    uint64_t v = 0;
++    if (PhFd() >= 0 && read(PhFd(), &v, sizeof v) == (ssize_t)sizeof v) return v / 1000;
++#endif
++    return thread_cpu_us();
++}
++static uint64_t s_ph_t = 0;
++static inline void PH(int i) {
++    if (PhOn()) { const uint64_t t = PhNow(); g_ph[i] += t - s_ph_t; s_ph_t = t; }
++}
+ 
+ // ---- R8 memory: give back what a backlog left behind -------------------------
+ // The FIFO buffers and command vectors are reused drain after drain and swap
+@@ -352,32 +394,134 @@
+     TrimVec(s_carry_draws, cmds);
+ }
+ 
+-void ProcessGXFifo() {
+-    static const char *s_ph_env = NWII_ENV("NWII_R7PH");
+-    static const bool s_ph = s_ph_env != nullptr;
+-    static int s_ph_fd = [] {
+-#if defined(__linux__)
+-        if (s_ph_env && *s_ph_env && std::strcmp(s_ph_env, "1")) return PhOpenCycles(s_ph_env);
+-#endif
+-        return -1;
+-    }();
+-    auto ph_now = [] () -> uint64_t {
+-#if defined(__linux__)
+-        uint64_t v = 0;
+-        if (s_ph_fd >= 0 && read(s_ph_fd, &v, sizeof v) == (ssize_t)sizeof v) return v / 1000;
++// ---- R11 render worker -------------------------------------------------------
++// The FIFO drain is split in two halves:
++//   PrepFrame    (CPU only, no GL): take the FIFO bytes, parse them (display
++//                lists expanded), find the frame end, frame-skip, decode the
++//                surviving draws (vertex arrays read from guest RAM), and
++//                hand the frame over as a FramePacket;
++//   RenderPacket (GL thread): put the parser's register state in g_state
++//                and Render() the frame (textures, EFB copies and the texture
++//                cache keep reading guest RAM here, as before).
++// With NWII_RENDER_WORKER on (default with a window), PrepFrame runs on its
++// own thread (core 2 on the Switch) and prepares frame N+1 while the render
++// thread draws frame N; whole frames change hands (one wake-up per frame, never
++// per draw). Off (NWII_RENDER_WORKER=0, headless, debug modes), both halves run
++// one after the other inside ProcessGXFifo, as before.
++//
++// Ownership: the parser state, the display-list and decode caches and every
++// DrawRaw / DecodedVerts reference count belong to the worker (HostPtr counts
++// are not atomic). The render thread only reads a packet's commands; the worker
++// destroys a packet's commands only after the render thread gave it back, and
++// it never touches a DecodedVerts' emit_cache (the renderer's). An emit-cache
++// entry that dies on the worker gives its arena slot back on the render thread
++// (renderer_gl.cpp, vbuf::ArenaFreeAny).
++namespace {
++struct PrepStats {
++    uint64_t parse_us = 0, decode_us = 0, draws = 0, dropped = 0, prep_cpu_us = 0;
++    uint64_t held = 0;  // XFB copies taken from the FIFO (worker: see s_held_frames)
++    uint64_t retracts = 0;  // ready frames the worker replaced with a newer one
++    uint64_t snap_draws = 0, draw_bytes = 0, dl_calls = 0, dl_bytes = 0, dl_us = 0, snap_us = 0,
++             dl_loadindx = 0, dl_hits = 0, decode_hits = 0, unknown = 0;
++    size_t carry = 0, buf = 0;
++    void add(const PrepStats &o) {
++        parse_us += o.parse_us; decode_us += o.decode_us; draws += o.draws; dropped += o.dropped;
++        held += o.held; retracts += o.retracts;
++        prep_cpu_us += o.prep_cpu_us; snap_draws += o.snap_draws; draw_bytes += o.draw_bytes;
++        dl_calls += o.dl_calls; dl_bytes += o.dl_bytes; dl_us += o.dl_us; snap_us += o.snap_us;
++        dl_loadindx += o.dl_loadindx; dl_hits += o.dl_hits; decode_hits += o.decode_hits;
++        unknown += o.unknown; carry = o.carry; buf = o.buf;
++    }
++};
++struct FramePacket {
++    std::vector<nwii::runtime::gx::GXCommand> frame;
++    std::vector<nwii::runtime::gx::GXCommand *> draws;  // frame's draws, in order
++    nwii::runtime::gx::ParseRenderState state;          // worker mode only
++    PrepStats stats;
++};
++PrepStats s_prep_pending;      // preparing side: counters since the last packet
++uint64_t s_prep_frames = 0;    // preparing side: frames produced
++PrepStats s_prof_acc;          // render side: counters of the taken packets ([GXPROF])
++
++// Worker hand-over. Two packets: one the render thread draws (s_rendering),
++// one the worker fills; a filled one waits in s_ready until it is taken.
++std::mutex s_pm;
++std::condition_variable s_cv_worker, s_cv_main;
++FramePacket s_pkts[2];
++FramePacket *s_ready = nullptr, *s_rendering = nullptr;
++bool s_stop = false;
++std::atomic<bool> s_worker_on{false};
++thread_local bool t_on_worker = false;
++#if defined(__SWITCH__)
++pthread_t s_worker_thread;
++#else
++std::thread *s_worker_thread = nullptr;  // never destroyed (exit paths)
+ #endif
+-        return thread_cpu_us();
+-    };
+-    uint64_t pt = s_ph ? ph_now() : 0;
+-    auto PH = [&](int i) { if (s_ph) { uint64_t t = ph_now(); g_ph[i] += t - pt; pt = t; } };
++// Memory report figures of the preparing side (GX_MemReport), refreshed by the
++// worker every ~2 s.
++struct PrepMem {
++    size_t parse_buf = 0, cmds = 0, dl_n = 0, dl_cmds = 0, dl_b = 0;
++} s_prep_mem;
++std::mutex s_prep_mem_m;
++}  // namespace
+ 
+-    
+-    
++namespace nwii::runtime::gx {
++void DLCacheMemStats(size_t& entries, size_t& cmds, size_t& bytes);
++}
++static PrepMem ComputePrepMem() {
++    using nwii::runtime::gx::GXCommand;
++    PrepMem m;
++    m.parse_buf = s_parse_buf.capacity();
++    m.cmds = (s_carry.capacity() + s_frame.capacity() + s_tail.capacity()) * sizeof(GXCommand) +
++             (s_draws.capacity() + s_carry_draws.capacity()) * sizeof(void *);
++    if (s_worker_on.load(std::memory_order_relaxed))
++        for (const auto &p : s_pkts)  // the render thread never resizes these
++            m.cmds += p.frame.capacity() * sizeof(GXCommand) + p.draws.capacity() * sizeof(void *);
++    nwii::runtime::gx::DLCacheMemStats(m.dl_n, m.dl_cmds, m.dl_b);
++    return m;
++}
++
++// True on the render worker thread (renderer_gl.cpp defers arena frees).
++bool GX_OnRenderWorker() { return t_on_worker; }
++
++// A frame packet the worker took back before the render thread took it (a
++// newer frame is complete): it becomes the dropped part of the next frame,
++// exactly as a drain that finds two frame ends drops the first one's draws.
++static void RetractToPrefix(FramePacket &pkt) {
++    auto &v = pkt.frame;
++    size_t w = 0;
++    for (size_t i = 0; i < v.size(); ++i) {
++        auto &c = v[i];
++        if (c.type == nwii::runtime::gx::GXCommandType::DrawPrimitive) continue;
++        if (c.type == nwii::runtime::gx::GXCommandType::BPRegister && c.reg == 0x52) {
++            if ((c.val & 0x4000) && !c.stale_copy) ++pkt.stats.dropped;
++            c.stale_copy = true;
++        }
++        if (w != i) v[w] = std::move(c);
++        ++w;
++    }
++    v.erase(v.begin() + w, v.end());
++    pkt.draws.clear();
++    ++pkt.stats.retracts;
++}
++
++// The preparing half of a drain (see above). Returns the packet a frame was
++// produced into (nullptr: none yet): the one `acquire` returns (called once a frame end is
++// parsed; `retracted`: it hands back a packet not rendered yet, whose
++// commands become the dropped start of this frame). apply_now: the render
++// thread is the caller (no worker): the parser state goes to g_state right
++// after each parse, as the single-threaded drain always did.
++static FramePacket *PrepFrame(FramePacket *(*acquire)(bool &retracted), bool apply_now) {
++    if (PhOn()) s_ph_t = PhNow();
+     if (s_host_tid.load(std::memory_order_relaxed) != std::this_thread::get_id())
+         s_host_tid.store(std::this_thread::get_id(), std::memory_order_relaxed);
+     TrimBuffers();
+     {
+         std::lock_guard<FifoLock> lock(g_fifo_mutex);
++        if (!apply_now) {  // worker: still not taken by the render thread
++            s_held_frames += s_fifo_frames;
++            s_prep_pending.held += s_fifo_frames;
++        }
+         s_fifo_frames = 0;  // every queued byte is taken below
+         if (s_parse_buf.empty()) {
+             // Nothing carried over: take the guest's buffer as is and leave
+@@ -394,13 +538,14 @@
+             TrimVec(g_hw_fifo, s_hw_bytes.get());
+     }
+     s_hw_bytes.note(s_parse_buf.size(), std::chrono::steady_clock::now());
+-    if (s_parse_buf.empty()) return;
++    if (s_parse_buf.empty()) return nullptr;
+ 
+     const uint64_t cpu0 = thread_cpu_us();
+-    struct DrainCpu {
++    struct PrepCpu {
+         uint64_t c0;
+-        ~DrainCpu() { g_prof_drain_cpu_us += thread_cpu_us() - c0; }
+-    } drain_cpu{cpu0};
++        bool armed = true;
++        ~PrepCpu() { if (armed) s_prep_pending.prep_cpu_us += thread_cpu_us() - c0; }
++    } prep_cpu{cpu0};
+     auto t0 = std::chrono::steady_clock::now();
+     // R7 perf: parse straight onto the commands carried over from earlier
+     // drains (a frame usually arrives over several 1 ms polls): parsing into
+@@ -413,9 +558,16 @@
+     const size_t carried = s_carry.size();
+     PH(7);
+     nwii::runtime::gx::FifoParser::Parse(s_parse_buf, s_carry);
++    if (apply_now) {
++        // Same thread renders: the parser's register state reaches g_state
++        // at the end of every parse, as when the parser wrote it directly.
++        static nwii::runtime::gx::ParseRenderState *st = new nwii::runtime::gx::ParseRenderState;
++        nwii::runtime::gx::FifoParser::TakeRenderState(*st);
++        nwii::runtime::gx::FifoParser::ApplyRenderState(*st);
++    }
+     PH(0);
+     auto t1 = std::chrono::steady_clock::now();
+-    g_stat_parse_us +=
++    s_prep_pending.parse_us +=
+         std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+ 
+     static const bool s_sample = NWII_ENV("NWII_SAMPLE") != nullptr;
+@@ -441,15 +593,9 @@
+     if (s_parse_buf.size() > (4u << 20))
+         s_parse_buf.clear();
+ 
+-    
+-
+-    // "sometimes only Press any button" frames. Dolphin has no such boundary
+-
+-    
+-    
+     PH(1);
+     int last_frame_end = -1;
+-    int prev_frame_end = -1; 
++    int prev_frame_end = -1;
+     for (size_t i = carried; i < s_carry.size(); ++i) {
+         const auto &c = s_carry[i];
+         if (c.type == nwii::runtime::gx::GXCommandType::DrawPrimitive)
+@@ -462,18 +608,26 @@
+     }
+     PH(2);
+     if (last_frame_end < 0)
+-        return; 
++        return nullptr;
++    bool retracted = false;
++    FramePacket &pkt = *acquire(retracted);
++    static nwii::runtime::gx::ParseRenderState *s_prev_state = new nwii::runtime::gx::ParseRenderState;
++    PrepStats prev_stats;
++    if (retracted) {
++        RetractToPrefix(pkt);
++        *s_prev_state = pkt.state;
++        prev_stats = pkt.stats;
++    } else if (!pkt.frame.empty() || !pkt.draws.empty()) {
++        // The render thread is done with this packet's last frame: its
++        // commands die here (worker: on the worker thread).
++        pkt.frame.clear();
++        pkt.draws.clear();
++    }
+     // NWII_NOFRAMESKIP=1: render every frame of the batch (only the last one
+     // is presented), so EFB copies of earlier frames are made with their draws.
+     static const bool s_noskip = NWII_ENV("NWII_NOFRAMESKIP") != nullptr;
+     if (s_noskip) prev_frame_end = -1;
+ 
+-    
+-
+-    
+-
+-    
+-
+     // NWII_FRAMELOG=1: per drained batch, how many frame ends (XFB copies)
+     // it held and how many draws frame-skip dropped.
+     static const bool framelog = NWII_ENV("NWII_FRAMELOG") != nullptr;
+@@ -489,12 +643,12 @@
+             }
+         }
+         printf("[FRAMELOG] f=%llu xfb_copies=%d tex_copies=%d draws=%d dropped=%d\n",
+-               (unsigned long long)g_stat_frames, ends, tex, draws, dropped);
++               (unsigned long long)s_prep_frames, ends, tex, draws, dropped);
+     }
+     auto &frame = s_frame;
+     frame.clear();
+-    struct FrameClear { decltype(PH)& ph; ~FrameClear() { s_draws.clear(); frame.clear(); ph(6); } } frame_clear{PH};
+-    if (prev_frame_end < 0) {
++    s_draws.clear();
++    if (prev_frame_end < 0 && !retracted) {
+         // Nothing to drop (the usual case at full speed): move only the
+         // commands after the frame end (the next frame's start) out, and
+         // take the rest as the frame without touching it.
+@@ -508,7 +662,6 @@
+         s_carry.swap(tail);
+         // Draw positions: the frame keeps those up to its end (same
+         // indices), the carried-over tail gets the rest, rebased.
+-        s_draws.clear();
+         size_t k = 0;
+         for (; k < s_carry_draws.size() && (int)s_carry_draws[k] <= last_frame_end; ++k)
+             s_draws.push_back(&frame[s_carry_draws[k]]);
+@@ -517,12 +670,15 @@
+             s_carry_draws[w++] = s_carry_draws[k] - (uint32_t)(last_frame_end + 1);
+         s_carry_draws.resize(w);
+     } else {
+-    frame.reserve(s_carry.size());
++    frame.reserve(pkt.frame.size() + s_carry.size());
++    // R11: a retracted packet's commands (draws already dropped) come first.
++    for (auto &c : pkt.frame) frame.push_back(std::move(c));
++    pkt.frame.clear();
+     for (int i = 0; i <= last_frame_end; ++i) {
+         auto &c = s_carry[i];
+         if (i <= prev_frame_end &&
+             c.type == nwii::runtime::gx::GXCommandType::DrawPrimitive)
+-            continue; 
++            continue;
+         // EFB copies of the dropped frames would capture an EFB without their
+         // draws (one-shot render-to-texture would keep that garbage); only
+         // their clears run.
+@@ -530,12 +686,11 @@
+             c.type == nwii::runtime::gx::GXCommandType::BPRegister &&
+             c.reg == 0x52) {
+             c.stale_copy = true;
+-            if (c.val & 0x4000) ++g_prof_dropped_frames;
++            if (c.val & 0x4000) ++s_prep_pending.dropped;
+         }
+         frame.push_back(std::move(c));
+     }
+     s_carry.erase(s_carry.begin(), s_carry.begin() + last_frame_end + 1);
+-    s_draws.clear();
+     for (auto &c : frame)
+         if (c.type == nwii::runtime::gx::GXCommandType::DrawPrimitive)
+             s_draws.push_back(&c);
+@@ -547,9 +702,10 @@
+ 
+     // NWII_FRAMESIG: per-frame signature (draw count + TEV colour/konst regs
+     // + alpha test). If the WARNING "press" blink exists in our command
+-    // stream, some field here must alternate between frames.
++    // stream, some field here must alternate between frames. (Reads g_state:
++    // keeps the drain on the render thread.)
+     static const bool framesig = NWII_ENV("NWII_FRAMESIG") != nullptr;
+-    if (framesig && g_stat_frames < 240) {
++    if (framesig && s_prep_frames < 240) {
+         size_t draws = 0, verts = 0;
+         for (const auto &c : frame)
+             if (c.type == nwii::runtime::gx::GXCommandType::DrawPrimitive) {
+@@ -578,7 +734,7 @@
+         }
+         uint32_t tevsig = 0;
+         for (int r = 0xE0; r <= 0xE7; r++) tevsig = tevsig * 33 + g_state.bp[r];
+-        std::cout << "[FRAMESIG] f=" << g_stat_frames << " draws=" << draws
++        std::cout << "[FRAMESIG] f=" << s_prep_frames << " draws=" << draws
+                   << " verts=" << verts << " tev=" << std::hex << tevsig
+                   << " draw=" << drawsig << " xf=" << xfsig
+                   << " ram=" << ramsig
+@@ -588,7 +744,7 @@
+ 
+     PH(3);
+     s_hw_cmds.note(std::max(frame.size(), s_carry.size()), t1);
+-    ++g_stat_frames;
++    ++s_prep_frames;
+     // Decode only the surviving frame's draws (stale frames' draws were
+     // dropped above and their vertices are never built).
+     auto d0 = std::chrono::steady_clock::now();
+@@ -639,88 +795,156 @@
+             }
+         }
+         nwii::runtime::gx::FifoParser::DecodeDraw(*s_draws[i]);
+-        ++g_stat_draws;
+     }
++    s_prep_pending.draws += nd;
+     PH(4);
+     auto d1 = std::chrono::steady_clock::now();
+-    uint64_t decode_us =
++    s_prep_pending.decode_us +=
+         std::chrono::duration_cast<std::chrono::microseconds>(d1 - d0).count();
+-    g_stat_parse_us += decode_us;
+ 
+-    // [GXPROF]: once a second, split the drain cost by cause. Prints in
+-    // headless too (the [STAT] line is window-only), so the 3D-scene
+-    // bottleneck can be measured without a display.
+-    {
+-        namespace fp = nwii::runtime::gx;
+-        extern uint64_t g_prof_decode_us_accum;
+-        g_prof_decode_us_accum += decode_us;
+-        static auto last = std::chrono::steady_clock::now();
+-        auto now = std::chrono::steady_clock::now();
+-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last).count() >= 2) {
+-            last = now;
+-            extern uint64_t g_prof_gl_draws, g_prof_gx_draws, g_prof_stitches;
+-            extern uint64_t g_prof_shader_compiles, g_prof_shader_loads,
+-                g_prof_shader_us, g_prof_shader_skips;
+-            extern uint64_t nwii_stat_shaders();
+-            extern uint64_t g_prof_tex_uploads, g_prof_tex_bind_saves;
+-            const uint64_t rf = g_prof_render_frames ? g_prof_render_frames : 1;
+-            std::cout << "[RPROF] frames=" << g_prof_render_frames
+-                      << " render_us/frame=" << g_prof_render_us / rf
+-                      << " render_max_us=" << g_prof_render_max_us
+-                      << " render_cpu_us/frame=" << g_prof_render_cpu_us / rf
+-                      << " drain_cpu_us/frame=" << g_prof_drain_cpu_us / rf
+-                      << " gx_draws/frame=" << g_prof_gx_draws / rf
+-                      << " gl_draws/frame=" << g_prof_gl_draws / rf
+-                      << " stitches/frame=" << g_prof_stitches / rf
+-                      << " shaders: new=" << g_prof_shader_compiles
+-                      << " disk=" << g_prof_shader_loads
+-                      << " ms=" << g_prof_shader_us / 1000
+-                      << " skipped_draws=" << g_prof_shader_skips
+-                      << " programs=" << nwii_stat_shaders()
+-                      << " dropped_frames=" << g_prof_dropped_frames
+-                      << " tex_uploads=" << g_prof_tex_uploads
+-                      << " tex_bind_fixes=" << g_prof_tex_bind_saves;
+-            if (g_prof_gpu_frames)
+-                std::cout << " gpu_us/frame=" << g_prof_gpu_us / g_prof_gpu_frames;
+-            std::cout << "\n";
+-            g_prof_gpu_us = g_prof_gpu_frames = 0;
+-            g_prof_dropped_frames = 0;
+-            g_prof_tex_bind_saves = 0;
+-            g_prof_tex_uploads = 0;
+-            g_prof_shader_compiles = g_prof_shader_loads = 0;
+-            g_prof_shader_us = g_prof_shader_skips = 0;
+-            g_prof_render_us = g_prof_render_frames = 0;
+-            g_prof_render_max_us = 0;
+-            g_prof_render_cpu_us = g_prof_drain_cpu_us = 0;
+-            g_prof_stitches = 0;
+-            g_prof_gl_draws = g_prof_gx_draws = 0;
+-            std::cout << "[GXPROF] parse+decode_ms=" << g_stat_parse_us / 1000
+-                      << " (decode_ms=" << g_prof_decode_us_accum / 1000 << ")"
+-                      << " draws_snap=" << fp::g_prof_draws
+-                      << " draw_bytes=" << fp::g_prof_draw_bytes
+-                      << " dl_calls=" << fp::g_prof_dl_calls
+-                      << " dl_bytes=" << fp::g_prof_dl_bytes
+-                      << " dl_ms=" << fp::g_prof_dl_us / 1000
+-                      << " snap_ms=" << fp::g_prof_snap_us / 1000
+-                      << " dl_loadindx=" << fp::g_prof_dl_loadindx
+-                      << " dl_hits=" << fp::g_prof_dl_hits
+-                      << " decode_hits=" << fp::g_prof_decode_hits
+-                      << " unknown=" << fp::g_prof_unknown
+-                      << " carry=" << s_carry.size()
+-                      << " buf=" << s_parse_buf.size() << "\n";
+-            g_prof_decode_us_accum = 0;
+-            fp::g_prof_draws = 0;
+-            fp::g_prof_draw_bytes = 0;
+-            fp::g_prof_dl_calls = 0;
+-            fp::g_prof_dl_bytes = 0;
+-            fp::g_prof_unknown = 0;
+-            fp::g_prof_dl_us = 0;
+-            fp::g_prof_snap_us = 0;
+-            fp::g_prof_dl_loadindx = 0;
+-            fp::g_prof_dl_hits = 0;
+-            fp::g_prof_decode_hits = 0;
++    // Hand the frame over: the packet's (empty) vectors become the next
++    // frame's, so their capacity is reused.
++    pkt.frame.swap(s_frame);
++    pkt.draws.swap(s_draws);
++    if (!apply_now) {
++        nwii::runtime::gx::FifoParser::TakeRenderState(pkt.state);
++        if (retracted) {
++            // The retracted frame's BP seeds were never applied: they go
++            // first, this parse's override them (as one drain of both).
++            auto &n = pkt.state;
++            const auto &o = *s_prev_state;
++            for (int w = 0; w < 4; ++w) {
++                for (uint64_t m = o.seed_mask[w] & ~n.seed_mask[w]; m; m &= m - 1) {
++                    const int r = w * 64 + __builtin_ctzll(m);
++                    n.seed_bp[r] = o.seed_bp[r];
++                }
++                n.seed_mask[w] |= o.seed_mask[w];
++            }
++            for (int k = 0; k < 8; ++k) {
++                if ((o.seed_kmask & ~n.seed_kmask) & (1u << k))
++                    n.seed_konst[k / 2][k & 1] = o.seed_konst[k / 2][k & 1];
++                if ((o.seed_cmask & ~n.seed_cmask) & (1u << k))
++                    n.seed_color[k / 2][k & 1] = o.seed_color[k / 2][k & 1];
++            }
++            n.seed_kmask |= o.seed_kmask;
++            n.seed_cmask |= o.seed_cmask;
+         }
+     }
++    {
++        namespace fp = nwii::runtime::gx;
++        PrepStats &p = s_prep_pending;
++        p.snap_draws = fp::g_prof_draws; fp::g_prof_draws = 0;
++        p.draw_bytes = fp::g_prof_draw_bytes; fp::g_prof_draw_bytes = 0;
++        p.dl_calls = fp::g_prof_dl_calls; fp::g_prof_dl_calls = 0;
++        p.dl_bytes = fp::g_prof_dl_bytes; fp::g_prof_dl_bytes = 0;
++        p.unknown = fp::g_prof_unknown; fp::g_prof_unknown = 0;
++        p.dl_us = fp::g_prof_dl_us; fp::g_prof_dl_us = 0;
++        p.snap_us = fp::g_prof_snap_us; fp::g_prof_snap_us = 0;
++        p.dl_loadindx = fp::g_prof_dl_loadindx; fp::g_prof_dl_loadindx = 0;
++        p.dl_hits = fp::g_prof_dl_hits; fp::g_prof_dl_hits = 0;
++        p.decode_hits = fp::g_prof_decode_hits; fp::g_prof_decode_hits = 0;
++        p.carry = s_carry.size();
++        p.buf = s_parse_buf.size();
++    }
++    s_prep_pending.prep_cpu_us += thread_cpu_us() - cpu0;
++    prep_cpu.armed = false;
++    prev_stats.add(s_prep_pending);  // (prev_stats is empty unless retracted)
++    pkt.stats = prev_stats;
++    s_prep_pending = PrepStats{};
++    if (!apply_now) {
++        // Worker: memory figures for GX_MemReport every ~2 s.
++        static auto last = std::chrono::steady_clock::time_point{};
++        if (d1 - last >= std::chrono::seconds(2)) {
++            last = d1;
++            const PrepMem m = ComputePrepMem();
++            std::lock_guard<std::mutex> lk(s_prep_mem_m);
++            s_prep_mem = m;
++        }
++    }
++    return &pkt;
++}
++
++// [RPROF] / [GXPROF] once every 2 s (render thread).
++static void PrintProf() {
++    static auto last = std::chrono::steady_clock::now();
++    auto now = std::chrono::steady_clock::now();
++    if (std::chrono::duration_cast<std::chrono::seconds>(now - last).count() < 2) return;
++    last = now;
++    extern uint64_t g_prof_gl_draws, g_prof_gx_draws, g_prof_stitches;
++    extern uint64_t g_prof_shader_compiles, g_prof_shader_loads,
++        g_prof_shader_us, g_prof_shader_skips;
++    extern uint64_t nwii_stat_shaders();
++    extern uint64_t g_prof_tex_uploads, g_prof_tex_bind_saves;
++    extern uint64_t g_prof_decode_us_accum;
++    const uint64_t rf = g_prof_render_frames ? g_prof_render_frames : 1;
++    std::cout << "[RPROF] frames=" << g_prof_render_frames
++              << " render_us/frame=" << g_prof_render_us / rf
++              << " render_max_us=" << g_prof_render_max_us
++              << " render_cpu_us/frame=" << g_prof_render_cpu_us / rf
++              << " drain_cpu_us/frame=" << g_prof_drain_cpu_us / rf
++              << " gx_draws/frame=" << g_prof_gx_draws / rf
++              << " gl_draws/frame=" << g_prof_gl_draws / rf
++              << " stitches/frame=" << g_prof_stitches / rf
++              << " shaders: new=" << g_prof_shader_compiles
++              << " disk=" << g_prof_shader_loads
++              << " ms=" << g_prof_shader_us / 1000
++              << " skipped_draws=" << g_prof_shader_skips
++              << " programs=" << nwii_stat_shaders()
++              << " dropped_frames=" << g_prof_dropped_frames
++              << " tex_uploads=" << g_prof_tex_uploads
++              << " tex_bind_fixes=" << g_prof_tex_bind_saves;
++    if (g_prof_gpu_frames)
++        std::cout << " gpu_us/frame=" << g_prof_gpu_us / g_prof_gpu_frames;
++    // R11: preparing half (parse, decode) per frame, on the render worker
++    // (worker=1) or inside drain_cpu (worker=0).
++    std::cout << " prep_cpu_us/frame=" << s_prof_acc.prep_cpu_us / rf
++              << " worker=" << (s_worker_on.load(std::memory_order_relaxed) ? 1 : 0)
++              << " retracts=" << s_prof_acc.retracts << " held=" << [] {
++                     std::lock_guard<FifoLock> lock(g_fifo_mutex);
++                     return s_held_frames;
++                 }();
++    std::cout << "\n";
++    g_prof_gpu_us = g_prof_gpu_frames = 0;
++    g_prof_dropped_frames = 0;
++    g_prof_tex_bind_saves = 0;
++    g_prof_tex_uploads = 0;
++    g_prof_shader_compiles = g_prof_shader_loads = 0;
++    g_prof_shader_us = g_prof_shader_skips = 0;
++    g_prof_render_us = g_prof_render_frames = 0;
++    g_prof_render_max_us = 0;
++    g_prof_render_cpu_us = g_prof_drain_cpu_us = 0;
++    g_prof_stitches = 0;
++    g_prof_gl_draws = g_prof_gx_draws = 0;
++    const PrepStats &a = s_prof_acc;
++    std::cout << "[GXPROF] parse+decode_ms=" << (a.parse_us + a.decode_us) / 1000
++              << " (decode_ms=" << g_prof_decode_us_accum / 1000 << ")"
++              << " draws_snap=" << a.snap_draws
++              << " draw_bytes=" << a.draw_bytes
++              << " dl_calls=" << a.dl_calls
++              << " dl_bytes=" << a.dl_bytes
++              << " dl_ms=" << a.dl_us / 1000
++              << " snap_ms=" << a.snap_us / 1000
++              << " dl_loadindx=" << a.dl_loadindx
++              << " dl_hits=" << a.dl_hits
++              << " decode_hits=" << a.decode_hits
++              << " unknown=" << a.unknown
++              << " carry=" << a.carry
++              << " buf=" << a.buf << "\n";
++    g_prof_decode_us_accum = 0;
++    s_prof_acc = PrepStats{};
++}
++
++// The rendering half: one prepared frame (render thread).
++static void RenderPacket(FramePacket &pkt, bool worker) {
++    extern uint64_t g_prof_decode_us_accum;
++    ++g_stat_frames;
++    g_stat_draws += pkt.stats.draws;
++    g_stat_parse_us += pkt.stats.parse_us + pkt.stats.decode_us;
++    g_prof_dropped_frames += pkt.stats.dropped;
++    g_prof_decode_us_accum += pkt.stats.decode_us;
++    s_prof_acc.add(pkt.stats);
++    PrintProf();
++    if (worker) nwii::runtime::gx::FifoParser::ApplyRenderState(pkt.state);
+ 
+     if (g_window) {
+         if (!g_renderer) {
+@@ -732,8 +956,8 @@
+             const uint64_t rc0 = thread_cpu_us();
+             const bool gpuprof = g_gpu_timer.on();
+             if (gpuprof) g_gpu_timer.begin();
+-            nwii::runtime::gx::g_render_draws = &s_draws;
+-            g_renderer->Render(frame);
++            nwii::runtime::gx::g_render_draws = &pkt.draws;
++            g_renderer->Render(pkt.frame);
+             nwii::runtime::gx::g_render_draws = nullptr;
+             if (gpuprof) g_gpu_timer.end();
+             g_prof_render_cpu_us += thread_cpu_us() - rc0;
+@@ -747,11 +971,227 @@
+             ++g_prof_render_frames;
+         }
+     }
++    // Test knobs (R11): make the render thread slow, as on the Switch, so the
++    // worker's frame replacement and the guest's backpressure get exercised on
++    // a fast PC. NWII_R11_SLOW_RENDER_US=<us> after every frame;
++    // NWII_R11_STALL=<frame>,<ms>: one long stall at that frame (a shader
++    // compile on the Switch).
++    static const long slow_us = [] {
++        const char *e = NWII_ENV("NWII_R11_SLOW_RENDER_US");
++        return e ? std::atol(e) : 0L;
++    }();
++    static long stall_frame = -1, stall_ms = 0;
++    static const bool stall_init = [] {
++        if (const char *e = NWII_ENV("NWII_R11_STALL")) std::sscanf(e, "%ld,%ld", &stall_frame, &stall_ms);
++        return true;
++    }();
++    (void)stall_init;
++    if (slow_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(slow_us));
++    if (stall_frame >= 0 && (long)g_stat_frames == stall_frame) {
++        std::printf("[GX] R11 test stall: %ld ms at frame %ld\n", stall_ms, stall_frame);
++        std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms));
++    }
++}
++
++static void WorkerMain() {
++    t_on_worker = true;
++#ifdef __SWITCH__
++    // Homebrew gets cores 0-2: render (main) on 0, the recompiled CPU on 1,
++    // audio (AX mixer, audren output) on 2, a few % busy. One priority step
++    // below the default (0x2C) so the AX mixer and the audio output always
++    // preempt it. NWII_RENDER_WORKER_CORE / _PRIO override.
++    {
++        u64 allowed = 0;
++        svcGetInfo(&allowed, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
++        const char *ce = std::getenv("NWII_RENDER_WORKER_CORE");
++        const int want = ce ? std::atoi(ce) : 2;
++        int core = -1;
++        for (int c : {want, 2, 0})
++            if (c >= 0 && c < 3 && (allowed & (1ull << c)) &&
++                R_SUCCEEDED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, c, 1u << c))) {
++                core = c;
++                break;
++            }
++        const char *pe = std::getenv("NWII_RENDER_WORKER_PRIO");
++        const int prio = pe ? (int)std::strtol(pe, nullptr, 0) : 0x2D;
++        const Result rc = svcSetThreadPriority(CUR_THREAD_HANDLE, prio);
++        std::printf("[NX] render worker thread on core %d, priority 0x%X%s (allowed mask 0x%llx)\n",
++                    core, prio, R_SUCCEEDED(rc) ? "" : " (failed)", (unsigned long long)allowed);
++        nwii::runtime::nx::note_thread(nwii::runtime::nx::kThreadGxw);
++    }
++#endif
++    using clk = std::chrono::steady_clock;
++    static const auto poll = std::chrono::microseconds([] {
++        const char *e = NWII_ENV("NWII_PRESENT_POLL_US");
++        long v = e ? std::atol(e) : 1000;
++        return v < 100 ? 100L : v > 8000 ? 8000L : v;
++    }());
++    // The packet to fill once a frame end is parsed: the waiting one if the
++    // render thread has not taken it (it is then replaced by a newer frame,
++    // as the single-threaded drain always rendered the newest one), else the
++    // one the render thread is not drawing.
++    // NWII_NOFRAMESKIP renders every frame: wait for the render thread to take
++    // the waiting one instead.
++    static FramePacket *(*const acquire)(bool &) = [](bool &retracted) -> FramePacket * {
++        static const bool noskip = NWII_ENV("NWII_NOFRAMESKIP") != nullptr;
++        std::unique_lock<std::mutex> lk(s_pm);
++        if (noskip) s_cv_worker.wait(lk, [] { return !s_ready || s_stop; });
++        if (FramePacket *p = s_ready) {
++            s_ready = nullptr;
++            retracted = true;
++            return p;
++        }
++        return s_rendering == &s_pkts[0] ? &s_pkts[1] : &s_pkts[0];
++    };
++    auto last_frame = clk::now();
++    for (;;) {
++        if (FramePacket *fill = PrepFrame(acquire, false)) {
++            {
++                std::lock_guard<std::mutex> lk(s_pm);
++                s_ready = fill;
++            }
++            s_cv_main.notify_one();
++            last_frame = clk::now();
++        }
++        // Look again in a poll interval (4 of them after 25 ms without a
++        // frame), like the frontend's drain loop did.
++        const auto d = clk::now() - last_frame > std::chrono::milliseconds(25) ? 4 * poll : poll;
++        std::unique_lock<std::mutex> lk(s_pm);
++        s_cv_worker.wait_for(lk, d, [] { return s_stop; });
++        if (s_stop) return;
++    }
++}
++
++static bool WorkerWanted() {
++    if (!g_window) return false;  // headless: no render, nothing to overlap
++    const char *e = NWII_ENV("NWII_RENDER_WORKER");
++    if (e && e[0] == '0') {
++        std::printf("[GX] render worker: off (NWII_RENDER_WORKER=0)\n");
++        return false;
++    }
++    // Debug modes that read render-thread state while parsing, time the
++    // drain phases on one thread, or signal the PE from the parser.
++    static const char *const kInline[] = {"NWII_R7PH", "NWII_FRAMESIG", "NWII_LATE_SYNC"};
++    for (const char *d : kInline)
++        if (std::getenv(d)) {
++            std::printf("[GX] render worker: off (%s)\n", d);
++            return false;
++        }
++    return true;
++}
++
++void GX_StopWorker();
++static void StartWorker() {
++#if defined(__SWITCH__)
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    pthread_attr_setstacksize(&attr, 1u << 20);
++    const int rc = pthread_create(
++        &s_worker_thread, &attr, [](void *) -> void * { WorkerMain(); return nullptr; }, nullptr);
++    pthread_attr_destroy(&attr);
++    if (rc != 0) {
++        std::printf("[GX] render worker: thread start failed (%d), drain on the render thread\n", rc);
++        return;
++    }
++#else
++    s_worker_thread = new std::thread(WorkerMain);
++#endif
++    s_worker_on.store(true);
++    // An exit() elsewhere (the main loop calls GX_StopWorker itself) must not
++    // run static destructors (display-list cache...) under a running worker.
++    std::atexit([] { GX_StopWorker(); });
++    std::printf("[GX] render worker: on (FIFO parse + decode on their own thread, whole frames "
++                "handed to the render thread; NWII_RENDER_WORKER=0 disables)\n");
++}
++
++// Main loop, at exit (before the GL context goes): stop and join the worker.
++void GX_StopWorker() {
++    if (!s_worker_on.load()) return;
++    {
++        std::lock_guard<std::mutex> lk(s_pm);
++        s_stop = true;
++    }
++    s_cv_worker.notify_all();
++    s_cv_main.notify_all();
++#if defined(__SWITCH__)
++    pthread_join(s_worker_thread, nullptr);
++#else
++    s_worker_thread->join();
++#endif
++    s_worker_on.store(false);
++}
++
++// Frame-paced main loop: wait for the next drain. Without the worker, sleep
++// `poll_us` (the drain polls the FIFO); with it, wake as soon as a frame is
++// ready, at most `max_us` later.
++void GX_HostWait(int64_t poll_us, int64_t max_us) {
++    if (!s_worker_on.load(std::memory_order_relaxed)) {
++        std::this_thread::sleep_for(std::chrono::microseconds(poll_us));
++        return;
++    }
++    std::unique_lock<std::mutex> lk(s_pm);
++    s_cv_main.wait_for(lk, std::chrono::microseconds(max_us),
++                       [] { return s_ready != nullptr || s_stop; });
++}
++
++// Seconds of CPU time the worker used so far (-1: no worker / unknown).
++double GX_WorkerCpuSeconds() {
++#if defined(__linux__) && !defined(__SWITCH__)
++    if (!s_worker_on.load(std::memory_order_relaxed)) return -1;
++    clockid_t cid;
++    if (pthread_getcpuclockid(s_worker_thread->native_handle(), &cid) != 0) return -1;
++    timespec ts{};
++    clock_gettime(cid, &ts);
++    return ts.tv_sec + ts.tv_nsec * 1e-9;
++#else
++    return -1;
++#endif
++}
++
++void ProcessGXFifo() {
++    static const bool worker = [] {
++        if (WorkerWanted()) StartWorker();
++        return s_worker_on.load();
++    }();
++    if (worker) {
++        FramePacket *p;
++        {
++            std::lock_guard<std::mutex> lk(s_pm);
++            p = s_ready;
++            if (!p) return;
++            s_ready = nullptr;
++            s_rendering = p;
++        }
++        {
++            // Its frames are taken now (see s_held_frames).
++            std::lock_guard<FifoLock> lock(g_fifo_mutex);
++            s_held_frames -= (uint32_t)p->stats.held;
++        }
++        static const bool noskip = NWII_ENV("NWII_NOFRAMESKIP") != nullptr;
++        if (noskip) s_cv_worker.notify_one();  // the worker may wait for this
++        const uint64_t c0 = thread_cpu_us();
++        RenderPacket(*p, true);
++        g_prof_drain_cpu_us += thread_cpu_us() - c0;
++        std::lock_guard<std::mutex> lk(s_pm);
++        s_rendering = nullptr;  // the worker frees its commands
++        return;
++    }
++    static FramePacket *s_inline = new FramePacket;
++    const uint64_t c0 = thread_cpu_us();
++    if (!PrepFrame([](bool &) { return s_inline; }, true)) {
++        g_prof_drain_cpu_us += thread_cpu_us() - c0;
++        return;
++    }
++    RenderPacket(*s_inline, false);
+     PH(5);
+-    if (s_ph && ++g_ph_n == 120) {
++    s_inline->frame.clear();
++    s_inline->draws.clear();
++    PH(6);
++    g_prof_drain_cpu_us += thread_cpu_us() - c0;
++    if (PhOn() && ++g_ph_n == 120) {
+         uint64_t tot = 0;
+         for (auto x : g_ph) tot += x;
+-        printf("[R7PH] %s/frame total=%llu ", s_ph_fd >= 0 ? "kcyc" : "us", (unsigned long long)tot / 120);
++        printf("[R7PH] %s/frame total=%llu ", PhFd() >= 0 ? "kcyc" : "us", (unsigned long long)tot / 120);
+         printf("parse=%llu carry=%llu scan=%llu split=%llu decode=%llu render=%llu destroy=%llu pre=%llu\n",
+                (unsigned long long)g_ph[0]/120, (unsigned long long)g_ph[1]/120, (unsigned long long)g_ph[2]/120,
+                (unsigned long long)g_ph[3]/120, (unsigned long long)g_ph[4]/120, (unsigned long long)g_ph[5]/120,
+@@ -767,24 +1207,26 @@
+ // backlog), the display-list cache, display-list snapshots, GL textures of the
+ // texture cache and EFB copies, and the shader programs. Host thread only (the
+ // thread that drains the FIFO and renders). Returns the bytes it accounts for.
+-namespace nwii::runtime::gx {
+-void DLCacheMemStats(size_t& entries, size_t& cmds, size_t& bytes);
+-}
+ void GX_RendererMemStats(size_t &programs, size_t &state_keys, size_t &cache_bytes,
+                          size_t &batch_bytes);
+ size_t GX_MemReport(char* out, size_t n) {
+-    using nwii::runtime::gx::GXCommand;
+     size_t hw_cap;
+     {
+         std::lock_guard<FifoLock> lock(g_fifo_mutex);
+         hw_cap = g_hw_fifo.capacity();
+     }
+-    const size_t fifo = hw_cap + s_parse_buf.capacity();
+-    const size_t cmds = (s_carry.capacity() + s_frame.capacity() + s_tail.capacity()) *
+-                            sizeof(GXCommand) +
+-                        (s_draws.capacity() + s_carry_draws.capacity()) * sizeof(void*);
+-    size_t dl_n = 0, dl_cmds = 0, dl_b = 0;
+-    nwii::runtime::gx::DLCacheMemStats(dl_n, dl_cmds, dl_b);
++    // R11: the parse-side buffers and caches belong to the render worker
++    // when it runs (figures it refreshes every ~2 s).
++    PrepMem pm;
++    if (s_worker_on.load()) {
++        std::lock_guard<std::mutex> lk(s_prep_mem_m);
++        pm = s_prep_mem;
++    } else {
++        pm = ComputePrepMem();
++    }
++    const size_t fifo = hw_cap + pm.parse_buf;
++    const size_t cmds = pm.cmds;
++    const size_t dl_n = pm.dl_n, dl_cmds = pm.dl_cmds, dl_b = pm.dl_b;
+     size_t snap_n = 0, snap_b = 0;
+     {
+         std::lock_guard<std::mutex> lk(g_dl_snap_mtx);
+@@ -1033,7 +1475,7 @@
+         if (s_wg_xfb) {
+             s_wg_xfb = false;
+             const uint32_t max = FifoMaxFrames();
+-            s_wg_full = ++s_fifo_frames >= max && max != 0;
++            s_wg_full = ++s_fifo_frames + s_held_frames >= max && max != 0;
+         }
+     }
+     if (__builtin_expect(s_wcheck_f != nullptr, 0) && s_wcheck_fn < (512u << 20)) {
+@@ -1166,7 +1608,7 @@
+         // BP 0x52 with bit 14: the copy to the XFB that ends a game frame.
+         if (bp && (val >> 24) == 0x52 && (val & 0x4000)) {
+             const uint32_t max = FifoMaxFrames();
+-            full = ++s_fifo_frames >= max && max != 0;
++            full = ++s_fifo_frames + s_held_frames >= max && max != 0;
+         }
+     }
+     if (__builtin_expect(full, 0)) FifoWaitForHost();
+diff --color -ruN r11base/nWiiRuntime/src/platform/switch/switch_platform.cpp r11a/nWiiRuntime/src/platform/switch/switch_platform.cpp
+--- r11base/nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-11-08 10:19:12.717760282 -0500
++++ r11a/nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-11-08 11:21:57.362254046 -0500
+@@ -627,7 +627,7 @@
+ // R8: per-thread CPU time for fps_log ("threads main x% cpu y% ax z%"), from
+ // the kernel's per-thread tick count (19.2 MHz).
+ static std::atomic<Handle> g_thread_handles[kThreadSlots];
+-static const char *const kThreadNames[kThreadSlots] = {"main", "cpu", "ax", "aud"};
++static const char *const kThreadNames[kThreadSlots] = {"main", "cpu", "ax", "aud", "gxw"};
+ 
+ void note_thread(int slot) {
+   if (slot >= 0 && slot < kThreadSlots)
+diff --color -ruN r11base/nWiiRuntime/src/platform/switch/switch_platform.h r11a/nWiiRuntime/src/platform/switch/switch_platform.h
+--- r11base/nWiiRuntime/src/platform/switch/switch_platform.h	2026-11-08 10:18:01.950584914 -0500
++++ r11a/nWiiRuntime/src/platform/switch/switch_platform.h	2026-11-08 11:21:57.360701492 -0500
+@@ -27,8 +27,10 @@
+ bool cpu_thread_done();
+ 
+ // R8: the calling thread is one of the threads fps_log reports CPU time for
+-// (0 main/render, 1 recompiled CPU, 2 AX audio mixer, 3 audio output).
+-enum ThreadSlot { kThreadMain = 0, kThreadCpu = 1, kThreadAx = 2, kThreadAudio = 3, kThreadSlots = 4 };
++// (0 main/render, 1 recompiled CPU, 2 AX audio mixer, 3 audio output, 4 render
++// worker: GX FIFO parse + decode, R11).
++enum ThreadSlot { kThreadMain = 0, kThreadCpu = 1, kThreadAx = 2, kThreadAudio = 3, kThreadGxw = 4,
++                  kThreadSlots = 5 };
+ void note_thread(int slot);
+ // Kernel handle of a noted thread (0 until it ran note_thread).
+ unsigned thread_handle(int slot);
+diff --color -ruN r11base/nWiiRuntime/src/platform/switch/switch_profiler.cpp r11a/nWiiRuntime/src/platform/switch/switch_profiler.cpp
+--- r11base/nWiiRuntime/src/platform/switch/switch_profiler.cpp	2026-10-31 08:10:55.574330396 -0500
++++ r11a/nWiiRuntime/src/platform/switch/switch_profiler.cpp	2026-11-08 11:22:06.640788919 -0500
+@@ -184,10 +184,11 @@
+ }
+ 
+ void sampler(void *) {
+-  static Target targets[] = {{"main", kThreadMain}, {"cpu", kThreadCpu}};
++  // R11: the render worker too (logs/profile_gxw.txt; no samples while it is off).
++  static Target targets[] = {{"main", kThreadMain}, {"cpu", kThreadCpu}, {"gxw", kThreadGxw}};
+   const u64 start = armGetSystemTick();
+   u64 last_write = start;
+-  uint64_t win_paused[2] = {};
++  uint64_t win_paused[3] = {};
+   for (;;) {
+     svcSleepThread((s64)g_interval_us * 1000);
+     for (Target &t : targets) {
+@@ -214,7 +215,7 @@
+       // last window paused, sample half as often (up to every 8 ms). The
+       // histograms are proportions, so they stay comparable.
+       double worst = 0;
+-      for (int i = 0; i < 2; ++i) {
++      for (int i = 0; i < 3; ++i) {
+         const uint64_t d = targets[i].paused_ticks - win_paused[i];
+         win_paused[i] = targets[i].paused_ticks;
+         worst = std::max(worst, d * tick_us / (g_write_secs * 1e4));

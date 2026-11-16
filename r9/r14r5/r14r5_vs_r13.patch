@@ -1,0 +1,1558 @@
+diff --color -ru r13/nWiiRuntime/include/runtime/gx_state.h r14r5/nWiiRuntime/include/runtime/gx_state.h
+--- r13/nWiiRuntime/include/runtime/gx_state.h	2026-10-31 06:08:13.572711897 -0500
++++ r14r5/nWiiRuntime/include/runtime/gx_state.h	2026-11-08 18:07:37.354393806 -0500
+@@ -136,12 +136,17 @@
+   uint32_t tlutSrcAddr;
+ 
+   uint64_t GetShaderHash(uint8_t prim_type) const {
++      // R14 R5: one multiply per 32-bit word (was one per byte: ~300 serial
++      // multiplies, ~1 500 cycles on the A57, per batch-key rebuild), with a
++      // fold of the high half back down so every input bit reaches every
++      // output bit. The value only keys the in-memory program map
++      // (s_shader_cache) and is printed in logs; nothing on disk keeps it.
+       uint64_t hash = 14695981039346656037ull;
+-      auto add_u8 = [&](uint8_t b) { hash = (hash ^ b) * 1099511628211ull; };
+       auto add_u32 = [&](uint32_t w) {
+-          add_u8(w & 0xFF); add_u8((w >> 8) & 0xFF);
+-          add_u8((w >> 16) & 0xFF); add_u8((w >> 24) & 0xFF);
++          hash = (hash ^ w) * 0x9E3779B97F4A7C15ull;
++          hash ^= hash >> 29;
+       };
++      auto add_u8 = [&](uint8_t b) { add_u32(b); };
+ 
+       add_u8(prim_type);
+ 
+@@ -160,10 +165,9 @@
+       for (int i = 0x10; i <= 0x1F; ++i) add_u32(bp[i]);
+       add_u32(bp[0x27]);
+ 
+-      for (int i = 0; i < 8; ++i) {
+-          add_u8(texStages[i].format);
+-          add_u8(texStages[i].tlut_format);
+-      }
++      for (int i = 0; i < 8; ++i)
++          add_u32((uint32_t)(uint8_t)texStages[i].format |
++                  ((uint32_t)(uint8_t)texStages[i].tlut_format << 8));
+ 
+       add_u32(cp[0x50]); 
+       add_u32(cp[0x60]); 
+diff --color -ru r13/nWiiRuntime/include/runtime/texture_cache_gl.h r14r5/nWiiRuntime/include/runtime/texture_cache_gl.h
+--- r13/nWiiRuntime/include/runtime/texture_cache_gl.h	2026-10-31 06:08:13.574700760 -0500
++++ r14r5/nWiiRuntime/include/runtime/texture_cache_gl.h	2026-11-08 17:59:22.936113486 -0500
+@@ -144,9 +144,22 @@
+         uint32_t bytes = 0;       // encoded size in guest RAM
+         uint32_t ram_hash = 0;    // RAM content when the copy was made
+         uint64_t frame = 0;
++        // R14 R5: hash_ram of the copy's range, memoised for one frame (as
++        // the texel hash of the decoded textures): a copy made in an earlier
++        // frame was re-hashed at every lookup (each batch-key rebuild).
++        uint32_t seen_hash = 0;
++        uint64_t seen_frame = ~0ull;
+     };
+ 
+     std::unordered_map<TextureKey, Entry, TextureKeyHash> cache;
++    // R14 R5: the cache entries by guest address (element pointers of `cache`
++    // are stable until erased), so an EFB copy finds the larger textures it
++    // lands inside without walking the whole cache; max_size_: the largest
++    // Entry::size so far (a texture starting more than that below the copy
++    // cannot contain it).
++    std::multimap<uint32_t, const std::pair<const TextureKey, Entry>*> by_addr_;
++    uint32_t max_size_ = 0;
++    void index_erase(const std::pair<const TextureKey, Entry>* kv);
+     std::map<uint32_t, EfbCopy> efb_copies;   // keyed by physical address
+     uint64_t frame_ = 1;
+     GLuint restore_read_fbo_ = 0;
+diff --color -ru r13/nWiiRuntime/src/core/main.cpp r14r5/nWiiRuntime/src/core/main.cpp
+--- r13/nWiiRuntime/src/core/main.cpp	2026-11-08 13:20:49.850719849 -0500
++++ r14r5/nWiiRuntime/src/core/main.cpp	2026-11-08 18:54:57.674893047 -0500
+@@ -1210,7 +1210,14 @@
+         }
+ 
+         nwii::runtime::gx::DrawPerfOverlay();  // r10: fps_overlay (off by default)
+-        SDL_GL_SwapWindow(window);
++        {
++          // R14 R5: swap time and loop period for [PIPE] (gx.cpp)
++          extern void GX_PipeNoteSwap(int64_t);
++          const auto ts0 = std::chrono::steady_clock::now();
++          SDL_GL_SwapWindow(window);
++          GX_PipeNoteSwap(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                              std::chrono::steady_clock::now() - ts0).count());
++        }
+         count_present();
+ 
+         // Offscreen (and any vsync-less) presentation would spin the host
+diff --color -ru r13/nWiiRuntime/src/hle/ax/ax_async.cpp r14r5/nWiiRuntime/src/hle/ax/ax_async.cpp
+--- r13/nWiiRuntime/src/hle/ax/ax_async.cpp	2026-10-31 06:08:18.875365522 -0500
++++ r14r5/nWiiRuntime/src/hle/ax/ax_async.cpp	2026-11-08 19:01:55.493398158 -0500
+@@ -204,8 +204,16 @@
+         core = c;
+         break;
+       }
+-    std::printf("[NX] AX thread on core %d (allowed mask 0x%llx)\n", core,
+-                (unsigned long long)allowed);
++    // R14 R5: libnx starts pthreads at priority 0x3B (the lowest), below the
++    // render worker (0x2D) that shares core 2: every list the worker
++    // preempted made the CPU thread wait in finish() (console, castle
++    // cutscene: ~70 ms of waits per second, mixes up to 42 ms). One step above
++    // the worker, as the worker's own comment assumed. NWII_AX_PRIO overrides.
++    const char *pe = std::getenv("NWII_AX_PRIO");
++    const int prio = pe ? (int)std::strtol(pe, nullptr, 0) : 0x2C;
++    const Result prc = svcSetThreadPriority(CUR_THREAD_HANDLE, prio);
++    std::printf("[NX] AX thread on core %d, priority 0x%X%s (allowed mask 0x%llx)\n", core, prio,
++                R_SUCCEEDED(prc) ? "" : " (failed)", (unsigned long long)allowed);
+     nx::note_thread(nx::kThreadAx);
+ #endif
+     uint64_t seen = 0;
+diff --color -ru r13/nWiiRuntime/src/hle/gx/renderer_gl.cpp r14r5/nWiiRuntime/src/hle/gx/renderer_gl.cpp
+--- r13/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-08 13:54:53.995221226 -0500
++++ r14r5/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-08 19:11:40.131730900 -0500
+@@ -1,4 +1,5 @@
+ #include "runtime/nwii_env.h"
++#define NWII_NOINLINE_R5 __attribute__((noinline))
+ #include "runtime/cpu_context.h"
+ #include "runtime/gx/fifo_parser.h"
+ #include "runtime/gx/renderer.h"
+@@ -18,6 +19,7 @@
+ #include <deque>
+ #include <thread>
+ #include <mutex>
++#include <atomic>
+ #include <unordered_map>
+ #include <vector>
+ #ifdef __SWITCH__
+@@ -76,6 +78,7 @@
+ // Render profiling ([RPROF] in gx.cpp): GL draw calls and GX draws rendered.
+ uint64_t g_prof_gl_draws = 0, g_prof_gx_draws = 0;
+ bool GX_OnRenderWorker();  // gx.cpp (R11)
++bool GX_RenderWorkerOn();  // gx.cpp (R14 R5)
+ // Batches that a texture upload would have drawn with the wrong texture
+ // before the texture cache got its own unit (see DrawPrimitive).
+ uint64_t g_prof_tex_bind_saves = 0;
+@@ -123,14 +126,16 @@
+ // NWII_RPHASE=2: coarse, for slow clocks (citron reads the counter through a
+ // host call): regs/state/tex/emit are one phase ("regs" = all CPU work per
+ // command) and only GL calls, copies and frame start/end are timed apart.
+-static int Level() {
+-  static const int lv = [] {
+-    const char *e = NWII_ENV("NWII_RPHASE");
+-    return e ? (e[0] == '2' ? 2 : 1) : 0;
+-  }();
+-  return lv;
++// R14 R5: read once (InitFlags, first Render()) into a plain global: Level()
++// and On() run several times per GX command; a function-local static costs a
++// call plus an acquire load of its guard each time.
++static int s_level = 0;
++static void InitLevel() {
++  const char *e = NWII_ENV("NWII_RPHASE");
++  s_level = e ? (e[0] == '2' ? 2 : 1) : 0;
+ }
+-static bool On() { return Level() != 0; }
++static inline int Level() { return s_level; }
++static inline bool On() { return s_level != 0; }
+ static inline uint64_t Now() {
+ #if defined(__SWITCH__)
+   uint64_t v;
+@@ -2182,7 +2187,7 @@
+ // shader, clears): the next draw re-applies everything.
+ static bool s_gl_state_dirty = true;
+ 
+-static bool DrawTraceOn();
++static inline bool DrawTraceOn();
+ static void CopyEfbToTexture(uint32_t val) {
+   uint32_t dest = g_state.efbCopyDest;
+   uint32_t w = g_state.efbW, h = g_state.efbH;
+@@ -2288,10 +2293,8 @@
+   uint64_t draws[2], verts[2], inside[2], nonfinite, frames;
+   uint64_t nrm_verts, nrm_inside;
+ } s_ds;
+-static bool DrawStatsOn() {
+-  static const bool on = NWII_ENV("NWII_DRAWSTATS") != nullptr;
+-  return on;
+-}
++static bool s_drawstats_on = false;  // R14 R5: set once by InitFlags()
++static inline bool DrawStatsOn() { return s_drawstats_on; }
+ static void DrawStatsVertex(const BatchVertex &bv) {
+   const float *p = s_proj;
+   float cx = p[0] * bv.x + p[4] * bv.y + p[8] * bv.z + p[12];
+@@ -2642,12 +2645,9 @@
+ // (numbered like the NWII_XFBDUMP files): vertex count, NDC bounding box,
+ // textures, blend/z/TEV state. Finds the draw behind a bad pixel.
+ static long s_dt_from = -1, s_dt_to = -1;
+-static bool DrawTraceOn() {
+-  static const bool on = [] {
+-    const char *e = NWII_ENV("NWII_DRAWTRACE");
+-    return e && std::sscanf(e, "%ld-%ld", &s_dt_from, &s_dt_to) == 2;
+-  }();
+-  if (!on) return false;
++static bool s_dt_on = false;  // R14 R5: set once by InitFlags()
++static inline bool DrawTraceOn() {
++  if (!s_dt_on) return false;
+   const long f = s_xfb_copies + 1;
+   return f >= s_dt_from && f <= s_dt_to;
+ }
+@@ -2755,9 +2755,11 @@
+   s_pw_labels.clear();
+ }
+ 
++static inline uint32_t DrawVertCount(const GXCommand &cmd);  // R14 R5 (after ecache::)
+ static void DrawPrimitive(const GXCommand &cmd) {
+-  const auto &v = cmd.verts();
+-  const size_t n = v.size();
++  // R14 R5: the vertex count from the draw's emit-cache entry when the render
++  // worker's list gave it (no read of the DecodedVerts).
++  const size_t n = DrawVertCount(cmd);
+   if (n == 0)
+     return;
+ 
+@@ -2769,6 +2771,7 @@
+   static const long s_drawlog_n =
+       NWII_ENV("NWII_DRAWLOG_N") ? std::atol(NWII_ENV("NWII_DRAWLOG_N")) : 40;
+   if (s_drawlog && s_draw_seq++ >= s_drawlog_from) {
++    const auto &v = cmd.verts();
+     static int dn = 0;
+     if (dn < s_drawlog_n) {
+       const auto &v0 = v[0];
+@@ -3491,28 +3494,36 @@
+   xf::Info xi;
+   uint8_t x_cls = 0;
+   int64_t x_slot = -1;
++  uint32_t x_n = 0;  // R14 R5: vertex count of the draw (set with the masks)
++  // R14 R5, NWII_GPU_XF_MDI: the draw's triangle indices (local vertex
++  // numbers) kept in the GPU XF arena like its vertices: arena unit, count,
++  // the primitive they were made for.
++  int64_t x_islot = -1;
++  uint32_t x_icount = 0;
++  uint8_t x_icls = 0, x_iprim = 0;
+   ~Entry() {
+     // R11 worker: the entry may die on the render worker (any thread).
+     if (slot >= 0) vbuf::ArenaFreeAny((uint32_t)slot, cls);
+     if (x_slot >= 0) vbuf::ArenaFreeAny((uint32_t)x_slot, x_cls, /*gpu_xf=*/true);
++    if (x_islot >= 0) vbuf::ArenaFreeAny((uint32_t)x_islot, x_icls, /*gpu_xf=*/true);
+   }
+ };
+-static bool On() {
+-  static const bool on = [] {
+-    const char *e = NWII_ENV("NWII_ECACHE");
+-    return !(e && e[0] == '0');
+-  }();
+-  return on;
+-}
+-static bool CheckOn() {
+-  static const bool on = NWII_ENV("NWII_ECACHE_CHECK") != nullptr;
+-  return on;
+-}
++// R14 R5: plain globals set once by InitFlags() (first Render(); also read
++// by the render worker, which starts after the first frame end is parsed --
++// see GX_WorkerPrepDraws -- and calls InitFlags() itself if needed).
++static bool s_on = true, s_check_on = false;
++static inline bool On() { return s_on; }
++static inline bool CheckOn() { return s_check_on; }
+ static uint64_t s_frame = 1;
+ static uint64_t s_hits = 0, s_misses = 0, s_checked = 0, s_bad = 0, s_hit_verts = 0,
+                 s_entries = 0, s_tg_hits = 0, s_m_noslot = 0, s_m_tg = 0;
++// R14 R5: entries made by GX_PrepDrawForRender (render worker) / made late by
++// Get() on the render thread (should stay 0 with the prep on).
++static std::atomic<uint64_t> s_entries_prep{0};
++static uint64_t s_entries_late = 0;
+ 
+ static void InitDeps(Entry &e, const std::vector<VertexData> &v) {
++  e.x_n = (uint32_t)v.size();
+   for (const auto &vtx : v) {
+     if (!vtx.pre_xf) {
+       if (vtx.has_pos && (vtx.posMtxIdx & 0x3F) <= 61) e.pos_mask |= 1ull << (vtx.posMtxIdx & 0x3F);
+@@ -3599,11 +3610,24 @@
+   StoreInputs(e, cfg);
+   e.out.assign(v, v + n);
+ }
++// R14 R5: the entry of the draw being rendered, from the render worker's list
++// (s_hint_ok: the list matches this frame's draws; s_hint null: that draw has
++// no entry). Same object as cmd.shared_vertices->emit_cache, without reading
++// the DecodedVerts.
++static Entry *s_hint = nullptr;
++static bool s_hint_ok = false;
+ // Entry of a draw's shared vertices (nullptr: not cacheable).
+ static inline Entry *Get(const GXCommand &cmd) {
+   if (!cmd.shared_vertices || !On() || s_r8_pass) return nullptr;
++  if (s_hint_ok && s_hint) return s_hint;
+   const DecodedVerts &dv = *cmd.shared_vertices;
+   if (!dv.emit_cache) {
++    // R14 R5: normally made on the render worker (GX_PrepDrawForRender)
++    // before the frame is handed over. A draw it missed is drawn without an
++    // entry while a worker runs (same output, the entry-less path): making
++    // one here could race with the worker's prep of a later frame.
++    ++s_entries_late;
++    if (GX_RenderWorkerOn()) return nullptr;
+     auto e = MakeHost<Entry>();
+     InitDeps(*e, dv);
+     dv.emit_cache = e;
+@@ -3623,16 +3647,23 @@
+            (unsigned long long)s_hits, (unsigned long long)s_misses,
+            (unsigned long long)s_tg_hits, (unsigned long long)s_m_noslot,
+            (unsigned long long)s_m_tg,
+-           (unsigned long long)s_hit_verts, (unsigned long long)s_entries,
++           (unsigned long long)s_hit_verts,
++           (unsigned long long)(s_entries + s_entries_prep.exchange(0, std::memory_order_relaxed)),
+            (unsigned long long)s_checked, (unsigned long long)s_bad,
+            vbuf::s_on ? "on" : "off", vbuf::s_bump, vbuf::kArenaVerts,
+            (unsigned long long)vbuf::s_arena_full, (unsigned long long)vbuf::s_waits,
+            (unsigned long long)vbuf::s_finishes, vbuf::s_inflight->size());
+     std::fflush(stdout);
++    if (s_entries_late) printf("[ECACHE] entries made late on the render thread: %llu\n",
++                               (unsigned long long)s_entries_late);
+     s_hits = s_misses = s_hit_verts = s_entries = s_tg_hits = s_m_noslot = s_m_tg = 0;
+   }
+ }
+ }  // namespace ecache
++static inline uint32_t DrawVertCount(const GXCommand &cmd) {
++  const ecache::Entry *he = ecache::Get(cmd);
++  return he ? he->x_n : (uint32_t)cmd.verts().size();
++}
+ 
+ // R9 render: EmitVertexFast<false> for four vertices at once (position,
+ // normal, colour; texgen is TexGen4). Taken when the four lanes agree on
+@@ -3705,10 +3736,8 @@
+   }
+   return true;
+ }
+-static bool Emit4On() {
+-  static const bool on = NWII_ENV("NWII_NOEMIT4") == nullptr;
+-  return on;
+-}
++static bool s_emit4_on = true;  // R14 R5: set once by InitFlags()
++static inline bool Emit4On() { return s_emit4_on; }
+ 
+ // The fast emit (EmitVertexFast + TexGen4) of v[0, n) into dst.
+ static inline void EmitRange(const std::vector<VertexData> &v, size_t n, BatchVertex *dst,
+@@ -3817,8 +3846,6 @@
+ }
+ 
+ static void EmitPrimitive(const GXCommand &cmd) {
+-  const auto &v = cmd.verts();
+-  const size_t n = v.size();
+   const uint8_t prim = cmd.prim_type & 0xF8;
+   if (prim >= 0xA8)
+     return;  // lines / points: not drawn
+@@ -3826,6 +3853,8 @@
+     xf::Emit(cmd, prim);
+     return;
+   }
++  const auto &v = cmd.verts();
++  const size_t n = v.size();
+   if (vbuf::s_on) {
+     EmitPrimitiveVB(cmd, prim);
+     return;
+@@ -3967,6 +3996,33 @@
+ constexpr int kClasses = 69;
+ static int s_variant = 0;
+ static std::string *s_vs = nullptr;
++// R14 R5: the batch's first draw entry passed as the draw's base instance
++// (gl_BaseInstanceARB) instead of the uXDraw uniform. NWII_GPU_XF_BASEINST=0: uniform.
++typedef void(APIENTRYP PFNDrawElementsInstancedBaseInstance)(GLenum, GLsizei, GLenum, const void *,
++                                                             GLsizei, GLuint);
++typedef void(APIENTRYP PFNDrawArraysInstancedBaseInstance)(GLenum, GLint, GLsizei, GLsizei, GLuint);
++static PFNDrawElementsInstancedBaseInstance s_draw_bi = nullptr;
++static bool s_baseinst = false;
++static int s_base_mode = 0;  // 0 uniform, 1 gl_BaseInstanceARB, 2 instanced attribute
++static GLuint s_iota = 0;    // mode 2: element i = kArenaUnits + i
++// The base instance of draw entry unit `du` (always in the ring).
++static inline GLuint BaseOf(uint64_t du) {
++  return (GLuint)(s_base_mode == 2 ? du - kArenaUnits : du);
++}
++// R14 R5, NWII_GPU_XF_MDI=1 (needs the base instance): a batch is one
++// glMultiDrawElementsIndirect, one sub-draw per GX draw (base instance = its
++// draw entry). A display-list draw's indices stay in the arena (written once);
++// only its 20-byte indirect command is written per frame. Other draws' indices
++// go to the ring as before, numbered from 0.
++typedef void(APIENTRYP PFNMultiDrawElementsIndirect)(GLenum, GLenum, const void *, GLsizei, GLsizei);
++#ifndef GL_DRAW_INDIRECT_BUFFER
++#define GL_DRAW_INDIRECT_BUFFER 0x8F3F  // GL 4.0 (glad here is 3.3)
++#endif
++static PFNMultiDrawElementsIndirect s_mdi_draw = nullptr;
++static bool s_mdi = false;
++static std::vector<uint32_t> s_icmds;  // the batch's indirect commands, 5 words each
++static constexpr uint32_t kRingIdx = 0x80000000u;  // firstIndex relative to the batch's ring indices
++static uint64_t st_mdi_static = 0, st_mdi_ring = 0;
+ static GLuint s_buf = 0, s_vao = 0, s_texw = 0, s_texq = 0;
+ static uint8_t *s_map = nullptr;
+ struct Frame { uint64_t id; GLsync fence; uint64_t r0; };
+@@ -3979,15 +4035,20 @@
+ static std::vector<uint32_t> s_draws;  // the batch's draw entries, 4 words each
+ static uint64_t s_epoch = 1;           // per Render(): matrix palette validity
+ // Counters, printed every 600 frames ([GPUXF]).
++static uint64_t st_packed = 0;  // R14 R5: ring draws packed on the worker
+ static uint64_t st_frames = 0, st_gpu = 0, st_cached = 0, st_cached_new = 0, st_cpu = 0,
+                 st_cpu_static = 0, st_cpu_row2 = 0, st_sverts = 0, st_cverts = 0, st_pal = 0,
+                 st_tg = 0, st_units = 0, st_waits = 0, st_finishes = 0, st_arena_full = 0,
+                 st_flushes = 0;
+ 
+ static const std::string &VsText() { return *s_vs; }
++// R14 R5: s_on as seen by the render worker (GX_PrepDrawForRender packs the
++// vertices of non-display-list draws only while GPU XF is in use).
++static std::atomic<bool> s_on_w{false};
+ static void Disable(const char *why) {
+   if (s_on) printf("[GPUXF] off: %s\n", why);
+   s_on = false;
++  s_on_w.store(false, std::memory_order_relaxed);
+ }
+ static bool Wanted() {
+   const char *e = NWII_ENV("NWII_GPU_XF");
+@@ -4343,6 +4404,15 @@
+   glBindVertexArray(s_vao);
+   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_buf);  // indices live in the ring
+   glBindVertexArray(0);
++  if (false) {  // (moved: set up once the draw base is chosen, below)
++    glBindVertexArray(s_vao);
++    glBindBuffer(GL_ARRAY_BUFFER, s_iota);
++    glVertexAttribIPointer(0, 1, GL_UNSIGNED_INT, 0, nullptr);
++    glVertexAttribDivisor(0, 1);
++    glEnableVertexAttribArray(0);
++    glBindVertexArray(0);
++    glBindBuffer(GL_ARRAY_BUFFER, 0);
++  }
+   const GLenum err = glGetError();
+   if (!s_map || err != GL_NO_ERROR) {
+     printf("[GPUXF] off: buffer mapping failed (err 0x%x)\n", err);
+@@ -4355,16 +4425,234 @@
+     return;
+   }
+   s_variant = variant;
+-  s_vs = new std::string(GenerateVertexShaderXF(variant, false));
++  {
++    // R14 R5: the batch's first draw entry as the draw's base instance, read
++    // in the shader as gl_BaseInstanceARB (mode 1) or as an instanced
++    // attribute fetched from an "iota" buffer at the start instance (mode 2:
++    // no shader draw parameters needed); else the uXDraw uniform (mode 0).
++    // Each is checked with transform feedback first; the results are logged
++    // ("[GPUXF] draw-base tests: ...") so a console that fails one can be read.
++    // NWII_GPU_XF_BASEINST=0: uniform; =1 / =2: only that mode is tried.
++    const char *bi = NWII_ENV("NWII_GPU_XF_BASEINST");
++    bool dp = major > 4 || (major == 4 && minor >= 6), binst = major > 4 || (major == 4 && minor >= 2);
++    for (GLint i = 0; i < next; i++) {
++      const char *x = (const char *)glGetStringi(GL_EXTENSIONS, i);
++      if (!x) continue;
++      if (!std::strcmp(x, "GL_ARB_shader_draw_parameters")) dp = true;
++      if (!std::strcmp(x, "GL_ARB_base_instance")) binst = true;
++    }
++    auto pe = (PFNDrawElementsInstancedBaseInstance)SDL_GL_GetProcAddress(
++        "glDrawElementsInstancedBaseInstance");
++    auto pa = (PFNDrawArraysInstancedBaseInstance)SDL_GL_GetProcAddress(
++        "glDrawArraysInstancedBaseInstance");
++    const bool want0 = bi && bi[0] == '0';
++    const bool only1 = bi && bi[0] == '1', only2 = bi && bi[0] == '2';
++    // Runs program p on 4 points with transform feedback of one uint ("oB").
++    // how: 0 glDrawArrays, 1 glDrawArraysInstancedBaseInstance(base 777000).
++    auto run = [&](GLuint p, int how, GLuint vao, uint32_t out[4]) {
++      GLuint tf = 0;
++      glGenBuffers(1, &tf);
++      glBindVertexArray(vao);
++      glUseProgram(p);
++      glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tf);
++      glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 16, nullptr, GL_STREAM_READ);
++      glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tf);
++      glEnable(GL_RASTERIZER_DISCARD);
++      glBeginTransformFeedback(GL_POINTS);
++      if (how == 0) glDrawArrays(GL_POINTS, 0, 4);
++      else pa(GL_POINTS, 0, 4, 1, 777000u);
++      glEndTransformFeedback();
++      glDisable(GL_RASTERIZER_DISCARD);
++      for (int k = 0; k < 4; ++k) out[k] = 0xDEADBEEFu;
++      glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 16, out);
++      glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0);
++      glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, 0);
++      glUseProgram(0);
++      glBindVertexArray(0);
++      glDeleteBuffers(1, &tf);
++      return glGetError();
++    };
++    static const char *const kVar[1] = {"oB"};
++    std::string log;
++    char buf[160];
++    GLuint tvao = 0;
++    glGenVertexArrays(1, &tvao);
++    glGetError();
++    if (!want0 && !only2 && dp && binst && pa && pe) {
++      const GLuint p = LinkTf("#version 330 core\n"
++                              "#extension GL_ARB_shader_draw_parameters : require\n"
++                              "flat out uint oB;\n"
++                              "void main() { oB = uint(gl_BaseInstanceARB) + uint(gl_VertexID) * 1000000u; "
++                              "gl_Position = vec4(0.0); }\n",
++                              kVar, 1);
++      if (p) {
++        uint32_t o0[4], o1[4];
++        const GLenum e0 = run(p, 0, tvao, o0), e1 = run(p, 1, tvao, o1);
++        bool ok = !e1;
++        for (uint32_t k = 0; k < 4; ++k) ok = ok && o1[k] == 777000u + k * 1000000u;
++        std::snprintf(buf, sizeof buf, " sysval: arrays %u %u %u %u (err 0x%x), base 777000 -> %u %u %u %u (err 0x%x) %s;",
++                      o0[0], o0[1], o0[2], o0[3], e0, o1[0], o1[1], o1[2], o1[3], e1, ok ? "ok" : "FAIL");
++        log += buf;
++        glDeleteProgram(p);
++        if (ok) s_base_mode = 1;
++      } else {
++        log += " sysval: shader rejected;";
++      }
++    } else if (!want0 && !only2) {
++      std::snprintf(buf, sizeof buf, " sysval: n/a (draw_parameters %d base_instance %d procs %d);", dp,
++                    binst, pa && pe);
++      log += buf;
++    }
++    if (!s_base_mode && !want0 && !only1 && binst && pa && pe) {
++      // Mode 2: iota buffer over the ring (entries are always in the ring):
++      // element i = kArenaUnits + i, base instance = ring-relative entry.
++      GLuint ib = 0;
++      glGenBuffers(1, &ib);
++      glBindBuffer(GL_ARRAY_BUFFER, ib);
++      {
++        std::vector<uint32_t> iota(kRingUnits);
++        for (uint32_t i = 0; i < kRingUnits; ++i) iota[i] = kArenaUnits + i;
++        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)iota.size() * 4, iota.data(), GL_STATIC_DRAW);
++      }
++      glBindVertexArray(tvao);
++      glVertexAttribIPointer(0, 1, GL_UNSIGNED_INT, 0, nullptr);
++      glVertexAttribDivisor(0, 1);
++      glEnableVertexAttribArray(0);
++      glBindVertexArray(0);
++      glBindBuffer(GL_ARRAY_BUFFER, 0);
++      const GLuint p = LinkTf("#version 330 core\n"
++                              "layout(location = 0) in uint aB;\n"
++                              "flat out uint oB;\n"
++                              "void main() { oB = aB + uint(gl_VertexID) * 1000000u; "
++                              "gl_Position = vec4(0.0); }\n",
++                              kVar, 1);
++      bool ok = false;
++      if (p) {
++        uint32_t o1[4];
++        const GLenum e1 = run(p, 1, tvao, o1);
++        ok = !e1;
++        for (uint32_t k = 0; k < 4; ++k) ok = ok && o1[k] == kArenaUnits + 777000u + k * 1000000u;
++        std::snprintf(buf, sizeof buf, " attribute: base 777000 -> %u %u %u %u (err 0x%x) %s;", o1[0],
++                      o1[1], o1[2], o1[3], e1, ok ? "ok" : "FAIL");
++        log += buf;
++        glDeleteProgram(p);
++      } else {
++        log += " attribute: shader rejected;";
++      }
++      if (ok) {
++        s_base_mode = 2;
++        s_iota = ib;
++      } else {
++        glDeleteBuffers(1, &ib);
++      }
++    }
++    glDeleteVertexArrays(1, &tvao);
++    glGetError();
++    if (s_base_mode) {
++      s_draw_bi = pe;
++      s_baseinst = true;
++    }
++    if (s_base_mode == 2) {
++      // attribute 0 of the GPU XF vertex array = iota[start instance] (see BaseOf)
++      glBindVertexArray(s_vao);
++      glBindBuffer(GL_ARRAY_BUFFER, s_iota);
++      glVertexAttribIPointer(0, 1, GL_UNSIGNED_INT, 0, nullptr);
++      glVertexAttribDivisor(0, 1);
++      glEnableVertexAttribArray(0);
++      glBindVertexArray(0);
++      glBindBuffer(GL_ARRAY_BUFFER, 0);
++    }
++    printf("[GPUXF] draw-base tests:%s\n", log.empty() ? " none" : log.c_str());
++    printf("[GPUXF] draw base: %s\n", s_base_mode == 1   ? "base instance, gl_BaseInstanceARB (no uniform per batch)"
++                                      : s_base_mode == 2 ? "base instance, instanced attribute (no uniform per batch)"
++                                                         : "uniform uXDraw");
++  }
++  if (s_baseinst) {
++    const char *mo = NWII_ENV("NWII_GPU_XF_MDI");
++    auto pm = (PFNMultiDrawElementsIndirect)SDL_GL_GetProcAddress("glMultiDrawElementsIndirect");
++    const char *why_m = nullptr;
++    if (!(mo && mo[0] == '1')) why_m = "off (NWII_GPU_XF_MDI=1 turns it on)";
++    else if (!(major > 4 || (major == 4 && minor >= 3)) || !pm) why_m = "no glMultiDrawElementsIndirect";
++    if (!why_m) {
++      // Self-test: two indexed sub-draws of points with base instances 777 000
++      // and 888 000, transform feedback of gl_BaseInstanceARB + 10^6 * gl_VertexID.
++      static const char *const kVar[1] = {"oB"};
++      const GLuint p = LinkTf("#version 330 core\n"
++                              "#extension GL_ARB_shader_draw_parameters : require\n"
++                              "flat out uint oB;\n"
++                              "void main() { oB = uint(gl_BaseInstanceARB) + uint(gl_VertexID) * 1000000u; "
++                              "gl_Position = vec4(0.0); }\n",
++                              kVar, 1);
++      bool ok = false;
++      if (p) {
++        const uint32_t idx[5] = {0, 1, 2, 0, 1};
++        const uint32_t cmd[10] = {3, 1, 0, 0, 777000u, 2, 1, 3, 0, 888000u};
++        GLuint tf = 0, vao = 0, ib = 0, db = 0;
++        glGenBuffers(1, &tf);
++        glGenBuffers(1, &ib);
++        glGenBuffers(1, &db);
++        glGenVertexArrays(1, &vao);
++        glBindVertexArray(vao);
++        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib);
++        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
++        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, db);
++        glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof cmd, cmd, GL_STATIC_DRAW);
++        glUseProgram(p);
++        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tf);
++        glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 20, nullptr, GL_STREAM_READ);
++        glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tf);
++        glEnable(GL_RASTERIZER_DISCARD);
++        glBeginTransformFeedback(GL_POINTS);
++        pm(GL_POINTS, GL_UNSIGNED_INT, nullptr, 2, 0);
++        glEndTransformFeedback();
++        glDisable(GL_RASTERIZER_DISCARD);
++        uint32_t out[5] = {};
++        glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 20, out);
++        glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0);
++        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, 0);
++        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
++        glUseProgram(0);
++        glBindVertexArray(0);
++        glDeleteVertexArrays(1, &vao);
++        glDeleteBuffers(1, &tf);
++        glDeleteBuffers(1, &ib);
++        glDeleteBuffers(1, &db);
++        glDeleteProgram(p);
++        const uint32_t want[5] = {777000u, 1777000u, 2777000u, 888000u, 1888000u};
++        ok = glGetError() == GL_NO_ERROR && !std::memcmp(out, want, sizeof want);
++        if (!ok)
++          printf("[GPUXF] multi-draw self-test: got %u %u %u %u %u\n", out[0], out[1], out[2],
++                 out[3], out[4]);
++      }
++      if (!ok) why_m = "self-test failed";
++    }
++    glGetError();
++    if (!why_m) {
++      s_mdi_draw = pm;
++      s_mdi = true;
++    }
++    printf("[GPUXF] multi-draw indirect: %s\n", s_mdi ? "on (static display-list indices)" : why_m);
++  }
++  s_vs = new std::string(GenerateVertexShaderXF(variant, false, s_base_mode));
+   // (Linked mode: the vertex shader compiles with the first program; check it
+   // now so a driver that rejects it keeps the CPU path.)
+   if (GLuint t = CompileVs(*s_vs, true)) {
+     glDeleteShader(t);
++  } else if (s_baseinst) {
++    // R14 R5: back to the uniform draw base.
++    s_baseinst = false;
++    s_base_mode = 0;
++    s_draw_bi = nullptr;
++    *s_vs = GenerateVertexShaderXF(variant, false, false);
++    printf("[GPUXF] draw base: uniform uXDraw (base-instance shader rejected)\n");
++    if (GLuint t2 = CompileVs(*s_vs, true)) glDeleteShader(t2);
++    else { printf("[GPUXF] off: vertex shader rejected\n"); return; }
+   } else {
+     printf("[GPUXF] off: vertex shader rejected\n");
+     return;
+   }
+   s_on = true;
++  s_on_w.store(true, std::memory_order_relaxed);
+   printf("[GPUXF] on: vertex transform and texgen on the GPU (variant %d, %zu MB buffer)%s\n",
+          variant, bytes >> 20, CheckEvery() ? " + transform-feedback check" : "");
+   std::fflush(stdout);
+@@ -4380,11 +4668,19 @@
+ static Pal12 s_pal_tex[64], s_pal_post[64];
+ // Position rows of matrix mi (3 units) and, with nrm, the normal rows of
+ // (mi & 31) (3 more units, one row of three per unit).
++// R14 R5: 48-byte equality without a memcmp call (bitwise, as memcmp).
++static inline bool Same48(const float *a, const float *b) {
++  uint64_t x[6], y[6];
++  std::memcpy(x, a, 48);
++  std::memcpy(y, b, 48);
++  return !((x[0] ^ y[0]) | (x[1] ^ y[1]) | (x[2] ^ y[2]) | (x[3] ^ y[3]) | (x[4] ^ y[4]) |
++           (x[5] ^ y[5]));
++}
+ static uint32_t PalPosNrm(int mi, bool pxf, bool nxf) {
+   const float *m = &g_state.posMatrices[mi * 4];
+   const float *nm = &g_state.normalMatrices[3 * (mi & 31)];
+   PalPN &e = s_pal_pn[mi];
+-  if (e.epoch == s_epoch && e.p == pxf && e.n == nxf && (!pxf || !std::memcmp(e.m, m, 48)) &&
++  if (e.epoch == s_epoch && e.p == pxf && e.n == nxf && (!pxf || Same48(e.m, m)) &&
+       (!nxf || !std::memcmp(e.nm, nm, 36)))
+     return e.unit;
+   float buf[24] = {};
+@@ -4405,8 +4701,12 @@
+ }
+ // 12 floats from `m` (a texture matrix in the position bank, or a post
+ // matrix: read exactly where TexGen4 reads them).
+-static uint32_t Pal3(Pal12 &e, const float *m) {
+-  if (e.epoch == s_epoch && !std::memcmp(e.m, m, 48)) return e.unit;
++static inline uint32_t Pal3Slow(Pal12 &e, const float *m);
++static inline uint32_t Pal3(Pal12 &e, const float *m) {
++  if (e.epoch == s_epoch && Same48(e.m, m)) return e.unit;
++  return Pal3Slow(e, m);
++}
++static NWII_NOINLINE_R5 uint32_t Pal3Slow(Pal12 &e, const float *m) {
+   const uint32_t u = (uint32_t)Alloc(3);
+   std::memcpy(s_map + (size_t)u * 16, m, 48);
+   e.epoch = s_epoch;
+@@ -4548,21 +4848,33 @@
+   chk_verts += n;
+ }
+ 
++// R14 R5: a non-display-list draw packed on the render worker
++// (GX_PrepDrawForRender): its Analyze() and the words WriteVerts() makes of its
++// vertices (n * xi.stride words follow the header in the packet's buffer).
++struct PackHdr {
++  Info xi;
++  uint32_t n, words;
++};
++static constexpr uint32_t kPackHdrWords = (sizeof(PackHdr) + 3) / 4;
++static const PackHdr *s_pack_hint = nullptr;  // the draw being rendered (null: none)
++static const uint32_t *s_pack_words = nullptr;
++
+ // ---- per draw ----------------------------------------------------------------
+ static void Emit(const GXCommand &cmd, uint8_t prim) {
+-  const auto &v = cmd.verts();
+-  const uint32_t n = (uint32_t)v.size();
++  const auto &v = cmd.verts();  // (a reference: read only when needed)
+   if (s_draws.size() >= 65535u * 4 || s_rw - s_batch_r0 > kBatchCapUnits) ::nwii::runtime::gx::FlushBatch();
+   TexGenCfg cfg;
+   PrepTexGen(cfg);
+   ecache::Entry *ce = ecache::Get(cmd);
++  const PackHdr *ph = ce ? nullptr : s_pack_hint;
++  const uint32_t n = ce ? ce->x_n : ph ? ph->n : (uint32_t)v.size();
+   Info local;
+   if (ce && !ce->x_init) {
+     ce->xi = Analyze(v);
+     ce->x_init = true;
+   }
+-  if (!ce) local = Analyze(v);
+-  const Info *in = ce ? &ce->xi : &local;
++  if (!ce && !ph) local = Analyze(v);
++  const Info *in = ce ? &ce->xi : ph ? &ph->xi : &local;
+   bool gpu = in->ok;
+   // Position/normal transform: all of the draw's matrix indices in range, or
+   // none (a vertex out of range is not transformed on the CPU either).
+@@ -4596,6 +4908,14 @@
+       }
+       vb = ce->x_slot;
+     }
++    if (vb < 0 && ph) {
++      // R14 R5: packed on the worker: one copy into the ring.
++      vb = (int64_t)Alloc(units);
++      std::memcpy(s_map + (size_t)vb * 16, s_pack_words, (size_t)n * in->stride * 4);
++      st_sverts += n;
++      ++st_packed;
++      if (rph::On()) rph::s_bytes += (uint64_t)n * in->stride * 4;
++    }
+     if (vb < 0) {
+       static std::vector<uint32_t> tmp;
+       if (tmp.size() < (size_t)units * 4) tmp.resize((size_t)units * 4);
+@@ -4700,10 +5020,108 @@
+   }
+   const uint32_t slot = (uint32_t)(s_draws.size() / 4);
+   s_draws.insert(s_draws.end(), de, de + 4);
++  if (s_mdi) {
++    // R14 R5: one indirect sub-draw; base instance = slot (+ the batch's
++    // first entry at FlushBatch).
++    if (ce && (ce->x_islot < 0 || ce->x_iprim != prim)) {
++      static std::vector<uint32_t> tmp;
++      tmp.clear();
++      s_batch_idx.swap(tmp);
++      EmitIndices(prim, 0, n);
++      s_batch_idx.swap(tmp);
++      if (ce->x_islot >= 0) {
++        ArenaFree((uint32_t)ce->x_islot, ce->x_icls);
++        ce->x_islot = -1;
++      }
++      ce->x_icount = (uint32_t)tmp.size();
++      ce->x_iprim = prim;
++      if (!tmp.empty()) {
++        uint8_t cls = 0;
++        const int64_t s2 = ArenaAlloc((uint32_t)((tmp.size() + 3) / 4), cls);
++        if (s2 >= 0) {
++          std::memcpy(s_map + (size_t)s2 * 16, tmp.data(), tmp.size() * 4);
++          ce->x_islot = s2;
++          ce->x_icls = cls;
++        }
++      }
++    }
++    uint32_t c[5];
++    if (ce && ce->x_islot >= 0) {
++      if (!ce->x_icount) return;
++      c[0] = ce->x_icount;
++      c[2] = (uint32_t)ce->x_islot * 4;  // in indices (4 bytes) from the buffer start
++      ++st_mdi_static;
++    } else {
++      const size_t at = s_batch_idx.size();
++      EmitIndices(prim, 0, n);
++      if (s_batch_idx.size() == at) return;
++      c[0] = (uint32_t)(s_batch_idx.size() - at);
++      c[2] = kRingIdx | (uint32_t)at;
++      ++st_mdi_ring;
++    }
++    c[1] = 1;
++    c[3] = 0;
++    c[4] = slot;
++    s_icmds.insert(s_icmds.end(), c, c + 5);
++    return;
++  }
+   EmitIndices(prim, slot << 16, n);
+ }
+ 
++static void FlushBatchMdi() {
++  if (s_icmds.empty()) {
++    s_draws.clear();
++    s_batch_idx.clear();
++    s_batch_r0 = s_rw;
++    return;
++  }
++  const int ph0 = rph::Set(rph::kUpload);
++  const uint32_t nd = (uint32_t)(s_draws.size() / 4);
++  const uint64_t du = Alloc(nd);
++  std::memcpy(s_map + du * 16, s_draws.data(), (size_t)nd * 16);
++  uint64_t iu = 0;
++  if (!s_batch_idx.empty()) {
++    const uint64_t ib = (uint64_t)s_batch_idx.size() * 4;
++    iu = Alloc((uint32_t)((ib + 15) / 16));
++    std::memcpy(s_map + iu * 16, s_batch_idx.data(), ib);
++  }
++  const uint32_t ncmd = (uint32_t)(s_icmds.size() / 5);
++  for (uint32_t k = 0; k < ncmd; ++k) {
++    uint32_t *c = &s_icmds[(size_t)k * 5];
++    if (c[2] & kRingIdx) c[2] = (uint32_t)(iu * 4) + (c[2] & ~kRingIdx);
++    c[4] += BaseOf(du);
++  }
++  const uint64_t cu = Alloc((uint32_t)((s_icmds.size() * 4 + 15) / 16));
++  std::memcpy(s_map + cu * 16, s_icmds.data(), s_icmds.size() * 4);
++  if (rph::On()) {
++    ++rph::s_flushes;
++    rph::s_idx += s_batch_idx.size();
++    rph::s_bytes += (uint64_t)nd * 16 + s_batch_idx.size() * 4 + s_icmds.size() * 4;
++  }
++  CBindVertexArray(s_vao);
++  static GLuint s_bound_ind = 0;
++  if (s_bound_ind != s_buf) {
++    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, s_buf);
++    s_bound_ind = s_buf;
++  }
++  rph::Set(rph::kGlDraw);
++  s_mdi_draw(GL_TRIANGLES, GL_UNSIGNED_INT, (const void *)(uintptr_t)(cu * 16), (GLsizei)ncmd, 0);
++  ++g_prof_gl_draws;
++  ++s_cap_cur.gl_draws;
++  ++st_flushes;
++  s_draws.clear();
++  s_batch_idx.clear();
++  s_icmds.clear();
++  s_batch.clear();
++  s_batch_r0 = s_rw;
++  rph::Set(ph0);
++}
++
+ static void FlushBatch() {
++  if (s_mdi) {
++    FlushBatchMdi();
++    return;
++  }
+   if (s_batch_idx.empty()) {
+     s_draws.clear();
+     s_batch_r0 = s_rw;
+@@ -4721,15 +5139,21 @@
+     rph::s_idx += s_batch_idx.size();
+     rph::s_bytes += (uint64_t)nd * 16 + ib;
+   }
+-  GLShader &vsh = sso::s_on ? sso::Vsh(true) : *s_active;
+-  if (vsh.uXDraw >= 0) {
+-    if (sso::s_on) sso::pU1i(vsh.id, vsh.uXDraw, (GLint)du);
+-    else glUniform1i(vsh.uXDraw, (GLint)du);
++  if (!s_baseinst) {
++    GLShader &vsh = sso::s_on ? sso::Vsh(true) : *s_active;
++    if (vsh.uXDraw >= 0) {
++      if (sso::s_on) sso::pU1i(vsh.id, vsh.uXDraw, (GLint)du);
++      else glUniform1i(vsh.uXDraw, (GLint)du);
++    }
+   }
+   CBindVertexArray(s_vao);
+   rph::Set(rph::kGlDraw);
+-  glDrawElements(GL_TRIANGLES, (GLsizei)s_batch_idx.size(), GL_UNSIGNED_INT,
+-                 (const void *)(uintptr_t)(iu * 16));
++  if (s_baseinst)
++    s_draw_bi(GL_TRIANGLES, (GLsizei)s_batch_idx.size(), GL_UNSIGNED_INT,
++              (const void *)(uintptr_t)(iu * 16), 1, BaseOf(du));
++  else
++    glDrawElements(GL_TRIANGLES, (GLsizei)s_batch_idx.size(), GL_UNSIGNED_INT,
++                   (const void *)(uintptr_t)(iu * 16));
+   ++g_prof_gl_draws;
+   ++s_cap_cur.gl_draws;
+   ++st_flushes;
+@@ -4764,11 +5188,12 @@
+   const double f = (double)st_frames;
+   printf("[GPUXF] per frame: draws gpu=%.0f (display-list %.0f, new slots %.1f) cpu=%.0f "
+          "(not uniform %.0f, colour texgen %.0f) | verts ring=%.0f cpu=%.0f | palette=%.0f "
+-         "texgen=%.0f ringKB=%.0f gl=%.0f | arena %u/%u units, full %llu, waits %llu, "
+-         "finishes %llu",
++         "texgen=%.0f ringKB=%.0f gl=%.0f packed=%.0f mdi static/ring=%.0f/%.0f | arena %u/%u units, "
++         "full %llu, waits %llu, finishes %llu",
+          st_gpu / f, st_cached / f, st_cached_new / f, st_cpu / f, st_cpu_static / f,
+          st_cpu_row2 / f, st_sverts / f, st_cverts / f, st_pal / f, st_tg / f,
+-         st_units * 16.0 / 1024.0 / f, st_flushes / f, s_bump, kArenaUnits,
++         st_units * 16.0 / 1024.0 / f, st_flushes / f, st_packed / f, st_mdi_static / f,
++         st_mdi_ring / f, s_bump, kArenaUnits,
+          (unsigned long long)st_arena_full, (unsigned long long)st_waits,
+          (unsigned long long)st_finishes);
+   if (CheckEvery())
+@@ -4780,7 +5205,8 @@
+   printf("\n");
+   std::fflush(stdout);
+   st_frames = st_gpu = st_cached = st_cached_new = st_cpu = st_cpu_static = st_cpu_row2 = 0;
+-  st_sverts = st_cverts = st_pal = st_tg = st_units = st_flushes = 0;
++  st_sverts = st_cverts = st_pal = st_tg = st_units = st_flushes = st_packed = 0;
++  st_mdi_static = st_mdi_ring = 0;
+ }
+ }  // namespace xf
+ 
+@@ -4845,6 +5271,50 @@
+ }  // namespace
+ 
+ const std::vector<GXCommand *> *g_render_draws = nullptr;
++// R14 R5: the frame's draws' emit-cache entries (parallel to g_render_draws).
++const std::vector<const void *> *g_render_entries = nullptr;
++// R14 R5: the frame's packed non-display-list draws (see xf::PackHdr).
++const std::vector<uint32_t> *g_render_pack = nullptr;
++
++// R14 R5, GPU XF: prefetch from the worker's entry list, without the
++// dependent loads of the old prefetch (command -> DecodedVerts -> entry, each
++// a likely cache miss on its own: ~28 % of RenderOnce on the PC's LP-E cores).
++// A draw with an entry and an arena slot reads only the entry's tail (x_init,
++// xi, x_slot, x_n); one without (not a display list, or new) reads its vertices.
++static inline void PrefetchDrawAheadXF(const std::vector<GXCommand *> &draws,
++                                       const std::vector<const void *> &ents, size_t d) {
++  const size_t nd = ents.size();
++  if (d + 6 < nd) {
++    const void *e = ents[d + 6];
++    if (e && !(reinterpret_cast<uintptr_t>(e) & 1)) {
++      const auto *ce = static_cast<const ecache::Entry *>(e);
++      __builtin_prefetch(&ce->x_init);
++      __builtin_prefetch(reinterpret_cast<const char *>(&ce->xi) + 64);
++      __builtin_prefetch(&ce->x_n);
++    }
++  }
++  if (d + 4 < nd) {
++    const uintptr_t t = reinterpret_cast<uintptr_t>(ents[d + 4]);
++    if ((t & 1) && g_render_pack) {
++      // packed: its words, about to be copied into the ring
++      const size_t off = t >> 1;
++      if (off < g_render_pack->size()) {
++        const char *w = reinterpret_cast<const char *>(g_render_pack->data() + off);
++        for (int o = 0; o < 512; o += 64) __builtin_prefetch(w + o);
++      }
++    }
++  }
++  // A draw without an entry and not packed reads its vertices (Analyze,
++  // WriteVerts). One with an entry reads them only the first time (no arena
++  // slot yet): not prefetched, so that the entry is not read here.
++  if (d + 2 < nd && !ents[d + 2]) {
++    const GXCommand &c = *draws[d + 2];
++    const auto &vv = c.verts();
++    const char *b = (const char *)vv.data();
++    const size_t bytes = std::min<size_t>(vv.size() * sizeof(VertexData), 1536);
++    for (size_t o = 0; o < bytes; o += 64) __builtin_prefetch(b + o);
++  }
++}
+ 
+ // R7 perf: the world map draws ~11k display-list draws per frame, each
+ // reading its own heap-allocated vertex array (~7 vertices, ~1 KB) through a
+@@ -4862,7 +5332,18 @@
+   // the output.
+   if (d + 4 < draws.size()) {
+     if (const auto *sv = draws[d + 4]->shared_vertices.get())
+-      if (const void *e = sv->emit_cache.get()) __builtin_prefetch(e);
++      if (const void *e = sv->emit_cache.get()) {
++        if (xf::Active()) {
++          // R14 R5: the fields GPU XF reads (x_init, xi, x_slot: the entry's
++          // last ~110 bytes), not its head.
++          const auto *ce = static_cast<const ecache::Entry *>(e);
++          __builtin_prefetch(&ce->x_init);
++          __builtin_prefetch(reinterpret_cast<const char *>(&ce->xi) + 64);
++          __builtin_prefetch(&ce->x_slot);
++        } else {
++          __builtin_prefetch(e);
++        }
++      }
+   }
+   if (d + 2 < draws.size()) {
+     const GXCommand &c = *draws[d + 2];
+@@ -4871,6 +5352,11 @@
+     const auto *ce = c.shared_vertices
+                          ? static_cast<const ecache::Entry *>(c.shared_vertices->emit_cache.get())
+                          : nullptr;
++    // R14 R5: GPU XF reads only the entry's layout and arena slot (xi, x_slot)
++    // of a display-list draw whose raw vertices are already in the arena: its
++    // vertices are not read at all (the old prefetch below pulled ~1.5 KB of
++    // them, 24 cache lines, for each of the ~11 000 draws of a world-map frame).
++    if (ce && xf::Active() && ce->x_init && ce->x_slot >= 0) return;
+     if (ce && ce->slot >= 0) {
+       b = (const char *)ce->in_tg.data();  // the hit test reads these first
+       bytes = std::min<size_t>(ce->in_tg.size() * 4, 512);
+@@ -4886,6 +5372,73 @@
+   }
+ }
+ 
++// R14 R5: the debug/test switches read on every GX command or draw, read once.
++// Thread-safe (std::call_once): the render worker may call it too.
++static std::once_flag s_flags_once;
++static void InitFlags() {
++  std::call_once(s_flags_once, [] {
++    rph::InitLevel();
++    s_drawstats_on = NWII_ENV("NWII_DRAWSTATS") != nullptr;
++    {
++      const char *e = NWII_ENV("NWII_DRAWTRACE");
++      s_dt_on = e && std::sscanf(e, "%ld-%ld", &s_dt_from, &s_dt_to) == 2;
++    }
++    {
++      const char *e = NWII_ENV("NWII_ECACHE");
++      ecache::s_on = !(e && e[0] == '0');
++    }
++    ecache::s_check_on = NWII_ENV("NWII_ECACHE_CHECK") != nullptr;
++    s_emit4_on = NWII_ENV("NWII_NOEMIT4") == nullptr;
++  });
++}
++
++// R14 R5: called for every draw of a frame right after it is decoded, on the
++// render worker (or, without one, on the render thread inside the drain),
++// before the frame is handed to the render thread. A display-list draw's
++// emit-cache entry is made here, with what the renderer needs from its
++// vertices worked out once (texgen/position input masks; GPU XF layout and
++// matrix indices: xf::Analyze, a pure function of the decoded vertices, which
++// never change). The render thread then reads only the entry, never the
++// ~1-2 KB of decoded vertices, for every frame that draws it. Thread safety: an
++// entry is written here only while it does not exist yet (emit_cache null); a
++// packet reaches the render thread only after this ran for all its draws (the
++// hand-over mutex orders it), and the render thread never writes emit_cache
++// itself unless the entry is missing (counted: "made late"), so the two
++// threads never write the same field. Entries die on the worker as before.
++const void *GX_PrepDrawForRender(const GXCommand &cmd, std::vector<uint32_t> &pack) {
++  static thread_local bool t_flags = false;
++  if (!t_flags) { t_flags = true; InitFlags(); }
++  if (!cmd.shared_vertices) {
++    // R14 R5: any other draw (vertices decoded for this frame only, ~30 000
++    // vertices per frame in busy levels): GPU XF's Analyze() and WriteVerts()
++    // here, the render thread only copies the words into its ring. Returned
++    // as a tagged offset into `pack` ((offset << 1) | 1).
++    if (!xf::s_on_w.load(std::memory_order_relaxed)) return nullptr;
++    const auto &v = cmd.vertices;
++    const uint32_t n = (uint32_t)v.size();
++    if (!n || (cmd.prim_type & 0xF8) >= 0xA8) return nullptr;
++    xf::PackHdr h;
++    h.xi = xf::Analyze(v);
++    h.n = n;
++    h.words = h.xi.ok ? n * h.xi.stride : 0;
++    const size_t off = pack.size();
++    pack.resize(off + xf::kPackHdrWords + h.words);
++    std::memcpy(pack.data() + off, &h, sizeof h);
++    if (h.words) xf::WriteVerts(v, n, h.xi, pack.data() + off + xf::kPackHdrWords);
++    return reinterpret_cast<const void *>((uintptr_t)((off << 1) | 1));
++  }
++  if (!ecache::On()) return nullptr;
++  const DecodedVerts &dv = *cmd.shared_vertices;
++  if (dv.emit_cache) return dv.emit_cache.get();
++  auto e = MakeHost<ecache::Entry>();
++  ecache::InitDeps(*e, dv);
++  e->xi = xf::Analyze(dv);
++  e->x_init = true;
++  dv.emit_cache = e;
++  ecache::s_entries_prep.fetch_add(1, std::memory_order_relaxed);
++  return dv.emit_cache.get();
++}
++
+ class RendererGL : public IRenderer {
+ public:
+   RendererGL() = default;
+@@ -4987,6 +5540,8 @@
+   }
+ 
+   void RenderOnce(const std::vector<GXCommand> &commands) {
++    static bool s_flags = false;
++    if (!s_flags) { s_flags = true; InitFlags(); }
+     rph::Set(rph::kFrame);
+     // The frontend binds the EFB before every drain; read it (and its
+     // colour texture) once.
+@@ -5056,8 +5611,25 @@
+     static const bool s_nobatch = NWII_ENV("NWII_NOBATCH") != nullptr;
+     static const bool s_noprefetch = NWII_ENV("NWII_NOPREFETCH") != nullptr;
+     const std::vector<GXCommand *> *draws = s_noprefetch ? nullptr : g_render_draws;
++    // R14 R5: the worker's per-draw entries (GPU XF; not in the r8 pass of
++    // NWII_R9_FRAMECHECK, where the emit cache is off).
++    const std::vector<const void *> *ents =
++        (draws && g_render_entries && g_render_entries->size() == draws->size() &&
++         xf::Active() && ecache::On())
++            ? g_render_entries : nullptr;
+     size_t draw_ord = 0;  // index of the next draw in *draws
+-    for (const auto &cmd : commands) {
++    const GXCommand *const cmd0 = commands.data();
++    const size_t ncmd = commands.size();
++    for (size_t ci = 0; ci < ncmd; ++ci) {
++      const GXCommand &cmd = cmd0[ci];
++      // R14 R5: the command array is walked once, in order, 136 bytes a
++      // command (~45 000 per world-map frame, ~6 MB: the first load of each was
++      // the top miss of RenderOnce). Fetch 8 commands ahead.
++      if (ci + 8 < ncmd) {
++        const char *pf = reinterpret_cast<const char *>(cmd0 + ci + 8);
++        __builtin_prefetch(pf);
++        __builtin_prefetch(pf + 72);
++      }
+       if (rph::On())
+         rph::Set(cmd.type == GXCommandType::DrawPrimitive ? rph::kState : rph::kRegs);
+       if (s_nobatch && cmd.type != GXCommandType::DrawPrimitive && s_batch_open) {
+@@ -5220,12 +5792,34 @@
+       } else if (cmd.type == GXCommandType::DrawPrimitive) {
+         if (draws) {
+           // The list must be this frame's draws, in order; else stop using it.
+-          if (draw_ord < draws->size() && (*draws)[draw_ord] == &cmd)
+-            PrefetchDrawAhead(*draws, draw_ord++);
+-          else
++          if (draw_ord < draws->size() && (*draws)[draw_ord] == &cmd) {
++            if (ents) {
++              const void *e = (*ents)[draw_ord];
++              const uintptr_t t = reinterpret_cast<uintptr_t>(e);
++              if (t & 1) {
++                // A packed draw (tagged offset into g_render_pack).
++                ecache::s_hint = nullptr;
++                const size_t off = t >> 1;
++                if (g_render_pack && off + xf::kPackHdrWords <= g_render_pack->size()) {
++                  xf::s_pack_hint = reinterpret_cast<const xf::PackHdr *>(g_render_pack->data() + off);
++                  xf::s_pack_words = g_render_pack->data() + off + xf::kPackHdrWords;
++                }
++              } else {
++                ecache::s_hint = const_cast<ecache::Entry *>(static_cast<const ecache::Entry *>(e));
++              }
++              ecache::s_hint_ok = true;
++              PrefetchDrawAheadXF(*draws, *ents, draw_ord++);
++            } else {
++              PrefetchDrawAhead(*draws, draw_ord++);
++            }
++          } else {
+             draws = nullptr;
++            ents = nullptr;
++          }
+         }
+         DrawPrimitive(cmd);
++        ecache::s_hint_ok = false;
++        xf::s_pack_hint = nullptr;
+       }
+     }
+     rph::Set(rph::kFrame);
+diff --color -ru r13/nWiiRuntime/src/hle/gx.cpp r14r5/nWiiRuntime/src/hle/gx.cpp
+--- r13/nWiiRuntime/src/hle/gx.cpp	2026-11-08 13:20:49.853890579 -0500
++++ r14r5/nWiiRuntime/src/hle/gx.cpp	2026-11-08 18:54:57.673830038 -0500
+@@ -94,6 +94,36 @@
+ // waits on the sum, so frames held by the worker still count as "not taken by
+ // the host" and a stalled renderer stops the guest as before.
+ static uint32_t s_held_frames = 0;
++// ---- R14 R5: pipeline timing ([PIPE] every 2 s, render thread) ---------------
++// Where a frame's time goes between the game's XFB copy (frame end handed to
++// the FIFO), the worker's hand-over, the render thread taking and drawing it
++// and the buffer swap. Monotonic ns; game-side figures are atomics (written
++// under g_fifo_mutex by the guest thread).
++static inline int64_t PipeNow() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++static std::atomic<int64_t> s_pipe_xfb_last{0};
++static std::atomic<uint64_t> s_pipe_xfb_n{0}, s_pipe_xfb_sum{0}, s_pipe_xfb_max{0};
++static std::atomic<uint32_t> s_pipe_xfb_h[5];  // interval <=18, <=22, <=30, <=36, >36 ms
++static inline void PipeNoteXfb() {  // guest thread, g_fifo_mutex held
++    const int64_t t = PipeNow();
++    const int64_t l = s_pipe_xfb_last.exchange(t, std::memory_order_relaxed);
++    if (!l) return;
++    const uint64_t d = (uint64_t)(t - l);
++    s_pipe_xfb_n.fetch_add(1, std::memory_order_relaxed);
++    s_pipe_xfb_sum.fetch_add(d, std::memory_order_relaxed);
++    if (d > s_pipe_xfb_max.load(std::memory_order_relaxed)) s_pipe_xfb_max.store(d, std::memory_order_relaxed);
++    const double ms = d / 1e6;
++    s_pipe_xfb_h[ms <= 18 ? 0 : ms <= 22 ? 1 : ms <= 30 ? 2 : ms <= 36 ? 3 : 4].fetch_add(
++        1, std::memory_order_relaxed);
++}
++// worker: frame end (newest XFB copy) -> hand-over
++static std::atomic<uint64_t> s_pipe_w_n{0}, s_pipe_w_sum{0}, s_pipe_w_max{0};
++// render thread (plain): hand-over -> taken, render time, swap time, loop period
++static uint64_t s_pipe_r_n = 0, s_pipe_r_wait = 0, s_pipe_r_wait_max = 0, s_pipe_r_draw = 0,
++                s_pipe_r_draw_max = 0, s_pipe_s_n = 0, s_pipe_s_sum = 0, s_pipe_s_max = 0,
++                s_pipe_l_n = 0, s_pipe_l_sum = 0, s_pipe_l_max = 0;
+ static std::atomic<std::thread::id> s_host_tid{};  // the thread that drains (ProcessGXFifo)
+ static std::atomic<uint64_t> s_fifo_waits{0}, s_fifo_wait_us{0};
+ static uint32_t FifoMaxFrames() {
+@@ -522,9 +552,16 @@
+ // lent to Render() for the duration of the call so it can prefetch the
+ // vertex arrays of the draws ahead of the one it is emitting.
+ extern const std::vector<GXCommand*>* g_render_draws;
++const void *GX_PrepDrawForRender(const GXCommand &cmd, std::vector<uint32_t> &pack);  // renderer_gl.cpp (R14 R5)
++extern const std::vector<const void *> *g_render_entries;  // renderer_gl.cpp (R14 R5)
++extern const std::vector<uint32_t> *g_render_pack;         // renderer_gl.cpp (R14 R5)
+ }
+ static uint64_t g_ph[8], g_ph_n;
+ static std::vector<nwii::runtime::gx::GXCommand*> s_draws;
++// R14 R5: per draw of s_draws, its emit-cache entry (made on this side) or null.
++static std::vector<const void*> s_draw_entries;
++// R14 R5: GPU XF words of the frame's non-display-list draws (renderer_gl.cpp xf::PackHdr).
++static std::vector<uint32_t> s_draw_pack;
+ // NWII_R7PH=<pmu>: drain cost per rendered frame split by phase, in host
+ // thread cycles of perf PMU <pmu> (cpu_atom / cpu_core on hybrid Intel,
+ // cpu elsewhere; the thread must stay on that core type), or in thread CPU
+@@ -632,6 +669,7 @@
+     TrimVec(s_frame, cmds);
+     TrimVec(s_tail, cmds);
+     TrimVec(s_draws, cmds);
++    TrimVec(s_draw_entries, cmds);
+     TrimVec(s_carry_draws, cmds);
+ }
+ 
+@@ -677,8 +715,11 @@
+ struct FramePacket {
+     std::vector<nwii::runtime::gx::GXCommand> frame;
+     std::vector<nwii::runtime::gx::GXCommand *> draws;  // frame's draws, in order
++    std::vector<const void *> entries;  // R14 R5: draws[i]'s emit-cache entry, packed draw, or null
++    std::vector<uint32_t> pack;         // R14 R5: packed draws' words
+     nwii::runtime::gx::ParseRenderState state;          // worker mode only
+     PrepStats stats;
++    int64_t t_ready = 0;  // R14 R5: hand-over time (PipeNow)
+ };
+ PrepStats s_prep_pending;      // preparing side: counters since the last packet
+ uint64_t s_prep_frames = 0;    // preparing side: frames produced
+@@ -724,6 +765,9 @@
+ 
+ // True on the render worker thread (renderer_gl.cpp defers arena frees).
+ bool GX_OnRenderWorker() { return t_on_worker; }
++// R14 R5: a render worker prepares the frames (renderer_gl.cpp: the render
++// thread then never makes an emit-cache entry itself).
++bool GX_RenderWorkerOn() { return s_worker_on.load(std::memory_order_relaxed); }
+ 
+ // A frame packet the worker took back before the render thread took it (a
+ // newer frame is complete): it becomes the dropped part of the next frame,
+@@ -743,6 +787,8 @@
+     }
+     v.erase(v.begin() + w, v.end());
+     pkt.draws.clear();
++    pkt.entries.clear();
++    pkt.pack.clear();
+     ++pkt.stats.retracts;
+ }
+ 
+@@ -863,6 +909,8 @@
+         // commands die here (worker: on the worker thread).
+         pkt.frame.clear();
+         pkt.draws.clear();
++        pkt.entries.clear();
++        pkt.pack.clear();
+     }
+     // NWII_NOFRAMESKIP=1: render every frame of the batch (only the last one
+     // is presented), so EFB copies of earlier frames are made with their draws.
+@@ -1020,6 +1068,8 @@
+                    (unsigned long long)checked, (unsigned long long)bad);
+     }
+     const size_t nd = s_draws.size();
++    s_draw_entries.resize(nd);
++    s_draw_pack.clear();
+     for (size_t i = 0; i < nd; ++i) {
+         if (i + 8 < nd) {
+             if (auto *r = s_draws[i + 8]->raw.get()) {
+@@ -1036,6 +1086,7 @@
+             }
+         }
+         nwii::runtime::gx::FifoParser::DecodeDraw(*s_draws[i]);
++        s_draw_entries[i] = nwii::runtime::gx::GX_PrepDrawForRender(*s_draws[i], s_draw_pack);  // R14 R5
+     }
+     s_prep_pending.draws += nd;
+     PH(4);
+@@ -1047,6 +1098,8 @@
+     // frame's, so their capacity is reused.
+     pkt.frame.swap(s_frame);
+     pkt.draws.swap(s_draws);
++    pkt.entries.swap(s_draw_entries);
++    pkt.pack.swap(s_draw_pack);
+     if (!apply_now) {
+         nwii::runtime::gx::FifoParser::TakeRenderState(pkt.state);
+         if (retracted) {
+@@ -1145,6 +1198,30 @@
+                      return s_held_frames;
+                  }();
+     std::cout << "\n";
++    {
++        // R14 R5: [PIPE] (see PipeNoteXfb)
++        auto ms = [](uint64_t ns, uint64_t n) { return n ? ns / 1e6 / n : 0.0; };
++        const uint64_t xn = s_pipe_xfb_n.exchange(0), xs = s_pipe_xfb_sum.exchange(0),
++                       xm = s_pipe_xfb_max.exchange(0);
++        uint32_t h[5];
++        for (int i = 0; i < 5; ++i) h[i] = s_pipe_xfb_h[i].exchange(0);
++        const uint64_t wn = s_pipe_w_n.exchange(0), ws = s_pipe_w_sum.exchange(0),
++                       wm = s_pipe_w_max.exchange(0);
++        char b[640];
++        std::snprintf(b, sizeof b,
++                      "[PIPE] game frames=%llu interval avg=%.1f max=%.1f ms (<=18:%u <=22:%u <=30:%u <=36:%u >36:%u)"
++                      " | worker frame-end->ready avg=%.1f max=%.1f ms (n=%llu)"
++                      " | render ready->taken avg=%.1f max=%.1f, draw avg=%.1f max=%.1f ms (n=%llu)"
++                      " | swap avg=%.1f max=%.1f ms, loop avg=%.1f max=%.1f ms (n=%llu)\n",
++                      (unsigned long long)xn, ms(xs, xn), xm / 1e6, h[0], h[1], h[2], h[3], h[4],
++                      ms(ws, wn), wm / 1e6, (unsigned long long)wn, ms(s_pipe_r_wait, s_pipe_r_n),
++                      s_pipe_r_wait_max / 1e6, ms(s_pipe_r_draw, s_pipe_r_n), s_pipe_r_draw_max / 1e6,
++                      (unsigned long long)s_pipe_r_n, ms(s_pipe_s_sum, s_pipe_s_n), s_pipe_s_max / 1e6,
++                      ms(s_pipe_l_sum, s_pipe_l_n), s_pipe_l_max / 1e6, (unsigned long long)s_pipe_l_n);
++        std::cout << b;
++        s_pipe_r_n = s_pipe_r_wait = s_pipe_r_wait_max = s_pipe_r_draw = s_pipe_r_draw_max = 0;
++        s_pipe_s_n = s_pipe_s_sum = s_pipe_s_max = s_pipe_l_n = s_pipe_l_sum = s_pipe_l_max = 0;
++    }
+     g_prof_gpu_us = g_prof_gpu_frames = 0;
+     g_prof_dropped_frames = 0;
+     g_prof_tex_bind_saves = 0;
+@@ -1198,8 +1275,13 @@
+             const bool gpuprof = g_gpu_timer.on();
+             if (gpuprof) g_gpu_timer.begin();
+             nwii::runtime::gx::g_render_draws = &pkt.draws;
++            nwii::runtime::gx::g_render_entries =
++                pkt.entries.size() == pkt.draws.size() ? &pkt.entries : nullptr;
++            nwii::runtime::gx::g_render_pack = &pkt.pack;
+             g_renderer->Render(pkt.frame);
+             nwii::runtime::gx::g_render_draws = nullptr;
++            nwii::runtime::gx::g_render_entries = nullptr;
++            nwii::runtime::gx::g_render_pack = nullptr;
+             if (gpuprof) g_gpu_timer.end();
+             g_prof_render_cpu_us += thread_cpu_us() - rc0;
+             auto r1 = std::chrono::steady_clock::now();
+@@ -1288,6 +1370,16 @@
+     for (;;) {
+         if (FramePacket *fill = PrepFrame(acquire, false)) {
+             {
++                const int64_t t = PipeNow();
++                const int64_t x = s_pipe_xfb_last.load(std::memory_order_relaxed);
++                if (x && t > x) {
++                    const uint64_t d = (uint64_t)(t - x);
++                    s_pipe_w_n.fetch_add(1, std::memory_order_relaxed);
++                    s_pipe_w_sum.fetch_add(d, std::memory_order_relaxed);
++                    if (d > s_pipe_w_max.load(std::memory_order_relaxed))
++                        s_pipe_w_max.store(d, std::memory_order_relaxed);
++                }
++                fill->t_ready = t;
+                 std::lock_guard<std::mutex> lk(s_pm);
+                 s_ready = fill;
+             }
+@@ -1362,6 +1454,22 @@
+     s_worker_on.store(false);
+ }
+ 
++// R14 R5: main loop timing for [PIPE]: the buffer swap and the loop period.
++void GX_PipeNoteSwap(int64_t swap_ns) {
++    static int64_t last = 0;
++    const int64_t t = PipeNow();
++    ++s_pipe_s_n;
++    s_pipe_s_sum += (uint64_t)swap_ns;
++    s_pipe_s_max = std::max(s_pipe_s_max, (uint64_t)swap_ns);
++    if (last) {
++        const uint64_t d = (uint64_t)(t - last);
++        ++s_pipe_l_n;
++        s_pipe_l_sum += d;
++        s_pipe_l_max = std::max(s_pipe_l_max, d);
++    }
++    last = t;
++}
++
+ // Frame-paced main loop: wait for the next drain. Without the worker, sleep
+ // `poll_us` (the drain polls the FIFO); with it, wake as soon as a frame is
+ // ready, at most `max_us` later.
+@@ -1411,8 +1519,18 @@
+         static const bool noskip = NWII_ENV("NWII_NOFRAMESKIP") != nullptr;
+         if (noskip) s_cv_worker.notify_one();  // the worker may wait for this
+         const uint64_t c0 = thread_cpu_us();
++        const int64_t t0 = PipeNow();
+         RenderPacket(*p, true);
+         g_prof_drain_cpu_us += thread_cpu_us() - c0;
++        {
++            const uint64_t w = p->t_ready && t0 > p->t_ready ? (uint64_t)(t0 - p->t_ready) : 0;
++            const uint64_t d = (uint64_t)(PipeNow() - t0);
++            ++s_pipe_r_n;
++            s_pipe_r_wait += w;
++            s_pipe_r_draw += d;
++            s_pipe_r_wait_max = std::max(s_pipe_r_wait_max, w);
++            s_pipe_r_draw_max = std::max(s_pipe_r_draw_max, d);
++        }
+         std::lock_guard<std::mutex> lk(s_pm);
+         s_rendering = nullptr;  // the worker frees its commands
+         return;
+@@ -1715,6 +1833,7 @@
+         g_hw_fifo.insert(g_hw_fifo.end(), s_wg, s_wg + s_wg_n);
+         if (s_wg_xfb) {
+             s_wg_xfb = false;
++            PipeNoteXfb();
+             const uint32_t max = FifoMaxFrames();
+             s_wg_full = ++s_fifo_frames + s_held_frames >= max && max != 0;
+         }
+@@ -1852,6 +1971,7 @@
+         wgp_push4(val);
+         // BP 0x52 with bit 14: the copy to the XFB that ends a game frame.
+         if (bp && (val >> 24) == 0x52 && (val & 0x4000)) {
++            PipeNoteXfb();
+             const uint32_t max = FifoMaxFrames();
+             full = ++s_fifo_frames + s_held_frames >= max && max != 0;
+         }
+diff --color -ru r13/nWiiRuntime/src/hle/texture_cache_gl.cpp r14r5/nWiiRuntime/src/hle/texture_cache_gl.cpp
+--- r13/nWiiRuntime/src/hle/texture_cache_gl.cpp	2026-10-31 06:08:13.580305463 -0500
++++ r14r5/nWiiRuntime/src/hle/texture_cache_gl.cpp	2026-11-08 17:59:29.217453936 -0500
+@@ -1,5 +1,6 @@
+ #include "runtime/nwii_env.h"
+ #include "runtime/texture_cache_gl.h"
++#include <cstdio>
+ #include <iostream>
+ #include <cstring>
+ #include <algorithm>
+@@ -39,10 +40,20 @@
+     ++gl_touches_;
+ }
+ 
++void TextureCache::index_erase(const std::pair<const TextureKey, Entry>* kv) {
++    auto r = by_addr_.equal_range(kv->first.addr);
++    for (auto it = r.first; it != r.second; ++it)
++        if (it->second == kv) {
++            by_addr_.erase(it);
++            return;
++        }
++}
++
+ void TextureCache::clear() {
+     for (auto& pair : cache)
+         glDeleteTextures(1, &pair.second.tex);
+     cache.clear();
++    by_addr_.clear();
+     // EFB copies survive: the renderer refills them every copy.
+ }
+ 
+@@ -104,17 +115,49 @@
+     }
+ }
+ 
++// R14 R5 counters ([TCSTAT] every 600 frames): hash_ram calls and sampled
++// words, by caller; EFB copies and the cache entries they examined.
++static uint64_t st_hash_tex = 0, st_hash_efb_get = 0, st_hash_efb_done = 0, st_hash_words = 0,
++                st_efb_done = 0, st_efb_scan = 0, st_frames = 0;
++
++// Content hash of guest RAM [addr, addr+size): one word every 32 bytes (one
++// every size/4096 for large ranges). Only ever compared with another value of
++// this same function. R14 R5: four FNV-1a lanes over consecutive samples
++// (same words as before) instead of one serial chain, so the multiplies of
++// four samples overlap (the serial chain was ~5 cycles per word on the A57);
++// the value differs from the r13 one, which nothing stored keeps.
+ static uint32_t hash_ram(CPUContext* ctx, uint32_t addr, uint32_t size) {
+     uint32_t hash = 2166136261u;
+     if (!ctx || !size) return hash;
+     const uint8_t* p = ctx->mmu.get_ptr(addr);
+     if (!p) return hash;
+     const uint32_t stride = size > 32 * 4096 ? (size / 4096) & ~3u : 32;
+-    for (uint32_t off = 0; off + 4 <= size; off += stride) {
++    uint32_t h0 = 2166136261u, h1 = 0x01000193u, h2 = 0x9E3779B9u, h3 = 0x85EBCA6Bu;
++    uint32_t off = 0;
++    uint64_t words = 0;
++    for (; off + 3 * stride + 4 <= size; off += 4 * stride) {
++        uint32_t w0, w1, w2, w3;
++        std::memcpy(&w0, p + off, 4);
++        std::memcpy(&w1, p + off + stride, 4);
++        std::memcpy(&w2, p + off + 2 * stride, 4);
++        std::memcpy(&w3, p + off + 3 * stride, 4);
++        h0 = (h0 ^ w0) * 16777619u;
++        h1 = (h1 ^ w1) * 16777619u;
++        h2 = (h2 ^ w2) * 16777619u;
++        h3 = (h3 ^ w3) * 16777619u;
++        words += 4;
++    }
++    for (; off + 4 <= size; off += stride) {
+         uint32_t w;
+         std::memcpy(&w, p + off, 4);
+-        hash = (hash ^ w) * 16777619u;
++        h0 = (h0 ^ w) * 16777619u;
++        ++words;
+     }
++    st_hash_words += words;
++    hash = (hash ^ h0) * 16777619u;
++    hash = (hash ^ h1) * 16777619u;
++    hash = (hash ^ h2) * 16777619u;
++    hash = (hash ^ h3) * 16777619u;
+     return hash;
+ }
+ 
+@@ -127,8 +170,16 @@
+     auto ec = efb_copies.find(addr);
+     if (ec != efb_copies.end() && ec->second.w == stage.width &&
+         ec->second.h == stage.height) {
+-        if (ec->second.frame == frame_ ||
+-            hash_ram(&ctx, addr, ec->second.bytes) == ec->second.ram_hash)
++        if (ec->second.frame == frame_)
++            return ec->second.tex;
++        // R14 R5: memoised for the frame, as the texel hash below.
++        EfbCopy& cp = ec->second;
++        if (cp.seen_frame != frame_) {
++            cp.seen_hash = hash_ram(&ctx, addr, cp.bytes);
++            cp.seen_frame = frame_;
++            ++st_hash_efb_get;
++        }
++        if (cp.seen_hash == cp.ram_hash)
+             return ec->second.tex;
+         // A batch not yet drawn may still sample it: delete at frame end.
+         retired_.push_back(ec->second.tex);
+@@ -138,12 +189,15 @@
+ 
+     TextureKey key = {addr, stage.width, stage.height, stage.format,
+                       stage.tlut_offset, stage.tlut_format};
+-    Entry& e = cache[key];
++    auto ins = cache.try_emplace(key);
++    Entry& e = ins.first->second;
++    if (ins.second) by_addr_.emplace(addr, &*ins.first);
+ 
+     // Texel hash, memoised for the frame (the 8 maps are looked up per batch).
+     if (e.data_frame != frame_) {
+         e.data_hash = hash_ram(&ctx, addr, size);
+         e.data_frame = frame_;
++        ++st_hash_tex;
+     }
+     uint32_t hash = e.data_hash;
+ 
+@@ -191,6 +245,7 @@
+     UnloadImage(img);
+     e.hash = hash;
+     e.size = size;
++    if (size > max_size_) max_size_ = size;
+     stitch_into(e.tex, stage, addr, size);
+     return e.tex;
+ }
+@@ -213,6 +268,15 @@
+ 
+ void TextureCache::end_frame() {
+     ++frame_;
++    if (++st_frames == 600) {
++        const double f = (double)st_frames;
++        printf("[TCSTAT] per frame: hash_ram tex=%.1f efb_get=%.1f efb_done=%.1f words=%.0f | "
++               "efb copies=%.1f scanned=%.1f | entries=%zu efb=%zu max_size=%u\n",
++               st_hash_tex / f, st_hash_efb_get / f, st_hash_efb_done / f, st_hash_words / f,
++               st_efb_done / f, st_efb_scan / f, cache.size(), efb_copies.size(), max_size_);
++        st_hash_tex = st_hash_efb_get = st_hash_efb_done = st_hash_words = 0;
++        st_efb_done = st_efb_scan = st_frames = 0;
++    }
+     if (!retired_.empty()) {
+         glDeleteTextures((GLsizei)retired_.size(), retired_.data());
+         retired_.clear();
+@@ -222,6 +286,7 @@
+         for (auto it = cache.begin(); it != cache.end();) {
+             if (it->second.last_used + 600 < frame_) {
+                 glDeleteTextures(1, &it->second.tex);
++                index_erase(&*it);
+                 it = cache.erase(it);
+             } else {
+                 ++it;
+@@ -294,11 +359,19 @@
+     c.bytes = ((h + bh - 1) / bh - 1) * c.stride + row_bytes;
+     c.ram_hash = hash_ram(ctx, addr, c.bytes);
+     c.frame = frame_;
++    ++st_hash_efb_done;
++    ++st_efb_done;
+ 
+     // Partial update of a larger texture already decoded from RAM.
+-    for (auto& kv : cache) {
+-        const TextureKey& k = kv.first;
+-        const Entry& e = kv.second;
++    // R14 R5: only the entries starting in [addr - max_size_, addr] can
++    // contain addr (was: every entry of the cache, ~420 on the world map, per
++    // copy). Same entries, same test; they are visited in address order
++    // instead of hash order (each stitch writes its own texture).
++    const uint32_t lo = addr > max_size_ ? addr - max_size_ : 0;
++    for (auto it = by_addr_.lower_bound(lo); it != by_addr_.end() && it->first <= addr; ++it) {
++        const TextureKey& k = it->second->first;
++        const Entry& e = it->second->second;
++        ++st_efb_scan;
+         if (!e.tex || k.addr == addr || addr < k.addr || addr >= k.addr + e.size)
+             continue;
+         stitch_one(e.tex, k.addr, k.width, k.height, k.format, c, addr);

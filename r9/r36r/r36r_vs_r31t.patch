@@ -1,0 +1,832 @@
+diff --color -ru r31t/nWiiRuntime/src/hle/gx/renderer_gl.cpp r36r/nWiiRuntime/src/hle/gx/renderer_gl.cpp
+--- r31t/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-08 21:23:01.160864493 -0500
++++ r36r/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-15 03:14:46.838177929 -0500
+@@ -2840,6 +2840,9 @@
+ }
+ 
+ static inline uint32_t DrawVertCount(const GXCommand &cmd);  // R14 R5 (after ecache::)
++// r36r (r13): NWII_DRAWLOG / NWII_DRAWLOG_N / NWII_XFLOG, set once by InitFlags().
++static bool s_dl_on = false;
++static long s_dl_from = 0, s_dl_n = 40, s_xflog_n = 0;
+ static void DrawPrimitive(const GXCommand &cmd) {
+   // R14 R5: the vertex count from the draw's emit-cache entry when the render
+   // worker's list gave it (no read of the DecodedVerts).
+@@ -2848,12 +2851,12 @@
+     return;
+ 
+   // NWII_DRAWLOG=<n>: log 40 draws starting at draw number n (default 0).
+-  static const char *s_drawlog_env = NWII_ENV("NWII_DRAWLOG");
+-  static const bool s_drawlog = s_drawlog_env != nullptr;
+-  static const long s_drawlog_from = s_drawlog ? std::atol(s_drawlog_env) : 0;
++  // r36r (r13): read once by InitFlags (were function-local statics: an
++  // acquire load of each guard on every draw).
++  const bool s_drawlog = s_dl_on;
++  const long s_drawlog_from = s_dl_from;
+   static long s_draw_seq = 0;
+-  static const long s_drawlog_n =
+-      NWII_ENV("NWII_DRAWLOG_N") ? std::atol(NWII_ENV("NWII_DRAWLOG_N")) : 40;
++  const long s_drawlog_n = s_dl_n;
+   if (s_drawlog && s_draw_seq++ >= s_drawlog_from) {
+     const auto &v = cmd.verts();
+     static int dn = 0;
+@@ -3579,6 +3582,10 @@
+   uint8_t x_cls = 0;
+   int64_t x_slot = -1;
+   uint32_t x_n = 0;  // R14 R5: vertex count of the draw (set with the masks)
++  // r36r NWII_R_CULL: bounding box of the raw positions (min xyz, max xyz),
++  // set with xi when every vertex has a position (xi.ok, xi.hp).
++  bool x_bb_ok = false;
++  float x_bb[6] = {};
+   // R14 R5, NWII_GPU_XF_MDI: the draw's triangle indices (local vertex
+   // numbers) kept in the GPU XF arena like its vertices: arena unit, count,
+   // the primitive they were made for.
+@@ -3744,6 +3751,7 @@
+   }
+ }
+ }  // namespace ecache
++static void SetBoundingBox(ecache::Entry &e, const std::vector<VertexData> &v);  // r36r
+ static inline uint32_t DrawVertCount(const GXCommand &cmd) {
+   const ecache::Entry *he = ecache::Get(cmd);
+   return he ? he->x_n : (uint32_t)cmd.verts().size();
+@@ -4828,11 +4836,18 @@
+ // (mi & 31) (3 more units, one row of three per unit).
+ // R14 R5: 48-byte equality without a memcmp call (bitwise, as memcmp).
+ static inline bool Same48(const float *a, const float *b) {
+-  uint64_t x[6], y[6];
+-  std::memcpy(x, a, 48);
+-  std::memcpy(y, b, 48);
+-  return !((x[0] ^ y[0]) | (x[1] ^ y[1]) | (x[2] ^ y[2]) | (x[3] ^ y[3]) | (x[4] ^ y[4]) |
+-           (x[5] ^ y[5]));
++  // r36r (r13): three 16-byte vector loads per side (was two 48-byte arrays the
++  // compiler spilled to the stack); the same bitwise comparison.
++  typedef uint64_t v2u __attribute__((vector_size(16)));
++  v2u a0, a1, a2, b0, b1, b2;
++  std::memcpy(&a0, a, 16);
++  std::memcpy(&a1, a + 4, 16);
++  std::memcpy(&a2, a + 8, 16);
++  std::memcpy(&b0, b, 16);
++  std::memcpy(&b1, b + 4, 16);
++  std::memcpy(&b2, b + 8, 16);
++  const v2u x = (a0 ^ b0) | (a1 ^ b1) | (a2 ^ b2);
++  return !(x[0] | x[1]);
+ }
+ static uint32_t PalPosNrm(int mi, bool pxf, bool nxf) {
+   const float *m = &g_state.posMatrices[mi * 4];
+@@ -4876,6 +4891,28 @@
+ static uint32_t s_tg_last[16];
+ static uint64_t s_tg_epoch = 0;
+ static uint32_t s_tg_unit = 0;
++// r36r NWII_R_TGMEMO=1: the texgen record of the last draw that built one, kept
++// with what it was built from (texgen config, texture matrix indices) and the
++// matrix rows it read. RenderOnce marks every position/post matrix row an XF
++// write touches (s_rows_*_w, a bit per 4-float row); while none of the rows the
++// record read was written, the same inputs give the same record (and the same
++// palette units, valid for the frame: s_epoch), so it is reused as is.
++static uint64_t s_rows_pos_w = ~0ull, s_rows_post_w = ~0ull;
++struct TgMemo {
++  bool valid = false;
++  uint64_t epoch = 0, dep_pos = 0, dep_post = 0;
++  uint32_t key[9] = {};
++  uint32_t rec[16] = {};
++};
++static TgMemo s_tgm;
++static uint64_t st_tgm_hit = 0, st_tgm_miss = 0;
++static bool TgMemoOn() {
++  static const bool on = [] {
++    const char *e = NWII_ENV("NWII_R_TGMEMO");
++    return e && e[0] == '1';
++  }();
++  return on;
++}
+ 
+ // ---- vertices ----------------------------------------------------------------
+ static inline uint8_t TexMask(const VertexData &x) {
+@@ -5012,25 +5049,123 @@
+ struct PackHdr {
+   Info xi;
+   uint32_t n, words;
++  bool bb_ok;   // r36r NWII_R_CULL: raw position bounding box (see SetBoundingBox)
++  float bb[6];
+ };
+ static constexpr uint32_t kPackHdrWords = (sizeof(PackHdr) + 3) / 4;
+ static const PackHdr *s_pack_hint = nullptr;  // the draw being rendered (null: none)
+ static const uint32_t *s_pack_words = nullptr;
+ 
++// ---- r36r NWII_R_CULL: draws entirely outside the clip volume ----------------
++// A cached (display-list) draw whose vertices all use one position matrix is
++// skipped when its raw-position bounding box, transformed by that matrix and
++// the projection the vertex shader uses (ApplyProjection), lies entirely on
++// the outer side of one of the clip planes x = +-w, y = +-w. Each plane test
++// d(P) = +-x_clip - w_clip is an affine function of the object-space position,
++// so its minimum over the box is at a corner and every vertex (all inside the
++// box) is outside too: GL clips such triangles away completely (depth clamp
++// only turns off the near/far planes), so they never produce a fragment and
++// the image is the same. Double precision and a relative margin of 1e-3 keep
++// the test conservative against the GPU's float rounding. Nothing else of the
++// draw is skipped (its state, textures and batch were set up before Emit).
++// NWII_R_CULL=1 on (default off).
++static uint64_t st_culled = 0, st_culled_packed = 0;
++// r12: RenderOnce already ran the test on this draw (and kept it): Emit skips it.
++static bool s_cull_done = false;
++static bool CullOn() {
++  static const bool on = [] {
++    const char *e = NWII_ENV("NWII_R_CULL");
++    return e && (e[0] == '1' || e[0] == '2');
++  }();
++  return on;
++}
++static bool Culled(const float bb[6], int mi) {
++  // Each clip plane d = +-x_clip - w_clip (or y) is an affine function of the
++  // object-space position: d(P) = c0*x + c1*y + c2*z + c3, built from the
++  // matrix rows and the projection exactly as ApplyProjection lays it out. Its
++  // minimum over the box is c3 + sum_k min(c_k*lo_k, c_k*hi_k).
++  // r8: single precision (the margin, 1e-3 of the terms' magnitude, is ~10^4
++  // times the rounding error of these few operations) and the box minimum per
++  // plane: the 8-corner double version of r4-r6 cost ~0.5 us a draw on the
++  // Switch, as much as the emit it saved.
++  const float *m = &g_state.posMatrices[mi * 4];
++  const float *sp = g_state.projection;
++  const float lo0 = bb[0], lo1 = bb[1], lo2 = bb[2], hi0 = bb[3], hi1 = bb[4], hi2 = bb[5];
++  auto test = [&](float c0, float c1, float c2, float c3) {
++    const float a0 = c0 * lo0, b0 = c0 * hi0, a1 = c1 * lo1, b1 = c1 * hi1, a2 = c2 * lo2, b2 = c2 * hi2;
++    const float dmin = std::min(a0, b0) + std::min(a1, b1) + std::min(a2, b2) + c3;
++    const float scale = std::max(std::fabs(a0), std::fabs(b0)) + std::max(std::fabs(a1), std::fabs(b1)) +
++                        std::max(std::fabs(a2), std::fabs(b2)) + std::fabs(c3) + 1.0f;
++    return dmin > 1e-3f * scale;  // false on NaN
++  };
++  if (!g_state.projSet || g_state.projType != 0) {
++    // orthographic (or no projection: identity): w = 1. r14: the box as centre
++    // c and half size h: over the box, x_clip ranges over X +- R with
++    // X = sx*(m0.c + m3) + tx and R = |sx| * (|m0|.h) (the same minimum as the
++    // per-plane form, both x planes from one centre/radius; same for y).
++    const float sx = g_state.projSet ? sp[0] : 1.0f, tx = g_state.projSet ? sp[1] : 0.0f;
++    const float sy = g_state.projSet ? sp[2] : 1.0f, ty = g_state.projSet ? sp[3] : 0.0f;
++    const float c0 = 0.5f * (lo0 + hi0), c1 = 0.5f * (lo1 + hi1), c2 = 0.5f * (lo2 + hi2);
++    const float h0 = 0.5f * (hi0 - lo0), h1 = 0.5f * (hi1 - lo1), h2 = 0.5f * (hi2 - lo2);
++    const float vx = m[0] * c0 + m[1] * c1 + m[2] * c2 + m[3];
++    const float rx = std::fabs(m[0]) * h0 + std::fabs(m[1]) * h1 + std::fabs(m[2]) * h2;
++    const float X = sx * vx + tx, R = std::fabs(sx) * rx;
++    const float sclx = std::fabs(sx) * (std::fabs(m[0] * c0) + std::fabs(m[1] * c1) + std::fabs(m[2] * c2) +
++                                        std::fabs(m[3]) + rx) + std::fabs(tx) + 1.0f;
++    if (X - R - 1.0f > 1e-3f * sclx || -X - R - 1.0f > 1e-3f * sclx) return true;  // x - w, -x - w
++    const float vy = m[4] * c0 + m[5] * c1 + m[6] * c2 + m[7];
++    const float ry = std::fabs(m[4]) * h0 + std::fabs(m[5]) * h1 + std::fabs(m[6]) * h2;
++    const float Y = sy * vy + ty, Ry = std::fabs(sy) * ry;
++    const float scly = std::fabs(sy) * (std::fabs(m[4] * c0) + std::fabs(m[5] * c1) + std::fabs(m[6] * c2) +
++                                        std::fabs(m[7]) + ry) + std::fabs(ty) + 1.0f;
++    if (Y - Ry - 1.0f > 1e-3f * scly || -Y - Ry - 1.0f > 1e-3f * scly) return true;  // y - w, -y - w
++    return false;  // (false on NaN)
++  }
++  // perspective: x_clip = p0*vx + p1*vz, y_clip = p2*vy + p3*vz, w = -vz
++  const float p0 = sp[0], p1 = sp[1], p2 = sp[2], p3 = sp[3];
++  const float *r0 = &m[0], *r1 = &m[4], *r2 = &m[8];
++  for (int k = 0; k < 4; ++k) {
++    const float *r = k < 2 ? r0 : r1;
++    const float al = k == 0 ? p0 : k == 1 ? -p0 : k == 2 ? p2 : -p2;
++    const float be = k == 0 ? p1 + 1.0f : k == 1 ? 1.0f - p1 : k == 2 ? p3 + 1.0f : 1.0f - p3;
++    if (test(al * r[0] + be * r2[0], al * r[1] + be * r2[1], al * r[2] + be * r2[2], al * r[3] + be * r2[3]))
++      return true;
++  }
++  return false;
++}
++
+ // ---- per draw ----------------------------------------------------------------
+ static void Emit(const GXCommand &cmd, uint8_t prim) {
+   const auto &v = cmd.verts();  // (a reference: read only when needed)
+   if (s_draws.size() >= 65535u * 4 || s_rw - s_batch_r0 > kBatchCapUnits) ::nwii::runtime::gx::FlushBatch();
+-  TexGenCfg cfg;
+-  PrepTexGen(cfg);
+   ecache::Entry *ce = ecache::Get(cmd);
+   const PackHdr *ph = ce ? nullptr : s_pack_hint;
+   const uint32_t n = ce ? ce->x_n : ph ? ph->n : (uint32_t)v.size();
+   Info local;
+   if (ce && !ce->x_init) {
+     ce->xi = Analyze(v);
++    ::nwii::runtime::gx::SetBoundingBox(*ce, v);  // r36r
+     ce->x_init = true;
+   }
++  // r36r NWII_R_CULL (see Culled above): before anything else of the draw.
++  // One position matrix, in range: the GPU path transforms by it, and so does
++  // the CPU path (EmitRange) of a draw with colour-sourced texgen.
++  if (ce && !s_cull_done && ce->x_bb_ok && ce->xi.ok && ce->xi.hp && ce->xi.npos == 1 && n &&
++      (ce->xi.pos[0] & 0x3F) * 4 + 12 <= 256 && CullOn() &&
++      Culled(ce->x_bb, ce->xi.pos[0] & 0x3F)) {
++    ++st_culled;
++    return;
++  }
++  // r36r NWII_R_CULL: the same for a draw packed on the worker (not a display list).
++  if (ph && ph->bb_ok && ph->xi.ok && ph->xi.hp && ph->xi.npos == 1 && n &&
++      (ph->xi.pos[0] & 0x3F) * 4 + 12 <= 256 && CullOn() &&
++      Culled(ph->bb, ph->xi.pos[0] & 0x3F)) {
++    ++st_culled;
++    ++st_culled_packed;
++    return;
++  }
++  TexGenCfg cfg;
++  PrepTexGen(cfg);
+   if (!ce && !ph) local = Analyze(v);
+   const Info *in = ce ? &ce->xi : ph ? &ph->xi : &local;
+   bool gpu = in->ok;
+@@ -5109,6 +5244,39 @@
+     // matrix rows (one entry per index, in rank order) and post matrix rows;
+     // per texgen a mask of the ranks whose texture matrix exists.
+     uint32_t rec[16] = {};
++    // r36r NWII_R_TGMEMO: key = texgen config + texture matrix index of each
++    // texgen (only draws with at most one index per texgen are memoised).
++    bool tgm_ok = TgMemoOn();
++    uint32_t tgk[9] = {};
++    uint64_t dep_pos = 0, dep_post = 0;
++    if (tgm_ok) {
++      tgk[0] = (uint32_t)cfg.n;
++      for (int t = 0; t < cfg.n && tgm_ok; ++t) {
++        const auto &c = cfg.c[t];
++        const int pi = c.pm ? (int)((c.pm - g_state.postMatrices) / 4) : 255;
++        tgk[1 + 2 * t] = (uint32_t)c.row | (c.stq ? 32u : 0u) | (c.abc1 ? 64u : 0u) | (c.mtx ? 128u : 0u) |
++                         (c.post ? 256u : 0u) | (c.post_norm ? 512u : 0u) | ((uint32_t)pi << 16);
++        if (c.mtx) {
++          const int nt = in->ntex[t];
++          if (nt > 1) { tgm_ok = false; break; }
++          const int mi = nt ? in->tex[t][0] : 255;
++          tgk[2 + 2 * t] = (uint32_t)nt | ((uint32_t)mi << 8);
++          if (nt && mi != 60 && mi * 4 + 12 <= 256) dep_pos |= 7ull << mi;  // rows mi..mi+2 (mi <= 61)
++          if (c.post && c.pm) {
++            if (pi > 61) { tgm_ok = false; break; }
++            dep_post |= 7ull << pi;
++          }
++        }
++      }
++    }
++    const bool tgm_hit = tgm_ok && s_tgm.valid && s_tgm.epoch == s_epoch &&
++                         !(s_rows_pos_w & s_tgm.dep_pos) && !(s_rows_post_w & s_tgm.dep_post) &&
++                         !std::memcmp(tgk, s_tgm.key, sizeof tgk);
++    if (tgm_hit) {
++      std::memcpy(rec, s_tgm.rec, sizeof rec);
++      ++st_tgm_hit;
++    } else {
++    if (tgm_ok) ++st_tgm_miss;
+     rec[0] = (uint32_t)cfg.n;
+     for (int t = 0; t < cfg.n; ++t) {
+       const auto &c = cfg.c[t];
+@@ -5148,6 +5316,17 @@
+       rec[5 + 2 * t] = pm;
+       rec[12 + t] = hmask;
+     }
++    if (tgm_ok) {
++      s_tgm.valid = true;
++      s_tgm.epoch = s_epoch;
++      s_tgm.dep_pos = dep_pos;
++      s_tgm.dep_post = dep_post;
++      std::memcpy(s_tgm.key, tgk, sizeof tgk);
++      std::memcpy(s_tgm.rec, rec, sizeof rec);
++      s_rows_pos_w &= ~dep_pos;  // rows written from now on invalidate it
++      s_rows_post_w &= ~dep_post;
++    }
++    }  // r36r: not a memo hit
+     if (s_tg_epoch != s_epoch || std::memcmp(rec, s_tg_last, sizeof rec)) {
+       s_tg_unit = (uint32_t)Alloc(4);
+       std::memcpy(s_map + (size_t)s_tg_unit * 16, rec, sizeof rec);
+@@ -5347,13 +5526,14 @@
+   printf("[GPUXF] per frame: draws gpu=%.0f (display-list %.0f, new slots %.1f) cpu=%.0f "
+          "(not uniform %.0f, colour texgen %.0f) | verts ring=%.0f cpu=%.0f | palette=%.0f "
+          "texgen=%.0f ringKB=%.0f gl=%.0f packed=%.0f mdi static/ring=%.0f/%.0f | arena %u/%u units, "
+-         "full %llu, waits %llu, finishes %llu",
++         "full %llu, waits %llu, finishes %llu, culled %.0f (packed %.0f) tgmemo %.0f/%.0f",
+          st_gpu / f, st_cached / f, st_cached_new / f, st_cpu / f, st_cpu_static / f,
+          st_cpu_row2 / f, st_sverts / f, st_cverts / f, st_pal / f, st_tg / f,
+          st_units * 16.0 / 1024.0 / f, st_flushes / f, st_packed / f, st_mdi_static / f,
+          st_mdi_ring / f, s_bump, kArenaUnits,
+          (unsigned long long)st_arena_full, (unsigned long long)st_waits,
+-         (unsigned long long)st_finishes);
++         (unsigned long long)st_finishes, st_culled / f, st_culled_packed / f, st_tgm_hit / f,
++         (st_tgm_hit + st_tgm_miss) / f);
+   if (CheckEvery())
+     printf(" | check: draws=%llu verts=%llu bad_verts=%llu (pos %llu nrm %llu tex %llu col %llu)",
+            (unsigned long long)chk_draws, (unsigned long long)chk_verts,
+@@ -5365,6 +5545,8 @@
+   st_frames = st_gpu = st_cached = st_cached_new = st_cpu = st_cpu_static = st_cpu_row2 = 0;
+   st_sverts = st_cverts = st_pal = st_tg = st_units = st_flushes = st_packed = 0;
+   st_mdi_static = st_mdi_ring = 0;
++  st_culled = st_culled_packed = 0;
++  st_tgm_hit = st_tgm_miss = 0;
+ }
+ }  // namespace xf
+ 
+@@ -5546,6 +5728,8 @@
+ const std::vector<const void *> *g_render_entries = nullptr;
+ // R14 R5: the frame's packed non-display-list draws (see xf::PackHdr).
+ const std::vector<uint32_t> *g_render_pack = nullptr;
++// r36r NWII_R_PREFIX: register writes of dropped frames, run before the frame (gx.cpp).
++const std::vector<GXCommand> *g_render_prefix = nullptr;
+ 
+ // R14 R5, GPU XF: prefetch from the worker's entry list, without the
+ // dependent loads of the old prefetch (command -> DecodedVerts -> entry, each
+@@ -5562,6 +5746,7 @@
+       __builtin_prefetch(&ce->x_init);
+       __builtin_prefetch(reinterpret_cast<const char *>(&ce->xi) + 64);
+       __builtin_prefetch(&ce->x_n);
++      __builtin_prefetch(&ce->x_bb[5]);  // r36r NWII_R_CULL
+     }
+   }
+   if (d + 4 < nd) {
+@@ -5659,6 +5844,13 @@
+       ecache::s_on = !(e && e[0] == '0');
+     }
+     ecache::s_check_on = NWII_ENV("NWII_ECACHE_CHECK") != nullptr;
++    {  // r36r (r13)
++      const char *dl = NWII_ENV("NWII_DRAWLOG");
++      s_dl_on = dl != nullptr;
++      s_dl_from = dl ? std::atol(dl) : 0;
++      s_dl_n = NWII_ENV("NWII_DRAWLOG_N") ? std::atol(NWII_ENV("NWII_DRAWLOG_N")) : 40;
++      s_xflog_n = NWII_ENV("NWII_XFLOG") ? std::atol(NWII_ENV("NWII_XFLOG")) : 0;
++    }
+     s_emit4_on = NWII_ENV("NWII_NOEMIT4") == nullptr;
+   });
+ }
+@@ -5676,6 +5868,24 @@
+ // hand-over mutex orders it), and the render thread never writes emit_cache
+ // itself unless the entry is missing (counted: "made late"), so the two
+ // threads never write the same field. Entries die on the worker as before.
++// r36r NWII_R_CULL: the raw position bounding box of a cached draw (see xf::Culled).
++static bool BBoxOf(const xf::Info &xi, const std::vector<VertexData> &v, float out[6]) {
++  if (!xi.ok || !xi.hp || v.empty()) return false;
++  float b[6] = {v[0].pos[0], v[0].pos[1], v[0].pos[2], v[0].pos[0], v[0].pos[1], v[0].pos[2]};
++  for (const VertexData &x : v) {
++    for (int k = 0; k < 3; ++k) {
++      if (!(x.pos[k] == x.pos[k]) || std::isinf(x.pos[k])) return false;  // NaN/inf: never culled
++      b[k] = std::min(b[k], x.pos[k]);
++      b[3 + k] = std::max(b[3 + k], x.pos[k]);
++    }
++  }
++  std::memcpy(out, b, sizeof b);
++  return true;
++}
++static void SetBoundingBox(ecache::Entry &e, const std::vector<VertexData> &v) {
++  e.x_bb_ok = BBoxOf(e.xi, v, e.x_bb);
++}
++
+ const void *GX_PrepDrawForRender(const GXCommand &cmd, std::vector<uint32_t> &pack) {
+   static thread_local bool t_flags = false;
+   if (!t_flags) { t_flags = true; InitFlags(); }
+@@ -5692,6 +5902,7 @@
+     h.xi = xf::Analyze(v);
+     h.n = n;
+     h.words = h.xi.ok ? n * h.xi.stride : 0;
++    h.bb_ok = BBoxOf(h.xi, v, h.bb);  // r36r
+     const size_t off = pack.size();
+     pack.resize(off + xf::kPackHdrWords + h.words);
+     std::memcpy(pack.data() + off, &h, sizeof h);
+@@ -5704,6 +5915,7 @@
+   auto e = MakeHost<ecache::Entry>();
+   ecache::InitDeps(*e, dv);
+   e->xi = xf::Analyze(dv);
++  SetBoundingBox(*e, dv);  // r36r
+   e->x_init = true;
+   dv.emit_cache = e;
+   ecache::s_entries_prep.fetch_add(1, std::memory_order_relaxed);
+@@ -5890,8 +6102,20 @@
+          xf::Active() && ecache::On())
+             ? g_render_entries : nullptr;
+     size_t draw_ord = 0;  // index of the next draw in *draws
+-    const GXCommand *const cmd0 = commands.data();
+-    const size_t ncmd = commands.size();
++    // r36r NWII_R_PREFIX (gx.cpp): the register writes of the frames dropped
++    // before this one (no draws) come in their own list and run first, exactly
++    // where they would sit at the start of `commands`.
++    const std::vector<GXCommand> *const pre =
++        (g_render_prefix && !g_render_prefix->empty()) ? g_render_prefix : nullptr;
++    // r36r: early cull (NWII_R_CULL; off with the draw log debug switch).
++    static const bool s_early_cull = xf::CullOn() && NWII_ENV("NWII_DRAWLOG") == nullptr;
++    static const bool s_cull_state = [] {
++      const char *e = NWII_ENV("NWII_R_CULL");
++      return e && e[0] == '2';
++    }();
++    for (int pass = pre ? 0 : 1; pass < 2; ++pass) {
++    const GXCommand *const cmd0 = pass == 0 ? pre->data() : commands.data();
++    const size_t ncmd = pass == 0 ? pre->size() : commands.size();
+     for (size_t ci = 0; ci < ncmd; ++ci) {
+       const GXCommand &cmd = cmd0[ci];
+       // R14 R5: the command array is walked once, in order, 136 bytes a
+@@ -5913,8 +6137,7 @@
+         bool touched_proj = false;
+         // NWII_XFLOG=<n>: print the first n distinct XF writes (address,
+         // count, first word) to 0x1000-0x10FF.
+-        static const long s_xflog =
+-            NWII_ENV("NWII_XFLOG") ? std::atol(NWII_ENV("NWII_XFLOG")) : 0;
++        const long s_xflog = s_xflog_n;  // r36r (r13): read once by InitFlags
+         if (s_xflog && addr >= 0x1000 && !cmd.payload.empty()) {
+           static long xn = 0;
+           static std::unordered_map<uint64_t, int> seen;
+@@ -5943,7 +6166,17 @@
+         else if (addr >= 0x500 && addr + np <= 0x600)
+           mtx_dst = &g_state.postMatrices[addr - 0x500];
+         if (mtx_dst) {
+-          if (np) std::memcpy(mtx_dst, cmd.payload.data(), np * sizeof(float));
++          if (np) {
++            std::memcpy(mtx_dst, cmd.payload.data(), np * sizeof(float));
++            // r36r NWII_R_TGMEMO: rows (4 floats) written
++            if (addr < 0x100 || addr >= 0x500) {
++              const int a = addr < 0x100 ? addr : addr - 0x500;
++              const int r0 = a >> 2, r1 = (a + (int)np - 1) >> 2;
++              const uint64_t m = (r1 - r0 >= 63) ? ~0ull : (((2ull << (r1 - r0)) - 1) << r0);
++              if (addr < 0x100) xf::s_rows_pos_w |= m;
++              else xf::s_rows_post_w |= m;
++            }
++          }
+           continue;
+         }
+         for (size_t i = 0; i < cmd.payload.size(); ++i) {
+@@ -5962,10 +6195,12 @@
+           }
+           if (current_addr >= 0x0000 && current_addr <= 0x00FF) {
+             g_state.posMatrices[current_addr] = cmd.payload[i];
++            xf::s_rows_pos_w |= 1ull << (current_addr >> 2);  // r36r
+           } else if (current_addr >= 0x0400 && current_addr <= 0x045F) {
+             g_state.normalMatrices[current_addr - 0x0400] = cmd.payload[i];
+           } else if (current_addr >= 0x0500 && current_addr <= 0x05FF) {
+             g_state.postMatrices[current_addr - 0x0500] = cmd.payload[i];
++            xf::s_rows_post_w |= 1ull << ((current_addr - 0x0500) >> 2);  // r36r
+           } else if (current_addr >= 0x0600 && current_addr <= 0x067F) {
+             int li = (current_addr - 0x0600) / 16;
+             float &l = g_state.lights[li][(current_addr - 0x0600) % 16];
+@@ -6101,11 +6336,38 @@
+             ents = nullptr;
+           }
+         }
++        // r36r NWII_R_CULL (r9): a draw whose state is already set up (clean
++        // state, open batch) and that the cull test rejects skips DrawPrimitive
++        // altogether (it would only count it and return from xf::Emit).
++        // NWII_R_CULL=2 (r10): also when the state is not set up yet: the
++        // rejected draw does not set it up either (no texture lookup, no batch
++        // key, no GL state): the next drawn draw does, and joins the open batch
++        // when its state equals the batch's (same GL draws, fewer of them).
++        if (s_early_cull && ecache::s_hint_ok && ecache::s_hint &&
++            (s_cull_state || (s_batch_open && !s_state_dirty && !s_skip_draw)) && xf::Active() &&
++            !DrawTraceOn() && !DrawStatsOn() && (cmd.prim_type & 0xF8) < 0xA8) {
++          const ecache::Entry *ce = ecache::s_hint;
++          if (ce->x_init && ce->x_bb_ok && ce->xi.ok && ce->xi.hp && ce->xi.npos == 1 && ce->x_n &&
++              (ce->xi.pos[0] & 0x3F) * 4 + 12 <= 256) {
++            if (xf::Culled(ce->x_bb, ce->xi.pos[0] & 0x3F)) {
++              ++g_prof_gx_draws;
++              ++s_cap_cur.gx_draws;
++              if (rph::On()) { ++rph::s_draws; rph::s_verts += ce->x_n; }
++              ++xf::st_culled;
++              ecache::s_hint_ok = false;
++              xf::s_pack_hint = nullptr;
++              continue;
++            }
++            xf::s_cull_done = true;  // r12: kept; xf::Emit does not test it again
++          }
++        }
+         DrawPrimitive(cmd);
++        xf::s_cull_done = false;
+         ecache::s_hint_ok = false;
+         xf::s_pack_hint = nullptr;
+       }
+     }
++    }  // r36r: pass (prefix, frame)
+     rph::Set(rph::kFrame);
+     if (s_batch_open) {
+       FlushBatch();
+diff --color -ru r31t/nWiiRuntime/src/hle/gx.cpp r36r/nWiiRuntime/src/hle/gx.cpp
+--- r31t/nWiiRuntime/src/hle/gx.cpp	2026-11-12 03:28:33.321869387 -0500
++++ r36r/nWiiRuntime/src/hle/gx.cpp	2026-11-15 01:01:37.164236185 -0500
+@@ -698,6 +698,7 @@
+ const void *GX_PrepDrawForRender(const GXCommand &cmd, std::vector<uint32_t> &pack);  // renderer_gl.cpp (R14 R5)
+ extern const std::vector<const void *> *g_render_entries;  // renderer_gl.cpp (R14 R5)
+ extern const std::vector<uint32_t> *g_render_pack;         // renderer_gl.cpp (R14 R5)
++extern const std::vector<GXCommand> *g_render_prefix;      // renderer_gl.cpp (r36r NWII_R_PREFIX)
+ }
+ static uint64_t g_ph[8], g_ph_n;
+ static std::vector<nwii::runtime::gx::GXCommand*> s_draws;
+@@ -912,6 +913,9 @@
+     std::vector<nwii::runtime::gx::GXCommand *> draws;  // frame's draws, in order
+     std::vector<const void *> entries;  // R14 R5: draws[i]'s emit-cache entry, packed draw, or null
+     std::vector<uint32_t> pack;         // R14 R5: packed draws' words
++    // r36r NWII_R_PREFIX: the kept register writes of the frames retracted
++    // before this one (no draws), rendered before `frame`.
++    std::vector<nwii::runtime::gx::GXCommand> pre;
+     uint64_t seq = 0;          // R22 R7: frame number (s_prep_frames) of its frame
+     bool has_draws = false;    // R22 R7: its commands may point at retired vertices
+     bool render_frees = false; // R22 R7: no command shares a reference count with the worker
+@@ -967,11 +971,197 @@
+ // thread then never makes an emit-cache entry itself).
+ bool GX_RenderWorkerOn() { return s_worker_on.load(std::memory_order_relaxed); }
+ 
++// ---- r36r (frente R): NWII_R_COALESCE ---------------------------------------
++// The dropped part of a frame (a retracted packet, or the commands up to the
++// earlier frame end of a drain that found two) keeps all its register writes,
++// so the state its draws left behind reaches the next frame. In the castle
++// cutscene that is ~28 000 commands per dropped frame (12 000 draws a frame,
++// a matrix load and a few BP writes before each), moved command by command on
++// the worker and replayed by the render thread before the frame it draws.
++// With no draws left, only the LAST write of each register / XF word matters,
++// except around commands that use the state at that point: an EFB copy/clear
++// (BP 0x52, reads the copy/clear registers), the TLUT load (BP 0x65, reads
++// 0x64 and guest RAM) and 0x64 itself. Those are kept and split the dropped
++// part into segments; inside a segment a BP write is dead when the same
++// register is written again later in the segment (TEV colour registers
++// 0xE0-0xE7: same register AND same colour/konst half, bit 23), an XF write
++// when every word it writes is written again later in the segment. Dead
++// writes are removed; nothing else changes (order kept), so the state at
++// every kept command and at the end is the same: the same image.
++// CP writes are not touched (RenderOnce ignores them anyway).
++// NWII_R_COALESCE=1 on (default off). NWII_R_COALESCE_CHECK=1: simulates the
++// register state of the full and of the compacted list at every kept barrier
++// and at the end, and counts mismatches ([RCOAL] line, worker, every ~2 s).
++namespace rcoal {
++static bool On() {
++    static const bool on = [] {
++        const char *e = NWII_ENV("NWII_R_COALESCE");
++        return e && e[0] == '1';
++    }();
++    return on;
++}
++static bool CheckOn() {
++    static const bool on = NWII_ENV("NWII_R_COALESCE_CHECK") != nullptr;
++    return on;
++}
++constexpr uint32_t kXfWords = 0x1100;  // matrix memory, lights, registers 0x1000-0x10FF
++static uint32_t s_xf_stamp[kXfWords];
++static uint32_t s_bp_stamp[256 + 16];
++static uint32_t s_stamp = 0;
++static std::vector<uint8_t> s_dead;
++static uint64_t st_in = 0, st_draws = 0, st_dead = 0, st_calls = 0, st_checks = 0, st_bad = 0;
++static inline bool IsBarrierBP(uint8_t reg) { return reg == 0x52 || reg == 0x64 || reg == 0x65; }
++static inline uint32_t BpKey(const nwii::runtime::gx::GXCommand &c) {
++    const uint8_t reg = (uint8_t)c.reg;
++    if (reg >= 0xE0 && reg <= 0xE7) return 256u + (uint32_t)(reg - 0xE0) * 2u + ((c.val >> 23) & 1u);
++    return reg;
++}
++static inline void NewSegment() {
++    if (++s_stamp == 0) {  // wrapped: forget every stamp
++        std::memset(s_xf_stamp, 0, sizeof s_xf_stamp);
++        std::memset(s_bp_stamp, 0, sizeof s_bp_stamp);
++        s_stamp = 1;
++    }
++}
++// Marks the dead writes of v[b, e) in s_dead[i - b] (draws are ignored: the
++// caller drops them). Returns the number of dead writes.
++static size_t Mark(const std::vector<nwii::runtime::gx::GXCommand> &v, size_t b, size_t e) {
++    using nwii::runtime::gx::GXCommandType;
++    s_dead.assign(e - b, 0);
++    NewSegment();
++    size_t dead = 0;
++    for (size_t i = e; i-- > b;) {
++        const auto &c = v[i];
++        if (c.type == GXCommandType::BPRegister) {
++            const uint8_t reg = (uint8_t)c.reg;
++            if (IsBarrierBP(reg)) { NewSegment(); continue; }
++            const uint32_t k = BpKey(c);
++            if (s_bp_stamp[k] == s_stamp) { s_dead[i - b] = 1; ++dead; }
++            else s_bp_stamp[k] = s_stamp;
++        } else if (c.type == GXCommandType::XFRegister) {
++            const uint32_t a = c.reg, n = (uint32_t)c.payload.size();
++            if (n == 0 || a + n > kXfWords) continue;  // keep (not tracked)
++            bool all = true;
++            for (uint32_t k = 0; k < n; ++k) {
++                if (s_xf_stamp[a + k] != s_stamp) { all = false; s_xf_stamp[a + k] = s_stamp; }
++            }
++            if (all) { s_dead[i - b] = 1; ++dead; }
++        }
++    }
++    return dead;
++}
++// NWII_R_COALESCE_CHECK: the register state a list of commands leaves (BP
++// registers, TEV colour/konst halves, XF words), compared at every barrier.
++struct Sim {
++    uint32_t bp[256 + 16];
++    uint32_t xf[kXfWords];
++    void reset() { std::memset(this, 0, sizeof *this); }
++    void apply(const nwii::runtime::gx::GXCommand &c) {
++        using nwii::runtime::gx::GXCommandType;
++        if (c.type == GXCommandType::BPRegister) {
++            bp[(uint8_t)c.reg] = c.val;
++            if ((uint8_t)c.reg >= 0xE0 && (uint8_t)c.reg <= 0xE7) bp[BpKey(c)] = c.val;
++        } else if (c.type == GXCommandType::XFRegister) {
++            const uint32_t a = c.reg, n = (uint32_t)c.payload.size();
++            for (uint32_t k = 0; k < n && a + k < kXfWords; ++k) std::memcpy(&xf[a + k], &c.payload[k], 4);
++        }
++    }
++};
++// full = the original commands (draws included or not), kept = what remains.
++static void Check(const std::vector<nwii::runtime::gx::GXCommand> &full, size_t b, size_t e,
++                  const std::vector<uint8_t> &dead) {
++    using nwii::runtime::gx::GXCommandType;
++    static Sim *sa = new Sim, *sb = new Sim;
++    sa->reset();
++    sb->reset();
++    bool ok = true;
++    for (size_t i = b; i < e; ++i) {
++        const auto &c = full[i];
++        if (c.type == GXCommandType::DrawPrimitive) continue;
++        const bool barrier = c.type == GXCommandType::BPRegister && IsBarrierBP((uint8_t)c.reg);
++        if (barrier && std::memcmp(sa, sb, sizeof(Sim))) ok = false;
++        sa->apply(c);
++        if (!dead[i - b]) sb->apply(c);
++    }
++    if (std::memcmp(sa, sb, sizeof(Sim))) ok = false;
++    ++st_checks;
++    if (!ok) ++st_bad;
++}
++// Drops the draws and the dead writes of v[b, e) in place (order kept);
++// returns the new end. `on_kept(c)` runs on every kept command.
++template <class F>
++static size_t Compact(std::vector<nwii::runtime::gx::GXCommand> &v, size_t b, size_t e, F on_kept) {
++    using nwii::runtime::gx::GXCommandType;
++    const bool on = On();
++    if (on) {
++        st_dead += Mark(v, b, e);
++        ++st_calls;
++        st_in += e - b;
++        if (CheckOn()) Check(v, b, e, s_dead);
++    }
++    size_t w = b;
++    for (size_t i = b; i < e; ++i) {
++        auto &c = v[i];
++        if (c.type == GXCommandType::DrawPrimitive) { if (on) ++st_draws; continue; }
++        if (on && s_dead[i - b]) continue;
++        on_kept(c);
++        if (w != i) v[w] = std::move(c);
++        ++w;
++    }
++    return w;
++}
++static void Report() {
++    if (!On()) return;
++    static auto last = std::chrono::steady_clock::now();
++    const auto now = std::chrono::steady_clock::now();
++    if (now - last < std::chrono::seconds(2)) return;
++    last = now;
++    std::printf("[RCOAL] dropped parts=%llu commands=%llu (draws %llu) dead writes removed=%llu kept=%llu"
++                " | check: %llu lists, %llu mismatches\n",
++                (unsigned long long)st_calls, (unsigned long long)st_in, (unsigned long long)st_draws,
++                (unsigned long long)st_dead, (unsigned long long)(st_in - st_draws - st_dead),
++                (unsigned long long)st_checks, (unsigned long long)st_bad);
++    st_calls = st_in = st_draws = st_dead = 0;
++}
++}  // namespace rcoal
++
++// r36r NWII_R_PREFIX=1: a retracted packet's kept commands go to its `pre`
++// list instead of the front of the next frame, so the next frame takes the
++// usual path (its commands handed over as parsed, the parser's draw entries
++// kept) instead of being moved command by command and every draw prepared
++// again. The renderer runs `pre` first: the same commands in the same order.
++static bool RPrefixOn() {
++    static const bool on = [] {
++        const char *e = NWII_ENV("NWII_R_PREFIX");
++        return e && e[0] == '1';
++    }();
++    return on;
++}
++
+ // A frame packet the worker took back before the render thread took it (a
+ // newer frame is complete): it becomes the dropped part of the next frame,
+ // exactly as a drain that finds two frame ends drops the first one's draws.
+ static void RetractToPrefix(FramePacket &pkt) {
+     auto &v = pkt.frame;
++    if (rcoal::On()) {
++        const size_t w = rcoal::Compact(v, 0, v.size(), [&](nwii::runtime::gx::GXCommand &c) {
++            if (c.type == nwii::runtime::gx::GXCommandType::BPRegister && c.reg == 0x52) {
++                if ((c.val & 0x4000) && !c.stale_copy) ++pkt.stats.dropped;
++                c.stale_copy = true;
++            }
++        });
++        v.erase(v.begin() + w, v.end());
++        pkt.draws.clear();
++        pkt.entries.clear();
++        pkt.pack.clear();
++        pkt.has_draws = false;
++        ++pkt.stats.retracts;
++        if (RPrefixOn()) {
++            pkt.pre.insert(pkt.pre.end(), std::make_move_iterator(v.begin()), std::make_move_iterator(v.end()));
++            v.clear();
++        }
++        return;
++    }
+     size_t w = 0;
+     for (size_t i = 0; i < v.size(); ++i) {
+         auto &c = v[i];
+@@ -989,6 +1179,10 @@
+     pkt.pack.clear();
+     pkt.has_draws = false;
+     ++pkt.stats.retracts;
++    if (RPrefixOn()) {  // r36r
++        pkt.pre.insert(pkt.pre.end(), std::make_move_iterator(v.begin()), std::make_move_iterator(v.end()));
++        v.clear();
++    }
+ }
+ 
+ // The preparing half of a drain (see above). Returns the packet a frame was
+@@ -1160,6 +1354,10 @@
+         pkt.entries.clear();
+         pkt.pack.clear();
+     }
++    if (!retracted) pkt.pre.clear();  // r36r NWII_R_PREFIX: already rendered
++    // r36r NWII_R_PREFIX: a retracted packet's commands are in pkt.pre: the
++    // new frame takes the usual path below.
++    const bool retr_slow = retracted && !RPrefixOn();
+     pkt.has_draws = false;
+     // NWII_NOFRAMESKIP=1: render every frame of the batch (only the last one
+     // is presented), so EFB copies of earlier frames are made with their draws.
+@@ -1187,7 +1385,7 @@
+     auto &frame = s_frame;
+     frame.clear();
+     s_draws.clear();
+-    if (prev_frame_end < 0 && !retracted) {
++    if (prev_frame_end < 0 && !retr_slow) {
+         // Nothing to drop (the usual case at full speed): move only the
+         // commands after the frame end (the next frame's start) out, and
+         // take the rest as the frame without touching it.
+@@ -1219,11 +1417,22 @@
+     // R11: a retracted packet's commands (draws already dropped) come first.
+     for (auto &c : pkt.frame) frame.push_back(std::move(c));
+     pkt.frame.clear();
++    // r36r NWII_R_COALESCE: the dead writes of the dropped part [0, prev_frame_end].
++    const bool coal = rcoal::On() && prev_frame_end >= 0;
++    if (coal) {
++        rcoal::st_dead += rcoal::Mark(s_carry, 0, (size_t)prev_frame_end + 1);
++        ++rcoal::st_calls;
++        rcoal::st_in += (size_t)prev_frame_end + 1;
++        if (rcoal::CheckOn()) rcoal::Check(s_carry, 0, (size_t)prev_frame_end + 1, rcoal::s_dead);
++    }
+     for (int i = 0; i <= last_frame_end; ++i) {
+         auto &c = s_carry[i];
+         if (i <= prev_frame_end &&
+-            c.type == nwii::runtime::gx::GXCommandType::DrawPrimitive)
++            c.type == nwii::runtime::gx::GXCommandType::DrawPrimitive) {
++            if (coal) ++rcoal::st_draws;
+             continue;
++        }
++        if (coal && i <= prev_frame_end && rcoal::s_dead[(size_t)i]) continue;
+         // EFB copies of the dropped frames would capture an EFB without their
+         // draws (one-shot render-to-texture would keep that garbage); only
+         // their clears run.
+@@ -1460,6 +1669,7 @@
+             s_prep_mem = m;
+         }
+     }
++    rcoal::Report();  // r36r
+     return &pkt;
+ }
+ 
+@@ -1606,6 +1816,7 @@
+             nwii::runtime::gx::g_render_entries =
+                 pkt.entries.size() == pkt.draws.size() ? &pkt.entries : nullptr;
+             nwii::runtime::gx::g_render_pack = &pkt.pack;
++            nwii::runtime::gx::g_render_prefix = &pkt.pre;  // r36r (empty unless NWII_R_PREFIX)
+             // r31t (frente T), SOLO MEDIR: NWII_T_NORENDER=N dibuja 1 de cada N fotogramas
+             // (el hilo de render queda casi parado) para ver cuanto frena al hilo del juego
+             // el trabajo del render en los otros nucleos (cache L2 compartida, memoria).
+@@ -1619,6 +1830,7 @@
+             nwii::runtime::gx::g_render_draws = nullptr;
+             nwii::runtime::gx::g_render_entries = nullptr;
+             nwii::runtime::gx::g_render_pack = nullptr;
++            nwii::runtime::gx::g_render_prefix = nullptr;
+             if (gpuprof) g_gpu_timer.end();
+             g_prof_render_cpu_us += thread_cpu_us() - rc0;
+             auto r1 = std::chrono::steady_clock::now();
+@@ -1873,12 +2085,44 @@
+                 std::lock_guard<std::mutex> lk(s_pm);
+                 free_here = s_ready == nullptr;
+             }
++            // r36r NWII_R_FREECHUNK=1: free from the back in chunks of 2048
++            // commands and stop as soon as the worker hands a new frame over (the
++            // render thread is then the slower side): the rest is freed by the
++            // worker when it reuses the packet, as without NWII_RENDER_FREE.
++            static const bool s_rchunk = [] {
++                const char *e = NWII_ENV("NWII_R_FREECHUNK");
++                return e && e[0] == '1';
++            }();
++            if (free_here && s_rchunk) {
++                const int64_t f0 = PipeNow();
++                auto &fr = p->frame;
++                bool stopped = false;
++                while (!fr.empty()) {
++                    const size_t k = std::min<size_t>(fr.size(), 2048);
++                    fr.erase(fr.end() - (ptrdiff_t)k, fr.end());
++                    if (fr.empty()) break;
++                    std::lock_guard<std::mutex> lk(s_pm);
++                    if (s_ready) { stopped = true; break; }
++                }
++                if (!stopped) {
++                    p->draws.clear();
++                    p->entries.clear();
++                    p->pack.clear();
++                    p->pre.clear();
++                }
++                // (stopped: draws/entries/pack point into the frame or are plain
++                // data; the worker clears them with what is left of the frame)
++                wprof::s_rfree.fetch_add(1, std::memory_order_relaxed);
++                wprof::s_rfree_ns.fetch_add((uint64_t)(PipeNow() - f0), std::memory_order_relaxed);
++                free_here = false;
++            }
+             if (free_here) {
+                 const int64_t f0 = PipeNow();
+                 p->frame.clear();
+                 p->draws.clear();
+                 p->entries.clear();
+                 p->pack.clear();
++                p->pre.clear();  // r36r
+                 wprof::s_rfree.fetch_add(1, std::memory_order_relaxed);
+                 wprof::s_rfree_ns.fetch_add((uint64_t)(PipeNow() - f0), std::memory_order_relaxed);
+             }

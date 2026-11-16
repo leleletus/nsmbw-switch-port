@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# vigia: alarma para que el usuario se despierte si el trabajo de Claude se cae (NSMBW port).
+#
+#   ~/nsmbw-port/scripts/vigia start     # arranca la vigilancia (servicio de usuario aparte de VS Code)
+#   ~/nsmbw-port/scripts/vigia callar    # apaga una alarma que está sonando (la vigilancia sigue)
+#   ~/nsmbw-port/scripts/vigia stop      # para la vigilancia (hazlo ANTES de cerrar VS Code a propósito)
+#   ~/nsmbw-port/scripts/vigia estado    # ¿está vigilando? últimas líneas del registro
+#   ~/nsmbw-port/scripts/vigia prueba    # suena 3 segundos al volumen actual
+#
+# Cada 15 s mira:
+#   1. ¿sigue vivo Claude Code (el proceso de la extensión de VS Code)? Si desaparece → ALARMA.
+#   2. ¿systemd-oomd ha matado algo por falta de memoria? → ALARMA.
+#   3. Prevención: si la RAM libre baja de 1,5 GB durante ~30 s, mata la compilación más grande de nsmbw.slice
+#      (las de los agentes, lanzadas con scripts/lim) ANTES de que el sistema mate VS Code entero, y avisa con
+#      una notificación (sin alarma; Claude sigue vivo y puede relanzarla).
+# La ALARMA: quita el silencio, sube el volumen al 100 % y repite un sonido fuerte hasta `vigia callar`
+# (o hasta que Claude vuelva a estar vivo, si lo que pasó fue que se cerró), más una notificación en pantalla.
+# Registro: ~/nsmbw-port/scripts/vigia.log
+HERE=$(cd "$(dirname "$0")" && pwd)
+LOG=$HERE/vigia.log
+STOP=/tmp/nsmbw-vigia.callar
+UNIT=nsmbw-vigia
+SND1=/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga
+SND2=/usr/share/sounds/freedesktop/stereo/phone-incoming-call.oga
+claude_vivo() { pgrep -f "anthropic.claude-code.*native-binary/claude" > /dev/null; }
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+alarma() {   # alarma <motivo>
+  local motivo=$1
+  log "ALARMA: $motivo"
+  rm -f "$STOP"
+  notify-send -u critical -a "NSMBW vigía" "⚠ ALARMA NSMBW" "$motivo — despierta y revisa. Para callar: ~/nsmbw-port/scripts/vigia callar" 2>/dev/null
+  while [[ ! -f $STOP ]]; do
+    wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 2>/dev/null; wpctl set-volume @DEFAULT_AUDIO_SINK@ 1.0 2>/dev/null
+    pactl set-sink-mute @DEFAULT_SINK@ 0 2>/dev/null; pactl set-sink-volume @DEFAULT_SINK@ 100% 2>/dev/null
+    paplay "$SND1" 2>/dev/null || pw-play "$SND1" 2>/dev/null
+    paplay "$SND2" 2>/dev/null
+    # si la alarma fue porque Claude se cerró y ya volvió (el usuario lo reabrió), se calla sola
+    [[ $motivo == Claude* ]] && claude_vivo && { log "Claude volvió: alarma apagada"; break; }
+  done
+  rm -f "$STOP"
+}
+
+bucle() {
+  log "vigilancia iniciada (Claude vivo: $(claude_vivo && echo sí || echo no))"
+  local visto=0 muerto=0 bajo=0 ultimo
+  claude_vivo && visto=1
+  ultimo=$(date '+%Y-%m-%d %H:%M:%S')
+  while true; do
+    sleep 15
+    # 1. Claude Code
+    if claude_vivo; then visto=1; muerto=0
+    elif ((visto)); then
+      ((muerto++))
+      ((muerto == 2)) && { alarma "Claude se cerró (el proceso de Claude Code en VS Code ya no existe)"; visto=0; }
+    fi
+    # 2. muertes por falta de memoria
+    local ahora; ahora=$(date '+%Y-%m-%d %H:%M:%S')
+    local k; k=$(journalctl --since "$ultimo" --until "$ahora" --no-pager 2>/dev/null | grep -m3 "systemd-oomd killed")
+    ultimo=$ahora
+    [[ -n $k ]] && alarma "La PC se quedó sin memoria y el sistema mató procesos: $(echo "$k" | head -1 | sed 's/.*systemd\[[0-9]*\]: //' | cut -c1-120)"
+    # 3. prevención: poca RAM libre durante ~30 s → matar la compilación más grande de nsmbw.slice
+    local libre swap_pct; libre=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+    # swap too: on 9-nov VS Code grew until RAM + 14.8 GB of swap were full while MemAvailable still looked fine
+    swap_pct=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{print (t>0)?int(100*(t-f)/t):0}' /proc/meminfo)
+    if ((libre < ${VIGIA_MIN_MB:-1500} || swap_pct > ${VIGIA_MAX_SWAP:-70})); then ((bajo++)); else bajo=0; fi
+    if ((bajo >= 2)); then
+      local pid; pid=$(for p in $(cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/nsmbw.slice/*/cgroup.procs 2>/dev/null); do
+          [[ -r /proc/$p/status ]] && echo "$(awk '/VmRSS/{print $2}' /proc/$p/status 2>/dev/null) $p"; done | sort -rn | head -1 | awk '{print $2}')
+      if [[ -n $pid ]]; then
+        local cmd; cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | cut -c1-150)
+        kill "$pid" 2>/dev/null
+        log "RAM libre ${libre} MB, swap ${swap_pct} %: maté el proceso más grande de nsmbw.slice (pid $pid): $cmd"
+        notify-send -u normal -a "NSMBW vigía" "RAM casi llena" "Maté una compilación grande (pid $pid) para salvar VS Code/Claude." 2>/dev/null
+        paplay /usr/share/sounds/freedesktop/stereo/dialog-warning.oga 2>/dev/null
+      else
+        log "RAM libre ${libre} MB y nada en nsmbw.slice que matar"
+      fi
+      bajo=0
+    fi
+  done
+}
+
+case ${1:-} in
+  start)
+    if systemctl --user is-active --quiet $UNIT; then echo "ya está vigilando"; exit 0; fi
+    systemd-run --user --unit=$UNIT --collect --quiet -p Nice=-5 "$HERE/vigia" bucle && echo "vigilando (registro: $LOG)" ;;
+  stop) systemctl --user stop $UNIT 2>/dev/null; touch "$STOP"; log "vigilancia detenida"; echo "vigilancia detenida" ;;
+  callar) touch "$STOP"; echo "alarma apagada (la vigilancia sigue)" ;;
+  estado) systemctl --user is-active $UNIT; tail -5 "$LOG" 2>/dev/null ;;
+  prueba) timeout 3 paplay "$SND1"; echo "¿sonó?" ;;
+  bucle) bucle ;;
+  *) sed -n 2,9p "$0" ;;
+esac

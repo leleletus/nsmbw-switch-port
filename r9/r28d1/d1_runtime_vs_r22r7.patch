@@ -1,0 +1,1381 @@
+diff --color -ruN r22r7/nWiiRuntime/CMakeLists.txt r28d1/nWiiRuntime/CMakeLists.txt
+--- r22r7/nWiiRuntime/CMakeLists.txt	2026-11-09 04:30:39.594220193 -0500
++++ r28d1/nWiiRuntime/CMakeLists.txt	2026-11-10 02:27:33.432319625 -0500
+@@ -35,6 +35,8 @@
+     src/input/sources/phone_source.cpp
+     src/hle/memory.cpp
+     src/hle/gx.cpp
++    src/hle/native_n1.cpp
++    src/hle/native_d1.cpp
+     src/hle/pad.cpp
+     src/hle/wpad_hle.cpp
+     src/hle/dvd.cpp
+diff --color -ruN r22r7/nWiiRuntime/include/runtime/native_d1.h r28d1/nWiiRuntime/include/runtime/native_d1.h
+--- r22r7/nWiiRuntime/include/runtime/native_d1.h	1969-12-31 19:00:00.000000000 -0500
++++ r28d1/nWiiRuntime/include/runtime/native_d1.h	2026-11-10 02:25:15.424928913 -0500
+@@ -0,0 +1,53 @@
++// r28d1 (front D, pilot D1): native fManager_c / fLiMgBa_c search functions with an exact ID -> node index.
++//
++// fManager_c::m_searchManage[8] (USA 0x80377A70, 8 cLineMg_c {first, last}) holds every fBase_c's mSearchNode,
++// in list (id & 7). fLiMgBa_c::searchNodeByID (0x80162C30) walks one list from first to the first node whose
++// owner's mUniqueID equals the id. The index keeps, per list, the list as it is in guest memory (node, owner,
++// id from top to bottom) and a hash id -> position of the first node with that id, so a lookup returns the
++// same node, at the same position k, without walking. Everything the generated walk leaves (r0, r3, r5, CR0,
++// inst_count = +8+7k / +6+7n, k+1 / n+1 interrupt polls) is computed from (k, n, last node).
++//
++// Coherence: the generated code of cLineMg_c::addTopLineNode / addLastLineNode / insertLineNode /
++// removeLineNode (labels loc_80161020 / 80160FE0 / 80160F10 / 80160F60 in output_21.cpp: the functions and
++// their merged copies) calls d1_touch(this, node) first. A touched search list is rebuilt from guest memory at
++// its next lookup (lazy; those bodies have no interrupt poll, so no lookup can run in the middle of one).
++// A node of a search list used with another list also marks its list. Guards on every lookup: list->first
++// must be the indexed first node, and on a hit node->owner / owner->id must still be the indexed ones;
++// otherwise the list is rebuilt (counted as "guard").
++//
++// Switches: NWII_NATIVE_SEARCHNODEBYID=0 / NWII_NATIVE_SEARCHBASEBYID=0 (generated code), NWII_D1_INDEX=0
++// (native linear walk, no index), NWII_D1_CHECK=1 (every indexed lookup also walks the list and compares
++// node, k, n, last node; "[D1] CHECK MISMATCH"), NWII_D1_STATS=1 (counters every 2^20 lookups and at exit).
++#pragma once
++#include <cstdint>
++
++namespace nwii {
++namespace runtime {
++
++extern uint32_t g_d1_dirty;      // bit i: search list i touched since its index was built
++extern uint32_t g_d1_nodes_live; // != 0 once any list was indexed (node check of other lists' operations)
++void d1_touch_other(uint32_t node);
++
++static constexpr uint32_t kD1SearchManage = 0x80377A70u;
++
++// list operation on cLineMg_c `list` with `node` (generated code, see above)
++inline __attribute__((always_inline)) void d1_touch(uint32_t list, uint32_t node) {
++  const uint32_t o = list - kD1SearchManage;
++  if (o < 64u) {
++    g_d1_dirty |= 1u << (o >> 3);
++    return;
++  }
++  if (g_d1_nodes_live) d1_touch_other(node);
++}
++// insertLineNode(node, prev): prev's links change too
++inline __attribute__((always_inline)) void d1_touch(uint32_t list, uint32_t node, uint32_t prev) {
++  const uint32_t o = list - kD1SearchManage;
++  if (o < 64u) {
++    g_d1_dirty |= 1u << (o >> 3);
++    return;
++  }
++  if (g_d1_nodes_live) { d1_touch_other(node); d1_touch_other(prev); }
++}
++
++}  // namespace runtime
++}  // namespace nwii
+diff --color -ruN r22r7/nWiiRuntime/include/runtime/native_n1.h r28d1/nWiiRuntime/include/runtime/native_n1.h
+--- r22r7/nWiiRuntime/include/runtime/native_n1.h	1969-12-31 19:00:00.000000000 -0500
++++ r28d1/nWiiRuntime/include/runtime/native_n1.h	2026-11-10 02:23:52.669943140 -0500
+@@ -0,0 +1,93 @@
++// r19n (front N): exact 1:1 native AArch64/x86 bodies for hot SDK leaf functions of the game thread.
++//
++// tools/apply_n1_hooks.py puts one line at the very top of each listed generated function:
++//     if (ctx.pc == 0xENTRY && nwii::runtime::n1_ENTRY(ctx, &<that function>)) return;  // [n1]
++// n1_ENTRY() returns true when the native body ran: ctx and guest memory are then exactly what the
++// generated code leaves at its blr (every GPR/FPR/PS1/CR/XER/CTR it writes, the volatile ones too,
++// inst_count with the same per-path sum, ctx.pc = ctx.lr, the same bytes stored in the same order, the
++// same interrupt polls). It returns false without touching anything when a precondition does not hold
++// (switch off, memory that is not plain MEM1/MEM2/locked-cache RAM, NWII_WATCH set, a GQR that is not
++// float, a poll that would have to take the slow path...): the generated code then runs as before.
++//
++// Switches (environment / debug.toml):
++//   NWII_NATIVE=0             all native bodies off
++//   NWII_NATIVE_<NAME>=0      one of them off (names: TABLE of tools/apply_n1.py, e.g. NWII_NATIVE_PSMTXCONCAT=0)
++//   NWII_NATIVE_VERIFY=n      the 1st, 2nd, 4th, 8th... and every n-th call of each function: snapshot of the
++//                             registers and of all guest RAM (MEM1/MEM2/LC), native body, its registers and the
++//                             32-byte RAM blocks it changed kept, those blocks put back, generated code, then
++//                             registers and changed blocks compared ("[N1] <name> verify MISMATCH ... first at
++//                             <addresses>"; the generated result is the one kept). Other threads (AX, render) keep
++//                             writing guest RAM meanwhile: a block only one side "changed" far from the function's
++//                             operands is such a writer. Functions that write MMIO / the GX pipe are not verified this
++//                             way (difftest only). PC only: ~88 MB copy + two scans per check.
++//   NWII_NATIVE_STATS=1       counters per function ("[N1] <name> stats" every 2^18 calls, "final" at exit)
++#pragma once
++#include "runtime/cpu_context.h"
++
++namespace nwii {
++namespace runtime {
++
++// One per replaced function (defined in the generated file next to the function, see apply_n1.py).
++struct N1Slot {
++  uint32_t entry;
++  const char *name;                 // NWII_NATIVE_<name>=0 turns it off
++  bool (*nat)(CPUContext &);        // native body: true = ran (ctx/memory = the generated result)
++  void (*gen)(CPUContext &);        // the generated function (for the verify mode)
++  uint32_t flags = 0;               // 1: writes MMIO / the GX gather pipe (cannot be undone: never verified)
++  int32_t mode = 0;                 // 0: not set up yet, 1: native, 2: off, 3: native + counters/verify,
++                                    // 4: off + call counter (NWII_NATIVE_STATS with the function off)
++  uint64_t calls = 0, native = 0, declined = 0, vok = 0, vbad = 0, vskip = 0;
++  N1Slot *next = nullptr;
++};
++bool n1_hook_slow(N1Slot &s, CPUContext &ctx);
++NWII_FORCEINLINE bool n1_hook(N1Slot &s, CPUContext &ctx) {
++  if (NWII_LIKELY(s.mode == 1)) return s.nat(ctx);
++  return n1_hook_slow(s, ctx);
++}
++// Slow interrupt polls taken inside native bodies (the verify mode compares only calls without one).
++extern uint64_t g_n1_slow;
++
++// An interrupt poll of the generated code (poll_due + slow path) whose outcome would only be "nothing":
++// MSR[EE] clear or none of the inline flags set (the slow path is due anyway when poll_left runs out).
++NWII_FORCEINLINE bool n1_no_flags(const CPUContext &c) {
++  return !(c.msr & 0x8000) ||
++         !(c.poll_dec_due | ((hw::pi_intsr.load(std::memory_order_relaxed) & hw::pi_intmr.load(std::memory_order_relaxed)) != 0) |
++           (c.pending_cb_count.load(std::memory_order_relaxed) != 0));
++}
++
++// Interrupt polls of a native loop, one at a time: a poll that the inline part of the generated poll
++// (poll_due) would find quiet (poll_left > 1 and MSR[EE] clear or no flag set) only decrements a local copy
++// of poll_left; the others are done for real (flush(), the state of that poll into ctx, poll_due + slow path).
++// The flags are read again after every real poll (as at most every 16 polls with the wall clock).
++struct N1Poll {
++  CPUContext &c;
++  int32_t start, left;
++  bool quiet;
++  explicit N1Poll(CPUContext &cc) : c(cc), start(cc.poll_left.load(std::memory_order_relaxed)), left(start), quiet(n1_no_flags(cc)) {}
++  NWII_FORCEINLINE bool fast() {
++    if (left > 1 && quiet) { --left; return true; }
++    return false;
++  }
++  // the local count back to ctx, unless another thread kicked poll_left meanwhile (the kick stays). Plain
++  // load + store, no CAS: the same window for a lost kick as the generated poll's load/decrement/store.
++  NWII_FORCEINLINE void flush() {
++    if (left != start) {
++      const int32_t now = c.poll_left.load(std::memory_order_relaxed);
++      if (now == start) c.poll_left.store(left, std::memory_order_relaxed);
++      start = left = (now == start) ? left : now;
++    }
++  }
++  NWII_FORCEINLINE void reload() {
++    start = left = c.poll_left.load(std::memory_order_relaxed);
++    quiet = n1_no_flags(c);
++  }
++};
++
++// Hand-written native bodies (native_n1.cpp).
++bool n1h_801AC440(CPUContext &ctx);  // DCInvalidateRange
++bool n1h_801AC470(CPUContext &ctx);  // DCFlushRange
++bool n1h_80162C30(CPUContext &ctx);  // fLiMgBa_c::searchNodeByID
++// Rounds N2+ (native_n2.cpp, n2h_<addr>): declared by apply_n1.py in the generated file of each function.
++
++}  // namespace runtime
++}  // namespace nwii
+diff --color -ruN r22r7/nWiiRuntime/src/hle/native_d1.cpp r28d1/nWiiRuntime/src/hle/native_d1.cpp
+--- r22r7/nWiiRuntime/src/hle/native_d1.cpp	1969-12-31 19:00:00.000000000 -0500
++++ r28d1/nWiiRuntime/src/hle/native_d1.cpp	2026-11-10 03:38:09.221280923 -0500
+@@ -0,0 +1,706 @@
++// r28d1 (front D, pilot D1): native fLiMgBa_c::searchNodeByID (0x80162C30) with an exact ID -> node index, and
++// native fManager_c::searchBaseByID (0x80162D00). See include/runtime/native_d1.h.
++#include "runtime/native_d1.h"
++#include "runtime/native_n1.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++namespace nwii {
++namespace runtime {
++
++uint32_t g_d1_dirty = 0xFFu;
++uint32_t g_d1_nodes_live = 0;
++
++namespace {
++
++struct D1Cfg {
++  bool index = true;  // NWII_D1_INDEX=0: native linear walk
++  bool check = false; // NWII_D1_CHECK=1
++  bool stats = false; // NWII_D1_STATS=1
++};
++struct D1Stats {
++  uint64_t look = 0, hit = 0, miss = 0, ksum = 0, nsum = 0, rebuild = 0, guard = 0, bad_list = 0, linear = 0,
++           poll_fallback = 0, other_list = 0, check_ok = 0, check_bad = 0, touch_other = 0, base_calls = 0,
++           base_declined = 0;
++  uint64_t per_list[8] = {};
++};
++D1Stats g_st;
++uint64_t g_slow_polls = 0, g_slow_diverged = 0;
++void d1_report(const char *why) {
++  const D1Stats &s = g_st;
++  std::printf("[D1] %s: lookups=%llu hit=%llu miss=%llu avg_k=%.2f avg_n(miss)=%.2f rebuild=%llu guard=%llu "
++              "unindexable=%llu linear=%llu poll_fallback=%llu other_list=%llu touch_other=%llu check ok=%llu bad=%llu "
++              "| searchBaseByID native=%llu declined=%llu | per list:",
++              why, (unsigned long long)s.look, (unsigned long long)s.hit, (unsigned long long)s.miss,
++              s.hit ? (double)s.ksum / (double)s.hit : 0.0, s.miss ? (double)s.nsum / (double)s.miss : 0.0,
++              (unsigned long long)s.rebuild, (unsigned long long)s.guard, (unsigned long long)s.bad_list,
++              (unsigned long long)s.linear, (unsigned long long)s.poll_fallback, (unsigned long long)s.other_list,
++              (unsigned long long)s.touch_other, (unsigned long long)s.check_ok, (unsigned long long)s.check_bad,
++              (unsigned long long)s.base_calls, (unsigned long long)s.base_declined);
++  for (int i = 0; i < 8; ++i) std::printf(" %llu", (unsigned long long)s.per_list[i]);
++  std::printf(" | slow polls in indexed walks=%llu diverged=%llu", (unsigned long long)g_slow_polls, (unsigned long long)g_slow_diverged);
++  std::printf("\n");
++  std::fflush(stdout);
++}
++void d1_report_exit() { d1_report("final"); }
++
++const D1Cfg &d1_cfg() {
++  static const D1Cfg c = [] {
++    D1Cfg r;
++    const char *e = std::getenv("NWII_D1_INDEX");
++    r.index = !(e && e[0] == '0');
++    e = std::getenv("NWII_D1_CHECK");
++    r.check = e && e[0] == '1';
++    e = std::getenv("NWII_D1_STATS");
++    r.stats = (e && e[0] == '1') || r.check;
++    if (r.stats) std::atexit(d1_report_exit);
++    std::printf("[D1] searchNodeByID: %s%s%s (r9/r28d1)\n", r.index ? "ID index" : "native linear walk (NWII_D1_INDEX=0)",
++                r.check ? ", cross-check every lookup" : "", r.stats ? ", stats" : "");
++    std::fflush(stdout);
++    return r;
++  }();
++  return c;
++}
++
++// ---- the index -------------------------------------------------------------------------------------
++struct D1Ent { uint32_t node, owner, id; };
++struct D1List {
++  std::vector<D1Ent> e;      // the list from first to last, as in guest memory at the last rebuild
++  std::vector<int32_t> h;    // id -> position of the first node with that id (-1: empty)
++  uint32_t mask = 0;
++  uint32_t first = 0;        // list->first at the last rebuild
++  bool ok = false;           // false: not indexable (pointer outside plain RAM, cycle): native linear walk
++};
++D1List g_l[8];
++// every indexed node -> its list (+1), for operations of other lists that use a search node
++std::vector<uint64_t> g_ns;  // (node << 8) | (list + 1), 0 = empty
++uint32_t g_ns_mask = 0;
++bool g_ns_dirty = true;
++
++NWII_FORCEINLINE uint32_t d1_hash(uint32_t x) {
++  x *= 0x9E3779B1u;
++  return x ^ (x >> 15);
++}
++// host pointer of a 4-byte aligned plain RAM word, or nullptr
++NWII_FORCEINLINE const uint8_t *d1_ptr(MMU &m, uint32_t a) {
++  if (a & 3u) return nullptr;
++  return m.fast_ptr(a);
++}
++NWII_FORCEINLINE uint32_t d1_rd(const uint8_t *p) {
++  uint32_t v;
++  std::memcpy(&v, p, 4);
++  return __builtin_bswap32(v);
++}
++
++void d1_rebuild_nodeset() {
++  size_t n = 0;
++  for (const D1List &L : g_l) n += L.e.size();
++  uint32_t cap = 64;
++  while (cap < 2 * n + 16) cap <<= 1;
++  g_ns.assign(cap, 0);
++  g_ns_mask = cap - 1;
++  for (int li = 0; li < 8; ++li)
++    for (const D1Ent &x : g_l[li].e) {
++      uint32_t i = d1_hash(x.node) & g_ns_mask;
++      while (g_ns[i] != 0 && (uint32_t)(g_ns[i] >> 8) != x.node) i = (i + 1) & g_ns_mask;
++      g_ns[i] = ((uint64_t)x.node << 8) | (uint64_t)(li + 1);
++    }
++  g_ns_dirty = false;
++}
++
++NWII_NOINLINE void d1_rebuild(MMU &m, int li) {
++  D1List &L = g_l[li];
++  ++g_st.rebuild;
++  L.e.clear();
++  L.ok = false;
++  g_d1_dirty &= ~(1u << li);
++  g_ns_dirty = true;
++  g_d1_nodes_live = 1;
++  const uint8_t *lp = d1_ptr(m, kD1SearchManage + 8u * (uint32_t)li);
++  if (!lp) { ++g_st.bad_list; return; }
++  uint32_t node = d1_rd(lp);
++  L.first = node;
++  while (node != 0) {
++    const uint8_t *np = d1_ptr(m, node);
++    if (!np || L.e.size() >= (1u << 16)) { L.e.clear(); ++g_st.bad_list; return; }
++    const uint32_t owner = d1_rd(np + 8);
++    const uint8_t *op = d1_ptr(m, owner);
++    if (!op) { L.e.clear(); ++g_st.bad_list; return; }
++    L.e.push_back({node, owner, d1_rd(op)});
++    node = d1_rd(np + 4);
++  }
++  uint32_t cap = 16;
++  while (cap < 2 * L.e.size()) cap <<= 1;
++  L.h.assign(cap, -1);
++  L.mask = cap - 1;
++  for (int32_t k = 0; k < (int32_t)L.e.size(); ++k) {
++    const uint32_t id = L.e[k].id;
++    uint32_t i = d1_hash(id) & L.mask;
++    for (;;) {
++      const int32_t s = L.h[i];
++      if (s < 0) { L.h[i] = k; break; }
++      if (L.e[s].id == id) break;  // an earlier (closer to first) node has this id: the walk stops there
++      i = (i + 1) & L.mask;
++    }
++  }
++  L.ok = true;
++}
++
++// What the generated walk would find: found at position k (node, owner), or not found after n nodes (the
++// last one's owner/id are what r5/r0 keep).
++struct D1Res {
++  bool found;
++  uint32_t k, n, node, owner, last_owner, last_id;
++};
++
++// The plain walk (cross-check mode and searchBaseByID without the index). false: a pointer outside plain RAM
++// or more than 2^20 nodes (the generated code then runs).
++bool d1_walk(MMU &m, uint32_t list, uint32_t id, D1Res &r) {
++  r = {};
++  const uint8_t *lp = d1_ptr(m, list);
++  if (!lp) return false;
++  uint32_t node = d1_rd(lp);
++  uint32_t k = 0;
++  while (node != 0) {
++    const uint8_t *np = d1_ptr(m, node);
++    if (!np || k >= (1u << 20)) return false;
++    const uint32_t owner = d1_rd(np + 8);
++    const uint8_t *op = d1_ptr(m, owner);
++    if (!op) return false;
++    const uint32_t oid = d1_rd(op);
++    r.last_owner = owner;
++    r.last_id = oid;
++    if (oid == id) {
++      r.found = true;
++      r.k = k;
++      r.node = node;
++      r.owner = owner;
++      return true;
++    }
++    node = d1_rd(np + 4);
++    ++k;
++  }
++  r.found = false;
++  r.n = k;
++  return true;
++}
++
++// Index lookup. false: list not indexable.
++NWII_FORCEINLINE bool d1_find(MMU &m, int li, uint32_t id, D1Res &r) {
++  D1List &L = g_l[li];
++  const uint8_t *lp = m.mem1.data() + ((kD1SearchManage & 0x3FFFFFFFu) + 8u * (uint32_t)li);
++  for (int attempt = 0;; ++attempt) {
++    if (NWII_UNLIKELY((g_d1_dirty >> li) & 1u)) d1_rebuild(m, li);
++    if (NWII_UNLIKELY(!L.ok)) return false;
++    if (NWII_UNLIKELY(d1_rd(lp) != L.first)) {  // the list changed without a hooked operation
++      ++g_st.guard;
++      g_d1_dirty |= 1u << li;
++      if (attempt) return false;
++      continue;
++    }
++    const uint32_t n = (uint32_t)L.e.size();
++    uint32_t i = d1_hash(id) & L.mask;
++    int32_t s;
++    while ((s = L.h[i]) >= 0 && L.e[s].id != id) i = (i + 1) & L.mask;
++    if (s >= 0) {
++      const D1Ent &x = L.e[s];
++      const uint8_t *np = d1_ptr(m, x.node);
++      const uint8_t *op = np ? d1_ptr(m, d1_rd(np + 8)) : nullptr;
++      if (NWII_UNLIKELY(!op || d1_rd(np + 8) != x.owner || d1_rd(op) != id)) {
++        ++g_st.guard;
++        g_d1_dirty |= 1u << li;
++        if (attempt) return false;
++        continue;
++      }
++      r.found = true;
++      r.k = (uint32_t)s;
++      r.node = x.node;
++      r.owner = x.owner;
++      r.last_owner = x.owner;
++      r.last_id = id;
++      r.n = 0;
++    } else {
++      r.found = false;
++      r.k = 0;
++      r.n = n;
++      r.node = r.owner = 0;
++      r.last_owner = n ? L.e[n - 1].owner : 0;
++      r.last_id = n ? L.e[n - 1].id : 0;
++    }
++    return true;
++  }
++}
++
++NWII_NOINLINE void d1_check(MMU &m, uint32_t list, uint32_t id, const D1Res &x) {
++  D1Res w;
++  if (!d1_walk(m, list, id, w)) { ++g_st.check_bad; return; }
++  bool same = w.found == x.found;
++  if (same && w.found) same = w.k == x.k && w.node == x.node && w.owner == x.owner;
++  if (same && !w.found) same = w.n == x.n && (w.n == 0 || (w.last_owner == x.last_owner && w.last_id == x.last_id));
++  if (same) { ++g_st.check_ok; return; }
++  ++g_st.check_bad;
++  if (g_st.check_bad <= 30)
++    std::printf("[D1] CHECK MISMATCH list %08x id %08x: walk found=%d k=%u n=%u node=%08x owner=%08x last=%08x/%08x | "
++                "index found=%d k=%u n=%u node=%08x owner=%08x last=%08x/%08x\n", list, id, w.found, w.k, w.n, w.node,
++                w.owner, w.last_owner, w.last_id, x.found, x.k, x.n, x.node, x.owner, x.last_owner, x.last_id);
++}
++
++}  // namespace
++
++void d1_touch_other(uint32_t node) {
++  if (g_ns_dirty) d1_rebuild_nodeset();
++  uint32_t i = d1_hash(node) & g_ns_mask;
++  for (;;) {
++    const uint64_t v = g_ns[i];
++    if (v == 0) return;
++    if ((uint32_t)(v >> 8) == node) {
++      ++g_st.touch_other;
++      g_d1_dirty |= 1u << ((uint32_t)(v & 0xFF) - 1);
++      return;
++    }
++    i = (i + 1) & g_ns_mask;
++  }
++}
++
++// Lookup for the hooks: the index (or the walk), cross-check, counters. false: neither can answer.
++NWII_FORCEINLINE bool d1_lookup(MMU &m, uint32_t list, uint32_t id, D1Res &r) {
++  const D1Cfg &c = d1_cfg();
++  const int li = (int)((list - kD1SearchManage) >> 3);
++  if (!c.index) {
++    if (!d1_walk(m, list, id, r)) return false;
++  } else {
++    if (!d1_find(m, li, id, r)) {
++      if (!d1_walk(m, list, id, r)) return false;
++    }
++    if (NWII_UNLIKELY(c.check)) d1_check(m, list, id, r);
++  }
++  if (NWII_UNLIKELY(c.stats)) {
++    ++g_st.look;
++    ++g_st.per_list[li];
++    if (r.found) { ++g_st.hit; g_st.ksum += r.k; } else { ++g_st.miss; g_st.nsum += r.n; }
++    if ((g_st.look & 0xFFFFF) == 0) d1_report("stats");
++  }
++  return true;
++}
++
++// fLiMgBa_c::searchNodeByID (0x80162C30): r3 = list, r4 = id. Generated code (G5):
++//   C30 lwz r3,0(r3) ; C34 b C4C ; C38 lwz r5,8(r3) ; C3C lwz r0,0(r5) ; C40 cmpw r0,r4 ; C44 beqlr ;
++//   C48 lwz r3,4(r3) ; C4C cmpwi r3,0 ; C50 bne C38 (poll) ; C54 li r3,0 ; C58 blr
++// Test t (t = 0..T-1, T = k+1 on a hit at position k, n+1 on a miss after n nodes) is the cmpwi at C4C and the
++// poll at C50 with r3 = node t (0 after the last node), r0/r5 = id/owner of node t-1 (the entry values for
++// t = 0), inst_count = entry + 4 + 7t. inst_count at the blr: hit +8+7k, miss +6+7n.
++// The polls a quiet countdown would skip are skipped in batches; a poll that must take the slow path is done
++// for real with ctx in the exact state of that test (if it delivers an interrupt, the generated code resumes
++// at C50 from that state). If a slow poll changed the registers or touched the list, the rest of the walk is
++// the generated loop's semantics on the real list (d1_linear_after_poll).
++namespace {
++// the loop of the generated code, starting right after the poll at C50 (state in ctx)
++bool d1_linear_after_poll(CPUContext &c) {
++  MemView mv(c.mmu);
++  uint32_t r0 = c.gpr[0], r3 = c.gpr[3], r4 = c.gpr[4], r5 = c.gpr[5], xer = c.xer;
++  bool lt = c.cr[0].lt, gt = c.cr[0].gt, eq = c.cr[0].eq, so = c.cr[0].so;
++  uint64_t ic = c.inst_count;
++  N1Poll P(c);
++  bool first = true;
++  for (;;) {
++    if (!first) {
++      ic += 2;
++      lt = (int32_t)r3 < 0; gt = (int32_t)r3 > 0; eq = r3 == 0; so = (xer >> 31) & 1;
++      if (!P.fast()) {
++        P.flush();
++        c.pc = 0x80162C50u;
++        if (poll_due(c)) {
++          c.cr[0].eq = eq; c.cr[0].gt = gt; c.cr[0].lt = lt; c.cr[0].so = so;
++          c.gpr[0] = r0; c.gpr[3] = r3; c.gpr[5] = r5; c.inst_count = ic;
++          ++g_n1_slow;
++          if (process_pending_callbacks_slow(c)) return true;
++          eq = c.cr[0].eq; gt = c.cr[0].gt; lt = c.cr[0].lt; so = c.cr[0].so;
++          r0 = c.gpr[0]; r3 = c.gpr[3]; r4 = c.gpr[4]; r5 = c.gpr[5]; ic = c.inst_count; xer = c.xer;
++        }
++        P.reload();
++      }
++    }
++    first = false;
++    if (eq) break;
++    ic += 4;
++    r5 = mv.read32<0>(r3 + 8);
++    r0 = mv.read32<0>(r5 + 0);
++    lt = (int32_t)r0 < (int32_t)r4; gt = (int32_t)r0 > (int32_t)r4; eq = r0 == r4; so = (xer >> 31) & 1;
++    if (eq) {
++      P.flush();
++      c.cr[0].eq = eq; c.cr[0].gt = gt; c.cr[0].lt = lt; c.cr[0].so = so;
++      c.gpr[0] = r0; c.gpr[3] = r3; c.gpr[5] = r5; c.inst_count = ic; c.pc = c.lr;
++      return true;
++    }
++    ic += 1;
++    r3 = mv.read32<0>(r3 + 4);
++  }
++  P.flush();
++  ic += 2;
++  r3 = 0;
++  c.cr[0].eq = eq; c.cr[0].gt = gt; c.cr[0].lt = lt; c.cr[0].so = so;
++  c.gpr[0] = r0; c.gpr[3] = r3; c.gpr[5] = r5; c.inst_count = ic; c.pc = c.lr;
++  return true;
++}
++}  // namespace
++
++// the whole function on ctx (always runs: true)
++static bool d1_search(CPUContext &c) {
++  const uint32_t list = c.gpr[3];
++  if ((list - kD1SearchManage) >= 64u || (list & 7u) || g_watch_addr != 0) {
++    ++g_st.other_list;
++    return n1h_80162C30(c);
++  }
++  const D1Cfg &cfg = d1_cfg();
++  const int li = (int)((list - kD1SearchManage) >> 3);
++  D1Res r;
++  if (!cfg.index || !d1_lookup(c.mmu, list, c.gpr[4], r) || !g_l[li].ok || (g_d1_dirty >> li) & 1u) {
++    ++g_st.linear;
++    return n1h_80162C30(c);
++  }
++  const std::vector<D1Ent> &E = g_l[li].e;
++  const uint32_t T = (r.found ? r.k : r.n) + 1u;
++  const uint32_t r0i = c.gpr[0], r5i = c.gpr[5], so = (c.xer >> 31) & 1, id = c.gpr[4];
++  const uint64_t ic0 = c.inst_count;
++  uint32_t t = 0;
++  while (t < T) {
++    const int32_t left = c.poll_left.load(std::memory_order_relaxed);
++    if (left > 1 && n1_no_flags(c)) {
++      const uint32_t q = std::min<uint32_t>(T - t, (uint32_t)(left - 1));
++      c.poll_left.store(left - (int32_t)q, std::memory_order_relaxed);
++      t += q;
++      continue;
++    }
++    // test t with a poll that is not quiet: the exact state of that test, then the generated poll
++    const uint32_t r3 = (r.found || t < r.n) ? E[t].node : 0u;
++    const uint32_t r0 = t ? E[t - 1].id : r0i, r5 = t ? E[t - 1].owner : r5i;
++    const uint64_t ic = ic0 + 4u + 7ull * t;
++    c.gpr[0] = r0; c.gpr[3] = r3; c.gpr[5] = r5; c.inst_count = ic;
++    c.cr[0].lt = (int32_t)r3 < 0; c.cr[0].gt = (int32_t)r3 > 0; c.cr[0].eq = r3 == 0; c.cr[0].so = so;
++    c.pc = 0x80162C50u;
++    ++g_slow_polls;
++    if (poll_due(c)) {
++      ++g_n1_slow;
++      if (process_pending_callbacks_slow(c)) return true;  // interrupt: the generated code resumes at C50
++      if (c.gpr[0] != r0 || c.gpr[3] != r3 || c.gpr[5] != r5 || c.inst_count != ic || c.gpr[4] != id ||
++          c.cr[0].eq != (r3 == 0) || ((g_d1_dirty >> li) & 1u)) {
++        ++g_slow_diverged;
++        return d1_linear_after_poll(c);
++      }
++    }
++    ++t;
++  }
++  if (r.found) {
++    c.gpr[0] = c.gpr[4];
++    c.gpr[3] = r.node;
++    c.gpr[5] = r.owner;
++    c.inst_count = ic0 + 8ull + 7ull * r.k;
++  } else {
++    if (r.n) { c.gpr[0] = r.last_id; c.gpr[5] = r.last_owner; } else { c.gpr[0] = r0i; c.gpr[5] = r5i; }
++    c.gpr[3] = 0;
++    c.inst_count = ic0 + 6ull + 7ull * r.n;
++  }
++  // hit: cmpw r0,r4 equal; miss: cmpwi r3,0 with r3 == 0
++  c.cr[0].lt = false; c.cr[0].gt = false; c.cr[0].eq = true; c.cr[0].so = so;
++  c.pc = c.lr;
++  return true;
++}
++
++bool d1h_80162C30(CPUContext &c) { return d1_search(c); }
++
++// fManager_c::searchBaseByID (0x80162D00): r3 = id.
++//   D00 stwu r1,-16(r1) ; mflr r0 ; lis r5,0x8037 ; mr r4,r3 ; stw r0,20(r1) ; rlwinm r0,r3,3,26,28 ;
++//   addi r5,r5,0x7A70 ; add r3,r5,r0 ; bl searchNodeByID ; D24 cmpwi r3,0 ; beq D34 ; lwz r3,8(r3) ; b D38 ;
++//   D34 li r3,0 ; D38 lwz r0,20(r1) ; mtlr r0 ; addi r1,r1,16 ; blr
++// inst_count (generated): +9, the walk, +4, (+1 not found), +4. The call is d1_search with ctx exactly as the
++// generated code leaves it before the bl (lr = D24); if the walk took an interrupt (ctx.pc != D24) we return
++// like the generated code does, and it resumes later at D24 through the generated function.
++bool d1h_80162D00(CPUContext &c) {
++  ++g_st.base_calls;
++  const uint32_t id = c.gpr[3], r1 = c.gpr[1], lr = c.lr, sp = r1 - 16u;
++  MMU &m = c.mmu;
++  if (g_watch_addr != 0) { ++g_st.base_declined; return false; }
++  MemView mv(m);
++  mv.write32<0>(sp, r1);        // stwu r1,-16(r1)
++  mv.write32<0>(sp + 20u, lr);  // stw r0,20(r1)
++  c.gpr[1] = sp;
++  c.gpr[0] = (id & 7u) << 3;
++  c.gpr[4] = id;
++  c.gpr[5] = kD1SearchManage;
++  c.gpr[3] = kD1SearchManage + ((id & 7u) << 3);
++  c.inst_count += 9u;
++  c.lr = 0x80162D24u;
++  c.pc = 0x80162C30u;
++  d1_search(c);
++  if (c.pc != 0x80162D24u) return true;
++  uint64_t ic = c.inst_count + 4u;
++  const uint32_t node = c.gpr[3];
++  c.cr[0].lt = (int32_t)node < 0; c.cr[0].gt = (int32_t)node > 0; c.cr[0].eq = node == 0; c.cr[0].so = (c.xer >> 31) & 1;
++  uint32_t r3;
++  if (node != 0) {
++    r3 = mv.read32<0>(node + 8u);
++  } else {
++    ic += 1;
++    r3 = 0;
++  }
++  ic += 4;
++  const uint32_t r0 = mv.read32<0>(c.gpr[1] + 20u);
++  c.gpr[0] = r0;
++  c.gpr[3] = r3;
++  c.gpr[1] = c.gpr[1] + 16u;
++  c.inst_count = ic;
++  c.lr = r0;
++  c.pc = r0;
++  return true;
++}
++
++// fTrMgBa_c::searchNodeByProfName (0x80163090): r3 = tree manager, r4 = profile name, r5 = parent node (or 0).
++// Pre-order walk from getTreeNext(parent) (or the root) to the first node whose owner's mProfName == r4.
++// No index (the tree order changes with every add/remove): the generated code of this function and of the two
++// it calls, cTreeNd_c::getTreeNext (0x801616C0, a stack frame below ours) and getTreeNextNotChild (0x80161700),
++// fused into one native loop with the registers in locals: the same loads, the same stack stores in the same
++// order, the same r0/r1/r3/r4/r31/CR0/LR and per-block inst_count, and the same interrupt polls (0x801630DC per
++// node, 0x80161734 per parent climbed), quiet ones batched. A poll that takes the slow path gets ctx in the
++// exact state the generated code has there (inside the nested calls too: frames written, lr = 0x801616E0); if it
++// delivers an interrupt we return like the generated code does, and the generated functions resume later
++// through their dispatch cases (0x80161734 / 0x801616E0 / 0x801630D8 / 0x801630B4 / 0x801630DC).
++namespace {
++uint64_t g_pn_calls = 0;
++void d1_pn_report() {
++  std::printf("[D1] searchNodeByProfName: calls=%llu\n", (unsigned long long)g_pn_calls);
++  std::fflush(stdout);
++}
++struct D1Pn {
++  CPUContext &c;
++  MemView mv;
++  N1Poll P;
++  uint32_t r0, r1, r3, r4, r31, lr, xer;
++  bool lt, gt, eq, so;
++  uint64_t ic;
++  explicit D1Pn(CPUContext &cc) : c(cc), mv(cc.mmu), P(cc) {}
++  NWII_FORCEINLINE void cmpwi(uint32_t v) { lt = (int32_t)v < 0; gt = (int32_t)v > 0; eq = v == 0; so = (xer >> 31) & 1; }
++  void spill() {
++    c.cr[0].lt = lt; c.cr[0].gt = gt; c.cr[0].eq = eq; c.cr[0].so = so;
++    c.gpr[0] = r0; c.gpr[1] = r1; c.gpr[3] = r3; c.gpr[4] = r4; c.gpr[31] = r31; c.inst_count = ic; c.lr = lr;
++  }
++  void reload() {
++    lt = c.cr[0].lt; gt = c.cr[0].gt; eq = c.cr[0].eq; so = c.cr[0].so;
++    r0 = c.gpr[0]; r1 = c.gpr[1]; r3 = c.gpr[3]; r4 = c.gpr[4]; r31 = c.gpr[31]; ic = c.inst_count; lr = c.lr; xer = c.xer;
++  }
++  // one poll at pc; true: an interrupt was delivered (ctx holds the state; return)
++  NWII_FORCEINLINE bool poll(uint32_t pc) {
++    if (P.fast()) return false;
++    P.flush();
++    c.pc = pc;
++    if (poll_due(c)) {
++      spill();
++      ++g_n1_slow;
++      if (process_pending_callbacks_slow(c)) return true;
++      reload();
++    }
++    P.reload();
++    return false;
++  }
++  // getTreeNextNotChild (r3 = node), called from getTreeNext with lr = 0x801616E0
++  bool nc() {
++    ic += 5;
++    r0 = mv.read32<0>(r3 + 12);
++    cmpwi(r0);
++    if (!eq) { r3 = r0; return false; }
++    ic += 2;
++    r4 = mv.read32<0>(r3 + 0);
++    for (;;) {
++      ic += 2;
++      cmpwi(r4);
++      if (poll(0x80161734u)) return true;
++      if (eq) break;
++      ic += 3;
++      r3 = mv.read32<0>(r4 + 12);
++      cmpwi(r3);
++      if (!eq) return false;
++      ic += 1;
++      r4 = mv.read32<0>(r4 + 0);
++    }
++    ic += 2;
++    r3 = 0;
++    return false;
++  }
++  // getTreeNext (r3 = node), called with lr = ret; true: interrupted
++  bool gtn(uint32_t ret) {
++    lr = ret;
++    ic += 7;
++    mv.write32<0>(r1 - 16u, r1);  // stwu r1,-16(r1)
++    r1 -= 16u;
++    r0 = lr;
++    mv.write32<0>(r1 + 20u, r0);  // stw r0,20(r1)
++    r0 = mv.read32<0>(r3 + 4);    // child
++    cmpwi(r0);
++    if (eq) {
++      ic += 1;
++      lr = 0x801616E0u;
++      if (nc()) return true;
++      ic += 1;
++      r0 = r3;
++    }
++    ic += 5;
++    r3 = r0;
++    r0 = mv.read32<0>(r1 + 20u);
++    lr = r0;
++    r1 += 16u;
++    return false;
++  }
++};
++}  // namespace
++
++static bool d1_pn_native(CPUContext &c);
++uint64_t g_pn_chk_ok = 0, g_pn_chk_bad = 0, g_pn_chk_skip = 0, g_pn_chk_slow = 0;
++static bool g_pn_bypass = false;
++void d1_pn_chk_report() {
++  std::printf("[D1] searchNodeByProfName check: ok=%llu bad=%llu (compared with slow polls, poll_left not compared: %llu) "
++              "skipped (interrupt delivered inside)=%llu\n", (unsigned long long)g_pn_chk_ok, (unsigned long long)g_pn_chk_bad,
++              (unsigned long long)g_pn_chk_slow, (unsigned long long)g_pn_chk_skip);
++  std::fflush(stdout);
++}
++}  // namespace runtime
++}  // namespace nwii
++extern "C" void func_80163090(nwii::runtime::CPUContext &ctx);
++namespace nwii {
++namespace runtime {
++
++// NWII_D1_CHECK=1: every call runs natively on a copy of the registers and of the stack words it can write
++// ([r1-32, r1+8)), then the generated code from the same state, and compares GPRs, CR0, LR, PC, inst_count,
++// poll_left and those stack bytes (cheap enough for every call, unlike NWII_NATIVE_VERIFY whose 88 MB
++// snapshot makes the next poll deliver an interrupt inside these long walks). Calls whose native run took a
++// slow poll keep the native result (skipped).
++struct D1PnRegs {
++  uint32_t gpr[32], lr, pc, ctr, xer;
++  bool cr[4];
++  uint64_t ic;
++  int32_t left;
++  uint8_t stack[40];
++};
++static void d1_pn_take(CPUContext &c, D1PnRegs &r, uint32_t base) {
++  std::memset(&r, 0, sizeof r);
++  for (int i = 0; i < 32; ++i) r.gpr[i] = c.gpr[i];
++  r.lr = c.lr; r.pc = c.pc; r.ctr = c.ctr; r.xer = c.xer;
++  r.cr[0] = c.cr[0].lt; r.cr[1] = c.cr[0].gt; r.cr[2] = c.cr[0].eq; r.cr[3] = c.cr[0].so;
++  r.ic = c.inst_count;
++  r.left = c.poll_left.load(std::memory_order_relaxed);
++  for (int i = 0; i < 40; ++i) r.stack[i] = c.mmu.read8(base + i);
++}
++static void d1_pn_put(CPUContext &c, const D1PnRegs &r, uint32_t base) {
++  for (int i = 0; i < 32; ++i) c.gpr[i] = r.gpr[i];
++  c.lr = r.lr; c.pc = r.pc; c.ctr = r.ctr; c.xer = r.xer;
++  c.cr[0].lt = r.cr[0]; c.cr[0].gt = r.cr[1]; c.cr[0].eq = r.cr[2]; c.cr[0].so = r.cr[3];
++  c.inst_count = r.ic;
++  c.poll_left.store(r.left, std::memory_order_relaxed);
++  for (int i = 0; i < 40; ++i) c.mmu.write8(base + i, r.stack[i]);
++}
++
++bool d1h_80163090(CPUContext &c) {
++  if (g_pn_bypass) { g_pn_bypass = false; return false; }
++  if (NWII_UNLIKELY(d1_cfg().check) && g_watch_addr == 0) {
++    const uint32_t base = c.gpr[1] - 32u;
++    D1PnRegs r0, rn, rg;
++    d1_pn_take(c, r0, base);
++    const uint64_t slow0 = g_n1_slow;
++    d1_pn_native(c);
++    // an interrupt delivered inside: the native result stays (the generated code resumes from that poll)
++    if (c.pc != r0.lr) { ++g_pn_chk_skip; return true; }
++    // slow polls that delivered nothing: compared too, except poll_left (each slow poll reloads it)
++    const bool slow = g_n1_slow != slow0;
++    d1_pn_take(c, rn, base);
++    d1_pn_put(c, r0, base);
++    g_pn_bypass = true;
++    ::func_80163090(c);
++    g_pn_bypass = false;
++    d1_pn_take(c, rg, base);
++    if (rg.pc != r0.lr) { ++g_pn_chk_skip; return true; }  // the generated run took an interrupt: its state stays
++    if (slow) { rn.left = rg.left; ++g_pn_chk_slow; }
++    if (std::memcmp(&rn, &rg, sizeof rn) == 0) {
++      ++g_pn_chk_ok;
++    } else {
++      ++g_pn_chk_bad;
++      if (g_pn_chk_bad <= 20) {
++        std::printf("[D1] searchNodeByProfName CHECK MISMATCH (r3=%08x r4=%08x r5=%08x):", r0.gpr[3], r0.gpr[4], r0.gpr[5]);
++        for (int i = 0; i < 32; ++i)
++          if (rn.gpr[i] != rg.gpr[i]) std::printf(" r%d n=%08x g=%08x", i, rn.gpr[i], rg.gpr[i]);
++        if (rn.lr != rg.lr || rn.pc != rg.pc) std::printf(" lr/pc n=%08x/%08x g=%08x/%08x", rn.lr, rn.pc, rg.lr, rg.pc);
++        if (rn.ctr != rg.ctr || rn.xer != rg.xer) std::printf(" ctr/xer differ");
++        if (rn.ic != rg.ic) std::printf(" ic n=%llu g=%llu", (unsigned long long)rn.ic, (unsigned long long)rg.ic);
++        if (rn.left != rg.left) std::printf(" poll_left n=%d g=%d", rn.left, rg.left);
++        if (std::memcmp(rn.cr, rg.cr, 4)) std::printf(" CR0 differs");
++        if (std::memcmp(rn.stack, rg.stack, 40)) std::printf(" stack differs");
++        std::printf("\n");
++      }
++    }
++    static bool once = (std::atexit(d1_pn_chk_report), true);
++    (void)once;
++    return true;  // the generated result stays
++  }
++  return d1_pn_native(c);
++}
++
++static bool d1_pn_native(CPUContext &c) {
++  if (g_watch_addr != 0) return false;
++  if (NWII_UNLIKELY(d1_cfg().stats)) {
++    static bool once = (std::atexit(d1_pn_report), true);
++    (void)once;
++    ++g_pn_calls;
++  }
++  D1Pn s(c);
++  s.r0 = c.gpr[0]; s.r1 = c.gpr[1]; s.r3 = c.gpr[3]; s.r4 = c.gpr[4]; s.r31 = c.gpr[31]; s.lr = c.lr; s.xer = c.xer;
++  s.lt = c.cr[0].lt; s.gt = c.cr[0].gt; s.eq = c.cr[0].eq; s.so = c.cr[0].so;
++  s.ic = c.inst_count;
++  const uint32_t r5 = c.gpr[5];
++  s.ic += 9;
++  s.mv.write32<0>(s.r1 - 16u, s.r1);  // stwu r1,-16(r1)
++  s.r1 -= 16u;
++  s.r0 = s.lr;
++  s.cmpwi(r5);
++  s.mv.write32<0>(s.r1 + 20u, s.r0);  // stw r0,20(r1)
++  s.mv.write32<0>(s.r1 + 12u, s.r31); // stw r31,12(r1)
++  s.r31 = s.r4;
++  if (s.eq) {
++    s.ic += 2;
++    s.r3 = s.mv.read32<0>(s.r3 + 0);
++  } else {
++    s.r3 = r5;
++    if (s.gtn(0x801630B4u)) return true;
++    s.ic += 1;
++  }
++  bool found = false;
++  for (;;) {
++    s.ic += 2;
++    s.cmpwi(s.r3);
++    if (s.poll(0x801630DCu)) return true;
++    if (s.eq) break;
++    s.ic += 5;
++    s.r4 = s.mv.read32<0>(s.r3 + 16);
++    s.r0 = s.mv.read16<0>(s.r4 + 8);
++    s.lt = s.r0 < s.r31; s.gt = s.r0 > s.r31; s.eq = s.r0 == s.r31; s.so = (s.xer >> 31) & 1;  // cmplw r0,r31
++    if (s.eq) { found = true; break; }
++    s.ic += 1;
++    if (s.gtn(0x801630D8u)) return true;
++  }
++  if (!found) {
++    s.ic += 1;
++    s.r3 = 0;
++  }
++  s.P.flush();
++  s.ic += 5;
++  s.r0 = s.mv.read32<0>(s.r1 + 20u);
++  s.r31 = s.mv.read32<0>(s.r1 + 12u);
++  s.lr = s.r0;
++  s.r1 += 16u;
++  s.spill();
++  c.pc = s.lr;
++  return true;
++}
++
++}  // namespace runtime
++}  // namespace nwii
+diff --color -ruN r22r7/nWiiRuntime/src/hle/native_n1.cpp r28d1/nWiiRuntime/src/hle/native_n1.cpp
+--- r22r7/nWiiRuntime/src/hle/native_n1.cpp	1969-12-31 19:00:00.000000000 -0500
++++ r28d1/nWiiRuntime/src/hle/native_n1.cpp	2026-11-10 02:23:52.676943392 -0500
+@@ -0,0 +1,487 @@
++// r19n (front N): runtime side of the native SDK leaf bodies (include/runtime/native_n1.h).
++//  - n1_hook_slow(): first call of each slot (reads the switches), the counters and the verify mode.
++//  - hand-written bodies: DCInvalidateRange / DCFlushRange (closed form + batched interrupt polls).
++#include "runtime/native_n1.h"
++
++#include <algorithm>
++#include <bit>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++#include <unordered_map>
++#include <chrono>
++#ifdef __SWITCH__
++#include <switch.h>
++#endif
++
++namespace nwii {
++namespace runtime {
++
++uint64_t g_n1_slow = 0;
++
++void n1_report_all();  // counters of every slot set up so far (also called by difftest)
++
++namespace {
++
++struct N1Cfg {
++  bool all_on = true;
++  unsigned long verify_every = 0;
++  bool stats = false;
++  bool timing = false;  // NWII_NATIVE_TIME=1: time every call (native, or the generated code when off)
++};
++const N1Cfg &n1_cfg() {
++  static const N1Cfg c = [] {
++    N1Cfg r;
++    const char *e = NWII_ENV("NWII_NATIVE");
++    r.all_on = !(e && e[0] == '0');
++    e = NWII_ENV("NWII_NATIVE_VERIFY");
++    r.verify_every = e ? std::strtoul(e, nullptr, 10) : 0;
++    e = NWII_ENV("NWII_NATIVE_STATS");
++    r.stats = (e && e[0] == '1') || r.verify_every != 0;
++    e = NWII_ENV("NWII_NATIVE_TIME");
++    r.timing = e && e[0] == '1';
++    if (r.timing) r.stats = true;
++    if (r.stats) std::atexit(n1_report_all);
++    std::printf("[N1] native SDK leaf bodies %s%s (r9/r19n)\n", r.all_on ? "on" : "OFF (NWII_NATIVE=0)",
++                r.verify_every ? ", verify mode" : "");
++    std::fflush(stdout);
++    return r;
++  }();
++  return c;
++}
++
++N1Slot *g_slots = nullptr;
++// verify / timing: the next hook of this slot (the generated function about to be called from here) must let
++// the generated code run. One-shot and per slot: the generated code may never come back here (an interrupt
++// delivered inside it can switch guest threads), and a sticky global flag would then disable every hook.
++const N1Slot *g_bypass_slot = nullptr;
++
++// NWII_NATIVE_TIME: time per slot (host ticks; Switch: the 19.2 MHz system counter, PC: steady_clock ns)
++struct N1Time { uint64_t ticks = 0, n = 0; };
++std::unordered_map<const N1Slot *, N1Time> g_ticks;
++NWII_FORCEINLINE uint64_t now_ticks() {
++#ifdef __SWITCH__
++  return armGetSystemTick();
++#else
++  return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++#endif
++}
++NWII_FORCEINLINE double ticks_to_ns(uint64_t t) {
++#ifdef __SWITCH__
++  return (double)t * 1e9 / 19200000.0;
++#else
++  return (double)t;
++#endif
++}
++
++void report(const N1Slot &s, const char *why) {
++  auto it = g_ticks.find(&s);
++  if (it != g_ticks.end()) {
++    const uint64_t n = it->second.n;
++    std::printf("[N1] %s time %s: %llu calls, %.1f ns/call (%s)\n", s.name, why, (unsigned long long)n,
++                n ? ticks_to_ns(it->second.ticks) / (double)n : 0.0, s.mode == 4 ? "generated code" : "native");
++  }
++  std::printf("[N1] %s %s: calls=%llu native=%llu declined=%llu verify ok=%llu bad=%llu skip=%llu\n", s.name, why,
++              (unsigned long long)s.calls, (unsigned long long)s.native, (unsigned long long)s.declined,
++              (unsigned long long)s.vok, (unsigned long long)s.vbad, (unsigned long long)s.vskip);
++  std::fflush(stdout);
++}
++
++// ---- verify mode ----------------------------------------------------------------------------------
++struct N1Regs {
++  uint32_t gpr[32];
++  uint64_t fpr[32], ps1[32];
++  uint8_t cr[8][4];
++  uint32_t pc, lr, ctr, xer, msr, fpscr, srr0, srr1, gqr[8], sprg[4], hid2, dma_u, dma_l, resv;
++  uint64_t inst_count;
++  int32_t poll_left;
++  uint8_t poll_dec_due;
++};
++N1Regs take_regs(const CPUContext &c) {
++  N1Regs r;
++  std::memset(&r, 0, sizeof r);
++  for (int i = 0; i < 32; ++i) {
++    r.gpr[i] = c.gpr[i];
++    std::memcpy(&r.fpr[i], &c.fpr[i], 8);
++    std::memcpy(&r.ps1[i], &c.ps1[i], 8);
++  }
++  for (int i = 0; i < 8; ++i) {
++    r.cr[i][0] = c.cr[i].lt; r.cr[i][1] = c.cr[i].gt; r.cr[i][2] = c.cr[i].eq; r.cr[i][3] = c.cr[i].so;
++    r.gqr[i] = c.gqr[i];
++  }
++  for (int i = 0; i < 4; ++i) r.sprg[i] = c.sprg[i];
++  r.pc = c.pc; r.lr = c.lr; r.ctr = c.ctr; r.xer = c.xer; r.msr = c.msr; r.fpscr = c.fpscr;
++  r.srr0 = c.srr0; r.srr1 = c.srr1; r.hid2 = c.hid2; r.dma_u = c.dma_u; r.dma_l = c.dma_l;
++  r.resv = c.reservation_addr;
++  r.inst_count = c.inst_count;
++  r.poll_left = c.poll_left.load(std::memory_order_relaxed);
++  r.poll_dec_due = c.poll_dec_due;
++  return r;
++}
++void put_regs(CPUContext &c, const N1Regs &r) {
++  for (int i = 0; i < 32; ++i) {
++    c.gpr[i] = r.gpr[i];
++    std::memcpy(&c.fpr[i], &r.fpr[i], 8);
++    std::memcpy(&c.ps1[i], &r.ps1[i], 8);
++  }
++  for (int i = 0; i < 8; ++i) {
++    c.cr[i].lt = r.cr[i][0]; c.cr[i].gt = r.cr[i][1]; c.cr[i].eq = r.cr[i][2]; c.cr[i].so = r.cr[i][3];
++    c.gqr[i] = r.gqr[i];
++  }
++  for (int i = 0; i < 4; ++i) c.sprg[i] = r.sprg[i];
++  c.pc = r.pc; c.lr = r.lr; c.ctr = r.ctr; c.xer = r.xer; c.msr = r.msr; c.fpscr = r.fpscr;
++  c.srr0 = r.srr0; c.srr1 = r.srr1; c.hid2 = r.hid2; c.dma_u = r.dma_u; c.dma_l = r.dma_l;
++  c.reservation_addr = r.resv;
++  c.inst_count = r.inst_count;
++  c.poll_left.store(r.poll_left, std::memory_order_relaxed);
++  c.poll_dec_due = r.poll_dec_due;
++}
++
++[[maybe_unused]] uint64_t hash_block(const MemBlock &m) {
++  const uint8_t *p = m.data();
++  const size_t n = m.size() & ~(size_t)15;
++  uint64_t h = 0xCBF29CE484222325ull, h2 = 0x84222325CBF29CE4ull;
++  for (size_t i = 0; i < n; i += 16) {
++    uint64_t a, b;
++    std::memcpy(&a, p + i, 8);
++    std::memcpy(&b, p + i + 8, 8);
++    h = (h ^ a) * 0x100000001B3ull;
++    h2 = (h2 ^ b) * 0xFF51AFD7ED558CCDull;
++  }
++  return h ^ (h2 * 31);
++}
++
++struct N1Snap {
++  std::vector<uint8_t> m1, m2, lc;
++  void save(MMU &m) {
++    m1.assign(m.mem1.data(), m.mem1.data() + m.mem1.size());
++    m2.assign(m.mem2.data(), m.mem2.data() + m.mem2.size());
++    lc.assign(m.lc.data(), m.lc.data() + m.lc.size());
++  }
++  void restore(MMU &m) const {
++    std::memcpy(m.mem1.data(), m1.data(), m1.size());
++    std::memcpy(m.mem2.data(), m2.data(), m2.size());
++    std::memcpy(m.lc.data(), lc.data(), lc.size());
++  }
++};
++
++void diff_regs(const N1Slot &s, const N1Regs &g, const N1Regs &n) {
++  for (int i = 0; i < 32; ++i)
++    if (g.gpr[i] != n.gpr[i]) std::printf("[N1] %s verify r%d gen=0x%08x native=0x%08x\n", s.name, i, g.gpr[i], n.gpr[i]);
++  for (int i = 0; i < 32; ++i) {
++    if (g.fpr[i] != n.fpr[i])
++      std::printf("[N1] %s verify f%d gen=0x%016llx native=0x%016llx\n", s.name, i, (unsigned long long)g.fpr[i], (unsigned long long)n.fpr[i]);
++    if (g.ps1[i] != n.ps1[i])
++      std::printf("[N1] %s verify ps1_%d gen=0x%016llx native=0x%016llx\n", s.name, i, (unsigned long long)g.ps1[i], (unsigned long long)n.ps1[i]);
++  }
++  if (std::memcmp(g.cr, n.cr, sizeof g.cr)) std::printf("[N1] %s verify CR differs\n", s.name);
++  if (g.pc != n.pc || g.lr != n.lr || g.ctr != n.ctr || g.xer != n.xer || g.inst_count != n.inst_count ||
++      g.poll_left != n.poll_left)
++    std::printf("[N1] %s verify pc/lr/ctr/xer/inst/poll_left gen=%x/%x/%x/%x/%llu/%d native=%x/%x/%x/%x/%llu/%d\n", s.name,
++                g.pc, g.lr, g.ctr, g.xer, (unsigned long long)g.inst_count, g.poll_left, n.pc, n.lr, n.ctr, n.xer,
++                (unsigned long long)n.inst_count, n.poll_left);
++}
++
++// 32-byte blocks of guest RAM that differ from the snapshot: (block index over MEM1|MEM2|LC, contents).
++struct N1Blk { uint32_t idx; uint8_t b[32]; };
++void changed_blocks(MMU &m, const N1Snap &sn, std::vector<N1Blk> &out) {
++  out.clear();
++  uint32_t base = 0;
++  auto scan = [&](const MemBlock &mb, const std::vector<uint8_t> &sv) {
++    const size_t n = mb.size() & ~(size_t)31;
++    for (size_t o = 0; o < n; o += 4096) {
++      const size_t len = std::min<size_t>(4096, n - o);
++      if (std::memcmp(mb.data() + o, sv.data() + o, len) == 0) continue;
++      for (size_t k = o; k < o + len; k += 32)
++        if (std::memcmp(mb.data() + k, sv.data() + k, 32) != 0) {
++          N1Blk x;
++          x.idx = base + (uint32_t)(k / 32);
++          std::memcpy(x.b, mb.data() + k, 32);
++          out.push_back(x);
++        }
++    }
++    base += (uint32_t)((mb.size() + 31) / 32);
++  };
++  scan(m.mem1, sn.m1);
++  scan(m.mem2, sn.m2);
++  scan(m.lc, sn.lc);
++}
++uint8_t *block_ptr(MMU &m, const N1Snap &sn, uint32_t idx, const uint8_t **snapp, uint32_t *ea) {
++  const uint32_t n1 = (uint32_t)((m.mem1.size() + 31) / 32), n2 = (uint32_t)((m.mem2.size() + 31) / 32);
++  if (idx < n1) { *snapp = sn.m1.data() + idx * 32; *ea = 0x80000000u + idx * 32; return m.mem1.data() + idx * 32; }
++  idx -= n1;
++  if (idx < n2) { *snapp = sn.m2.data() + idx * 32; *ea = 0x90000000u + idx * 32; return m.mem2.data() + idx * 32; }
++  idx -= n2;
++  *snapp = sn.lc.data() + idx * 32; *ea = MMU::kLCBase + idx * 32;
++  return m.lc.data() + idx * 32;
++}
++
++// Native body on the current state, then the same state again through the generated code; the
++// generated result is kept. Only calls whose native run took no slow interrupt poll are compared
++// (a slow poll may run scheduler events, which cannot be undone): the others keep the native result.
++// Memory: the 32-byte blocks the native run changed (against a snapshot taken just before) are put back
++// from the snapshot (only those: other threads -- AX, render -- keep writing guest RAM meanwhile), the
++// generated code runs, and then every block that differs from the snapshot is compared: a block written
++// by both must hold the same bytes; a block written by only one side is a mismatch unless it is outside
++// what the function could write (reported with its address, so concurrent writers are recognisable).
++bool verify(N1Slot &s, CPUContext &ctx) {
++  static N1Snap snap;
++  static std::vector<N1Blk> bn, bg;
++  MMU &m = ctx.mmu;
++  const N1Regs r0 = take_regs(ctx);
++  snap.save(m);
++  const uint64_t slow0 = g_n1_slow;
++  if (!s.nat(ctx)) {
++    ++s.declined;
++    return false;  // untouched: the generated code runs
++  }
++  if (g_n1_slow != slow0) {
++    ++s.vskip;
++    return true;
++  }
++  const N1Regs rn = take_regs(ctx);
++  changed_blocks(m, snap, bn);
++  for (const N1Blk &x : bn) {
++    const uint8_t *sp = nullptr;
++    uint32_t ea = 0;
++    uint8_t *dst = block_ptr(m, snap, x.idx, &sp, &ea);  // first: it sets sp
++    std::memcpy(dst, sp, 32);
++  }
++  put_regs(ctx, r0);
++  g_bypass_slot = &s;
++  ctx.pc = s.entry;
++  s.gen(ctx);
++  g_bypass_slot = nullptr;
++  const N1Regs rg = take_regs(ctx);
++  changed_blocks(m, snap, bg);
++  const bool regs_ok = std::memcmp(&rg, &rn, sizeof rg) == 0;
++  // merge the two sorted lists
++  uint32_t bad_blocks = 0, only_n = 0, only_g = 0;
++  uint32_t first_ea[4] = {0, 0, 0, 0};
++  int nfirst = 0;
++  size_t i = 0, j = 0;
++  while (i < bn.size() || j < bg.size()) {
++    uint32_t idx;
++    bool differ;
++    if (j >= bg.size() || (i < bn.size() && bn[i].idx < bg[j].idx)) { idx = bn[i].idx; differ = true; ++only_n; ++i; }
++    else if (i >= bn.size() || bg[j].idx < bn[i].idx) { idx = bg[j].idx; differ = true; ++only_g; ++j; }
++    else { idx = bn[i].idx; differ = std::memcmp(bn[i].b, bg[j].b, 32) != 0; ++i; ++j; }
++    if (differ) {
++      ++bad_blocks;
++      const uint8_t *sp; uint32_t ea;
++      block_ptr(m, snap, idx, &sp, &ea);
++      if (nfirst < 4) first_ea[nfirst++] = ea;
++    }
++  }
++  if (regs_ok && bad_blocks == 0) {
++    ++s.vok;
++  } else {
++    ++s.vbad;
++    if (s.vbad <= 20) {
++      std::printf("[N1] %s verify MISMATCH (call %llu, r1=%08x r3=%08x r4=%08x r5=%08x): regs %s, %u RAM blocks differ "
++                  "(native-only %u, generated-only %u; native wrote %zu, generated %zu) first at %08x %08x %08x %08x\n",
++                  s.name, (unsigned long long)s.calls, r0.gpr[1], r0.gpr[3], r0.gpr[4], r0.gpr[5], regs_ok ? "same" : "DIFFER",
++                  bad_blocks, only_n, only_g, bn.size(), bg.size(), first_ea[0], first_ea[1], first_ea[2], first_ea[3]);
++      diff_regs(s, rg, rn);
++    }
++  }
++  const uint64_t n = s.vok + s.vbad;
++  if (n == 1 || (n & (n - 1)) == 0 || !(regs_ok && bad_blocks == 0)) report(s, "verify");
++  return true;
++}
++
++}  // namespace
++
++void n1_report_all() {
++  uint64_t ok = 0, bad = 0;
++  for (N1Slot *s = g_slots; s; s = s->next) {
++    if (s->mode == 3 || s->mode == 4) report(*s, s->mode == 4 ? "final (off)" : "final");
++    ok += s->vok;
++    bad += s->vbad;
++  }
++  std::printf("[N1] verify total ok=%llu bad=%llu\n", (unsigned long long)ok, (unsigned long long)bad);
++  std::fflush(stdout);
++}
++
++NWII_NOINLINE bool n1_hook_slow(N1Slot &s, CPUContext &ctx) {
++  if (s.mode == 0) {
++    const N1Cfg &c = n1_cfg();
++    char key[96];
++    std::snprintf(key, sizeof key, "NWII_NATIVE_%s", s.name);
++    const char *e = std::getenv(key);
++    const bool on = c.all_on && !(e && e[0] == '0') && !g_trace_calls;
++    s.mode = !on ? (c.stats ? 4 : 2) : (c.stats || c.verify_every) ? 3 : 1;
++    s.next = g_slots;
++    g_slots = &s;
++    std::printf("[N1] %s (0x%08X): %s\n", s.name, s.entry,
++                s.mode == 2 ? "off (generated code)" : s.mode == 4 ? "off (generated code), counted" :
++                s.mode == 3 ? "native, counters/verify" : "native");
++    std::fflush(stdout);
++  }
++  if (s.mode == 1) return s.nat(ctx);
++  if (g_bypass_slot == &s) { g_bypass_slot = nullptr; return false; }
++  if (s.mode == 2) return false;
++  ++s.calls;
++  const N1Cfg &c = n1_cfg();
++  if (s.mode == 4) {
++    if ((s.calls & 0x3FFFF) == 0) report(s, "stats (off)");
++    if (!c.timing) return false;
++    // time the generated code: run it here (its own hook is bypassed) instead of in the caller; same code,
++    // same state, one call level deeper
++    const uint64_t t0 = now_ticks();
++    g_bypass_slot = &s;
++    s.gen(ctx);
++    g_bypass_slot = nullptr;
++    N1Time &t = g_ticks[&s];
++    t.ticks += now_ticks() - t0;
++    ++t.n;
++    return true;
++  }
++  // verify the 1st, 2nd, 4th, 8th... call of each function (rare ones too) and then every n-th
++  if (c.verify_every && !(s.flags & 1) && ((s.calls & (s.calls - 1)) == 0 || s.calls % c.verify_every == 0))
++    return verify(s, ctx);
++  bool r;
++  if (c.timing) {
++    const uint64_t t0 = now_ticks();
++    r = s.nat(ctx);
++    if (r) { N1Time &t = g_ticks[&s]; t.ticks += now_ticks() - t0; ++t.n; }
++  } else {
++    r = s.nat(ctx);
++  }
++  if (r) ++s.native; else ++s.declined;
++  if ((s.calls & 0x3FFFF) == 0) report(s, "stats");
++  return r;
++}
++
++// ---- hand-written bodies -------------------------------------------------------------------------
++namespace {
++// Runs the interrupt polls 1..total of a loop exactly as the generated code would: a poll whose inline
++// part (poll_due) says "nothing to do" only decrements poll_left, so runs of them are done at once; a poll
++// that would take the slow path is done for real, with ctx in the state of that poll (set(j)). Returns
++// true when a poll delivered an interrupt (ctx is then at that poll; the generated code resumes there).
++template <class Set>
++NWII_FORCEINLINE bool n1_polls(CPUContext &c, uint64_t total, Set &&set) {
++  uint64_t j = 0;
++  while (j < total) {
++    const int32_t left = c.poll_left.load(std::memory_order_relaxed);
++    if (left > 1 && n1_no_flags(c)) {
++      const uint64_t k = std::min<uint64_t>(total - j, (uint64_t)(left - 1));
++      c.poll_left.store(left - (int32_t)k, std::memory_order_relaxed);
++      j += k;
++      continue;
++    }
++    ++j;
++    set(j);
++    if (poll_due(c)) {
++      ++g_n1_slow;
++      if (process_pending_callbacks_slow(c)) return true;
++    }
++  }
++  return false;
++}
++
++// DCInvalidateRange / DCFlushRange / (the other DC* have the same shape): r3 = address, r4 = length.
++//   cmplwi r4,0 ; blelr ; rlwinm r5,r3,0,27,31 ; add r4,r4,r5 ; addi r4,r4,31 ; rlwinm r4,r4,27,5,31 ;
++//   mtctr r4 ; loop: dcbX 0,r3 ; addi r3,r3,32 ; bdnz loop (poll at POLL) ; [sc (poll)] ; blr
++// The cache operation is a no-op here (no data cache model), so the whole function is its registers.
++template <uint32_t POLL, uint32_t SC>
++NWII_FORCEINLINE bool n1_dc_range(CPUContext &c) {
++  const uint32_t len = c.gpr[4], r3 = c.gpr[3], r5 = r3 & 0x1F;
++  const uint32_t n = std::rotl(len + r5 + 31u, 27) & 0x7FFFFFFu;
++  // n == 0 with len != 0 would loop 2^32 times (ctr wraps): left to the generated code (nothing touched).
++  if (len != 0 && n == 0) return false;
++  c.inst_count += 2;
++  c.cr[0].lt = false;
++  c.cr[0].gt = len > 0;
++  c.cr[0].eq = len == 0;
++  c.cr[0].so = (c.xer >> 31) & 1;
++  if (len == 0) {
++    c.pc = c.lr;
++    return true;
++  }
++  c.inst_count += 5;
++  c.gpr[5] = r5;
++  c.gpr[4] = n;
++  const uint64_t ic0 = c.inst_count;
++  // poll j (1..n): r3 = r3 + 32 j, inst_count = ic0 + 3 j, ctr = n - j + 1 (decremented after the poll)
++  const bool irq = n1_polls(c, n, [&](uint64_t j) {
++    c.gpr[3] = r3 + 32u * (uint32_t)j;
++    c.inst_count = ic0 + 3 * j;
++    c.ctr = n - (uint32_t)j + 1;
++    c.pc = POLL;
++  });
++  if (irq) return true;
++  c.gpr[3] = r3 + 32u * n;
++  c.ctr = 0;
++  c.inst_count = ic0 + 3ull * n;
++  if (SC) {  // sc: one more poll at SC, then blr
++    c.inst_count += 1;
++    c.pc = SC;
++    if (poll_due(c)) {
++      ++g_n1_slow;
++      if (process_pending_callbacks_slow(c)) return true;
++    }
++  }
++  c.inst_count += 1;
++  c.pc = c.lr;
++  return true;
++}
++}  // namespace
++
++// fLiMgBa_c::searchNodeByID (f_line.cpp, 80162C30): r3 = list, r4 = id; walks node = list->first,
++// node = node->next until node->obj->id == id (returns node) or node == 0 (returns 0).
++//   lwz r3,0(r3) ; b test ; loop: lwz r5,8(r3) ; lwz r0,0(r5) ; cmpw r0,r4 ; beqlr ; lwz r3,4(r3) ;
++//   test: cmpwi r3,0 ; bne loop (poll 0x80162C50) ; li r3,0 ; blr
++// Guest memory through the same MemView accessors as the generated code.
++bool n1h_80162C30(CPUContext &c) {
++  MemView mv(c.mmu);
++  uint32_t r0 = c.gpr[0], r3 = c.gpr[3], r4 = c.gpr[4], r5 = c.gpr[5], xer = c.xer;
++  bool lt = c.cr[0].lt, gt = c.cr[0].gt, eq = c.cr[0].eq, so = c.cr[0].so;
++  uint64_t ic = c.inst_count;
++  N1Poll P(c);
++  ic += 2;
++  r3 = mv.read32<0>(r3 + 0);
++  for (;;) {
++    ic += 2;
++    lt = (int32_t)r3 < 0; gt = (int32_t)r3 > 0; eq = r3 == 0; so = (xer >> 31) & 1;
++    if (!P.fast()) {
++      P.flush();
++      c.pc = 0x80162C50u;
++      if (poll_due(c)) {
++        c.cr[0].eq = eq; c.cr[0].gt = gt; c.cr[0].lt = lt; c.cr[0].so = so;
++        c.gpr[0] = r0; c.gpr[3] = r3; c.gpr[5] = r5; c.inst_count = ic;
++        ++g_n1_slow;
++        if (process_pending_callbacks_slow(c)) return true;
++        eq = c.cr[0].eq; gt = c.cr[0].gt; lt = c.cr[0].lt; so = c.cr[0].so;
++        r0 = c.gpr[0]; r3 = c.gpr[3]; r4 = c.gpr[4]; r5 = c.gpr[5]; ic = c.inst_count; xer = c.xer;
++      }
++      P.reload();
++    }
++    if (eq) break;
++    ic += 4;
++    r5 = mv.read32<0>(r3 + 8);
++    r0 = mv.read32<0>(r5 + 0);
++    lt = (int32_t)r0 < (int32_t)r4; gt = (int32_t)r0 > (int32_t)r4; eq = r0 == r4; so = (xer >> 31) & 1;
++    if (eq) {
++      P.flush();
++      c.cr[0].eq = eq; c.cr[0].gt = gt; c.cr[0].lt = lt; c.cr[0].so = so;
++      c.gpr[0] = r0; c.gpr[3] = r3; c.gpr[5] = r5; c.inst_count = ic; c.pc = c.lr;
++      return true;
++    }
++    ic += 1;
++    r3 = mv.read32<0>(r3 + 4);
++  }
++  P.flush();
++  ic += 2;
++  r3 = 0;
++  c.cr[0].eq = eq; c.cr[0].gt = gt; c.cr[0].lt = lt; c.cr[0].so = so;
++  c.gpr[0] = r0; c.gpr[3] = r3; c.gpr[5] = r5; c.inst_count = ic; c.pc = c.lr;
++  return true;
++}
++
++bool n1h_801AC440(CPUContext &ctx) { return n1_dc_range<0x801AC464u, 0>(ctx); }
++bool n1h_801AC470(CPUContext &ctx) { return n1_dc_range<0x801AC494u, 0x801AC49Cu>(ctx); }
++
++}  // namespace runtime
++}  // namespace nwii
+diff --color -ruN r22r7/nWiiRuntime/src/platform/switch/switch_platform.cpp r28d1/nWiiRuntime/src/platform/switch/switch_platform.cpp
+--- r22r7/nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-11-09 05:53:25.642238604 -0500
++++ r28d1/nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-11-10 02:27:33.432802844 -0500
+@@ -211,7 +211,9 @@
+                             key == "NWII_FIFO_MAX_FRAMES" || key == "NWII_SHADER_PREWARM_BAR" ||
+                             // R22 R7: on by default, "0" turns them off
+                             key == "NWII_DLMEMO" || key == "NWII_PINDEX" || key == "NWII_RENDER_FREE" ||
+-                            key == "NWII_DLMEMO_LIST" || key == "NWII_WPROF";
++                            key == "NWII_DLMEMO_LIST" || key == "NWII_WPROF" ||
++                            // R28 D1: native search functions / ID index, "0" turns them off
++                            key.rfind("NWII_NATIVE", 0) == 0 || key.rfind("NWII_D1", 0) == 0;
+     const bool off = lv.empty() || lv == "off" || lv == "false" || lv == "no" ||
+                      (lv == "0" && !keeps_zero);
+     if (off)

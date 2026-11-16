@@ -1,0 +1,363 @@
+diff -ru a/nWiiRuntime/src/hle/gx/fifo_parser.cpp b/nWiiRuntime/src/hle/gx/fifo_parser.cpp
+--- a/nWiiRuntime/src/hle/gx/fifo_parser.cpp	2026-11-08 08:51:13.447296322 -0500
++++ b/nWiiRuntime/src/hle/gx/fifo_parser.cpp	2026-11-08 11:50:01.003340204 -0500
+@@ -14,6 +14,15 @@
+ #include <unordered_map>
+ #include <algorithm>
+ 
++// LOAD_INDX data copied by the guest thread when the game issued the command
++// (gx.cpp): false = no copy, read guest RAM now as before.
++namespace nwii::runtime {
++bool GX_IdxTakeMain(int arr, uint32_t addr, int num, float *out);
++void GX_IdxBeginDL(uint32_t addr, uint32_t size);
++bool GX_IdxReadDL(int arr, uint32_t addr, int num, float *out);
++void GX_IdxEndDL();
++}
++
+ namespace nwii::runtime { extern bool g_early_gx_sync; }
+ namespace nwii::runtime {
+ std::shared_ptr<const std::vector<uint8_t>> GX_DL_FetchShared(uint32_t addr, uint32_t size);
+@@ -603,6 +612,8 @@
+ 
+ 
+ 
++
++
+ // Display lists are static geometry the game CALLs every frame; re-parsing
+ // them dominated the 3D-scene drain (measured 1.3s per 2s). Cache the parsed
+ // commands keyed by address+content, guarded by a hash of the parser state
+@@ -785,9 +796,11 @@
+                     uint32_t index = c.val & 0xFFFF;
+                     uint32_t base = g_state.arrayBase[array] +
+                                     index * g_state.arrayStride[array];
+-                    for (int i = 0; i < num && i < (int)c.payload.size(); i++)
+-                        c.payload[i] =
+-                            nwii::runtime::g_mmu->read_f32(base + i * 4);
++                    if (num > (int)c.payload.size() ||
++                        !nwii::runtime::GX_IdxReadDL(array - 12, base, num, c.payload.data()))
++                        for (int i = 0; i < num && i < (int)c.payload.size(); i++)
++                            c.payload[i] =
++                                nwii::runtime::g_mmu->read_f32(base + i * 4);
+                     if (c.reg < 256 || (c.reg >= 0x400 && c.reg < 0x460))
+                         ParseApplyMatrixWrite(c.reg, c.payload);
+                 } else if (c.type == GXCommandType::XFRegister &&
+@@ -1195,8 +1208,11 @@
+             }
+             // A CALL_DL inside a display list is not executed (Dolphin
+             // OnDisplayList: "recursive display list detected").
+-            if (depth == 0)
++            if (depth == 0) {
++                nwii::runtime::GX_IdxBeginDL(dl_addr, dl_size);
+                 ExpandDisplayList(dl_addr, dl_size, commands, depth);
++                nwii::runtime::GX_IdxEndDL();
++            }
+             offset += 9;
+         } else if (cmd == 0x78) {
+             // Seam RMW marker (not a real GP opcode). Native GX handlers own
+@@ -1253,8 +1269,12 @@
+                 c.payload.resize(num);
+                 uint32_t base = g_state.arrayBase[array] +
+                                 index * g_state.arrayStride[array];
+-                for (int i = 0; i < num; i++)
+-                    c.payload[i] = nwii::runtime::g_mmu->read_f32(base + i * 4);
++                const bool snap =
++                    depth == 0 ? nwii::runtime::GX_IdxTakeMain(array - 12, base, num, c.payload.data())
++                               : nwii::runtime::GX_IdxReadDL(array - 12, base, num, c.payload.data());
++                if (!snap)
++                    for (int i = 0; i < num; i++)
++                        c.payload[i] = nwii::runtime::g_mmu->read_f32(base + i * 4);
+                 if (gx_trace()) {
+                     static int ln = 0;
+                     if (ln++ < 24) {
+diff -ru a/nWiiRuntime/src/hle/gx.cpp b/nWiiRuntime/src/hle/gx.cpp
+--- a/nWiiRuntime/src/hle/gx.cpp	2026-11-08 08:51:26.656872214 -0500
++++ b/nWiiRuntime/src/hle/gx.cpp	2026-11-08 12:00:54.802601379 -0500
+@@ -2,6 +2,9 @@
+ #include <glad/glad.h>
+ 
+ #include <map>
++#include <deque>
++#include <array>
++#include <algorithm>
+ #include <unordered_map>
+ #include <memory>
+ #include "runtime/cpu_context.h"
+@@ -168,6 +171,244 @@
+     if (it == g_dl_snap.end() || it->second->size() != size) return nullptr;
+     return it->second;
+ }
++
++// ---- Indexed matrix loads (LOAD_INDX) at the moment the game issues them ----
++// LOAD_INDX makes the GPU read a matrix from a guest RAM array (CP array 12-15,
++// set by GXSetArray) when it executes the command, right after the CPU wrote
++// it. The parser runs up to a few frames later, and reading the array then
++// gives whatever the game has written into it since: the title screen's wipe
++// frames draw the scene twice per frame with two cameras into the same G3D
++// matrix array, and the visible pass got the other (off-screen) camera, so the
++// iris showed black. The guest thread now copies the data when it writes the
++// command (main stream) or calls the display list (lists), in stream order;
++// the parser takes the copies in the same order, checks they belong to the
++// command it is parsing (same array/address/size or same list), and reads
++// live RAM as before when there is none. NWII_IDXSNAP=0 disables.
++namespace hw { extern bool g_wgp_redirect_on; }  // hw_pi.cpp
++static const bool s_idx_on = [] {
++    const char *e = NWII_ENV("NWII_IDXSNAP");
++    return !(e && e[0] == '0');
++}();
++struct IdxRecMain { uint32_t frame, arr, addr, num; float v[16]; };
++struct IdxRecDL {
++    uint32_t frame;
++    uint64_t key;
++    uint32_t base[4];        // sniffed array base (0 = unknown)
++    uint32_t lo[4];          // copied byte range [base+lo, base+lo+bytes.size())
++    std::vector<uint8_t> bytes[4];
++};
++struct IdxRange { uint32_t lo = ~0u, hi = 0; };
++static std::mutex s_idx_mtx;
++static std::atomic<uint64_t> s_idx_bytes{0};  // bytes the guest thread copied for lists
++static std::deque<IdxRecMain> s_idx_main;
++static std::deque<IdxRecDL> s_idx_dl;
++static std::unordered_map<uint64_t, std::array<IdxRange, 4>> s_idx_need;  // per list
++static constexpr uint32_t kIdxMaxSpan = 64u << 10;
++static constexpr size_t kIdxMaxQueue = 16384, kIdxSearch = 64;
++// Guest thread: the CP array state seen in the pipe.
++static uint32_t s_sn_base[4], s_sn_stride[4];
++static uint32_t s_sn_frame = 0;  // XFB copies written (stamps the records)
++
++static bool idx_copy(uint32_t phys, uint32_t len, uint8_t *dst) {
++    phys &= 0x1FFFFFFF;
++    const bool m1 = phys + len <= 0x01800000u;
++    const bool m2 = phys >= 0x10000000u && phys + len <= 0x14000000u;
++    if (!(m1 || m2) || !g_mmu) return false;
++    if (const uint8_t *p = g_mmu->get_ptr(0x80000000u | phys)) std::memcpy(dst, p, len);
++    else for (uint32_t i = 0; i < len; ++i) dst[i] = g_mmu->read8(0x80000000u | (phys + i));
++    return true;
++}
++
++static inline bool idx_in_ram(uint32_t phys, uint32_t len) {
++    phys &= 0x1FFFFFFF;
++    return phys + len <= 0x01800000u || (phys >= 0x10000000u && phys + len <= 0x14000000u);
++}
++static void idx_dl_call(uint32_t addr, uint32_t size);
++
++// The SDK writes these commands as separate calls: CP = Write8(0x08),
++// Write8(reg), Write32(value); LOAD_INDX = Write8(0x20/0x28/0x30/0x38),
++// Write32; CALL_DL = Write8(0x40), Write32(addr), Write32(size). A small
++// state machine over the calls finds them (the seams' 0x78 marker, Write8 x3
++// + Write32 x2, is skipped). Data that merely looks like one makes a record
++// the parser never takes: it only takes records that match the command it
++// is parsing.
++static int s_sn_st = 0;   // 1 0x08, 2 0x08 reg, 3 LOAD_INDX op, 4 0x40, 5 0x40 addr, 6/7 0x78 marker
++static uint32_t s_sn_a = 0;
++
++static void idx_loadindx(uint8_t op, uint32_t v) {
++    if (!g_mmu) return;
++    IdxRecMain r;
++    r.frame = s_sn_frame;
++    r.arr = (op - 0x20) / 8;
++    r.num = ((v >> 12) & 0xF) + 1;
++    r.addr = s_sn_base[r.arr] + (v >> 16) * s_sn_stride[r.arr];
++    if (!s_sn_base[r.arr] || !idx_in_ram(r.addr, r.num * 4)) return;
++    for (uint32_t i = 0; i < r.num; ++i) r.v[i] = g_mmu->read_f32(r.addr + i * 4);
++    std::lock_guard<std::mutex> lk(s_idx_mtx);
++    if (s_idx_main.size() >= kIdxMaxQueue) s_idx_main.pop_front();
++    s_idx_main.push_back(r);
++}
++static inline void idx_sniff8(uint8_t b) {
++    if (!s_idx_on) return;
++    switch (s_sn_st) {
++    case 1: s_sn_st = 2; s_sn_a = b; return;
++    case 6: s_sn_st = 7; return;
++    case 7: s_sn_st = 0; return;
++    default: break;
++    }
++    s_sn_st = b == 0x08 ? 1 : (b & 0xE7) == 0x20 ? 3 : b == 0x40 ? 4 : b == 0x78 ? 6 : 0;
++    s_sn_a = b;
++}
++static inline void idx_sniff16(uint16_t) { s_sn_st = 0; }
++static inline void idx_sniff32(uint32_t v, bool is_int) {
++    const int st = s_sn_st;
++    s_sn_st = 0;
++    if (!is_int || !s_idx_on) return;
++    if (st == 2) {
++        if (s_sn_a >= 0xAC && s_sn_a <= 0xAF) s_sn_base[s_sn_a - 0xAC] = v & 0x3FFFFFFF;
++        else if (s_sn_a >= 0xBC && s_sn_a <= 0xBF) s_sn_stride[s_sn_a - 0xBC] = v & 0xFF;
++    } else if (st == 3) {
++        idx_loadindx((uint8_t)s_sn_a, v);
++    } else if (st == 4) {
++        s_sn_st = 5;
++        s_sn_a = v;
++    } else if (st == 5) {
++        const uint32_t addr = s_sn_a, size = v;
++        if (size && size <= (8u << 20) && !((addr | size) & 31) && idx_in_ram(addr, size))
++            idx_dl_call(addr, size);
++    }
++}
++
++// GXCallDisplayList, guest thread: copy the parts of the arrays this list
++// read the previous times it was parsed (unknown the first time: live RAM).
++static void idx_dl_call(uint32_t addr, uint32_t size) {
++    if (!s_idx_on || hw::g_wgp_redirect_on) return;
++    IdxRecDL r;
++    r.frame = s_sn_frame;
++    r.key = ((uint64_t)(addr & 0x1FFFFFFF) << 24) ^ size;
++    std::array<IdxRange, 4> need{};
++    {
++        std::lock_guard<std::mutex> lk(s_idx_mtx);
++        auto it = s_idx_need.find(r.key);
++        if (it != s_idx_need.end()) need = it->second;
++    }
++    for (int a = 0; a < 4; ++a) {
++        r.base[a] = s_sn_base[a];
++        r.lo[a] = 0;
++        if (!r.base[a] || need[a].hi <= need[a].lo) continue;
++        r.lo[a] = need[a].lo;
++        r.bytes[a].resize(need[a].hi - need[a].lo);
++        s_idx_bytes.fetch_add(need[a].hi - need[a].lo, std::memory_order_relaxed);
++        if (!idx_copy(r.base[a] + r.lo[a], need[a].hi - need[a].lo, r.bytes[a].data()))
++            r.bytes[a].clear();
++    }
++    std::lock_guard<std::mutex> lk(s_idx_mtx);
++    if (s_idx_dl.size() >= kIdxMaxQueue) s_idx_dl.pop_front();
++    s_idx_dl.push_back(std::move(r));
++}
++
++// ---- parser side (host thread) ----
++// Records the parser never matched (data that looked like a command, or a
++// command it parsed differently) are dropped once they are 16 frames older
++// than the newest one: the host is never that far behind (FIFO_MAX_FRAMES).
++template <class Q> static void idx_prune(Q &q) {
++    while (!q.empty() && q.front().frame + 16 < q.back().frame) q.pop_front();
++}
++// NWII_IDXSNAP_LOG=1: [IDXSNAP] counters (copies used / live reads).
++static uint64_t s_idx_n[6];  // main used, main live, dl calls with/without record, dl used, dl live
++static void idx_log() {
++    static const bool on = NWII_ENV("NWII_IDXSNAP_LOG") != nullptr;
++    static uint64_t next = 2000;
++    if (!on || s_idx_n[2] + s_idx_n[3] < next) return;
++    next += 20000;
++    std::printf("[IDXSNAP] main used=%llu live=%llu | lists with=%llu without=%llu | in lists used=%llu live=%llu | copied %llu KB\n",
++                (unsigned long long)s_idx_n[0], (unsigned long long)s_idx_n[1],
++                (unsigned long long)s_idx_n[2], (unsigned long long)s_idx_n[3],
++                (unsigned long long)s_idx_n[4], (unsigned long long)s_idx_n[5],
++                (unsigned long long)(s_idx_bytes.load(std::memory_order_relaxed) >> 10));
++}
++// Main-stream LOAD_INDX: the copy made when it was written, if it is this one.
++bool GX_IdxTakeMain(int arr, uint32_t addr, int num, float *out) {
++    if (!s_idx_on) return false;
++    std::lock_guard<std::mutex> lk(s_idx_mtx);
++    idx_prune(s_idx_main);
++    const size_t n = std::min(s_idx_main.size(), kIdxSearch);
++    for (size_t i = 0; i < n; ++i) {
++        const IdxRecMain &r = s_idx_main[i];
++        if (r.arr == (uint32_t)arr && r.addr == addr && r.num == (uint32_t)num) {
++            std::memcpy(out, r.v, num * sizeof(float));
++            s_idx_main.erase(s_idx_main.begin(), s_idx_main.begin() + i + 1);
++            ++s_idx_n[0];
++            return true;
++        }
++    }
++    ++s_idx_n[1];
++    return false;
++}
++
++static bool s_idx_ctx = false;
++static IdxRecDL s_idx_cur;
++static std::array<IdxRange, 4> s_idx_seen;
++// CALL_DL in the main stream: take that call's record for the list's LOAD_INDX.
++void GX_IdxBeginDL(uint32_t addr, uint32_t size) {
++    s_idx_ctx = false;
++    if (!s_idx_on) return;
++    const uint64_t key = ((uint64_t)(addr & 0x1FFFFFFF) << 24) ^ size;
++    std::lock_guard<std::mutex> lk(s_idx_mtx);
++    idx_prune(s_idx_dl);
++    const size_t n = std::min(s_idx_dl.size(), kIdxSearch);
++    for (size_t i = 0; i < n; ++i) {
++        if (s_idx_dl[i].key != key) continue;
++        s_idx_cur = std::move(s_idx_dl[i]);
++        s_idx_dl.erase(s_idx_dl.begin(), s_idx_dl.begin() + i + 1);
++        s_idx_ctx = true;
++        s_idx_seen = {};
++        ++s_idx_n[2];
++        idx_log();
++        return;
++    }
++    ++s_idx_n[3];
++    idx_log();
++}
++
++// LOAD_INDX inside the list being expanded.
++bool GX_IdxReadDL(int arr, uint32_t addr, int num, float *out) {
++    if (!s_idx_ctx || !s_idx_cur.base[arr]) return false;
++    const uint32_t off = addr - s_idx_cur.base[arr], len = (uint32_t)num * 4;
++    if (off >= kIdxMaxSpan || off + len > kIdxMaxSpan) return false;
++    IdxRange &sr = s_idx_seen[arr];
++    sr.lo = std::min(sr.lo, off);
++    sr.hi = std::max(sr.hi, off + len);
++    const std::vector<uint8_t> &b = s_idx_cur.bytes[arr];
++    const uint32_t lo = s_idx_cur.lo[arr];
++    if (off < lo || off + len > lo + b.size()) { ++s_idx_n[5]; return false; }
++    ++s_idx_n[4];
++    for (int i = 0; i < num; ++i) {
++        const uint8_t *p = &b[off - lo + i * 4];
++        const uint32_t u = (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3];
++        std::memcpy(&out[i], &u, 4);
++    }
++    return true;
++}
++
++// End of the list: remember the range it read for its next call.
++void GX_IdxEndDL() {
++    if (!s_idx_ctx) return;
++    s_idx_ctx = false;
++    std::lock_guard<std::mutex> lk(s_idx_mtx);
++    std::array<IdxRange, 4> *need = nullptr;
++    for (int a = 0; a < 4; ++a) {
++        const IdxRange &sr = s_idx_seen[a];
++        if (sr.hi <= sr.lo) continue;
++        if (!need) {
++            if (s_idx_need.size() >= 8192) s_idx_need.clear();
++            need = &s_idx_need[s_idx_cur.key];
++        }
++        IdxRange &nr = (*need)[a];
++        nr.lo = std::min(nr.lo, sr.lo);
++        nr.hi = std::max(nr.hi, sr.hi);
++    }
++}
+ } // namespace nwii::runtime
+ 
+ 
+@@ -1094,6 +1335,7 @@
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     if (__builtin_expect(hw::g_wgp_redirect_on, 0) && wgp_redirect(val)) { s_bp_armed = false; return; }
+     s_bp_armed = (val == 0x61);
++    idx_sniff8(val);
+     if (__builtin_expect(wgp_gather(), 1)) {
+         wg_count();
+         if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check(val, 1);
+@@ -1110,6 +1352,7 @@
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     s_bp_armed = false;
+     if (__builtin_expect(hw::g_wgp_redirect_on, 0) && wgp_redirect(val >> 8)) { wgp_redirect(val & 0xFF); return; }
++    idx_sniff16(val);
+     if (__builtin_expect(wgp_gather(), 1)) {
+         wg_count();
+         if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check(val, 2);
+@@ -1136,6 +1379,8 @@
+         wgp_redirect(val & 0xFF);
+         return;
+     }
++    idx_sniff32(val, is_int);
++    if (bp && (val >> 24) == 0x52 && (val & 0x4000)) ++s_sn_frame;
+     static const bool s_sample = NWII_ENV("NWII_SAMPLE") != nullptr;
+     if (__builtin_expect(s_sample, 0)) {
+         static uint64_t n = 0;
+@@ -1195,6 +1440,8 @@
+             wgp_redirect((u.i >> s) & 0xFF);
+         return;
+     }
++    idx_sniff32((uint32_t)(u.i >> 32), false);
++    idx_sniff32((uint32_t)u.i, false);
+     if (__builtin_expect(wgp_gather(), 1)) {
+         wg_count();
+         if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check(u.i, 8);

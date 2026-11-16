@@ -1,0 +1,254 @@
+diff --color -ruN ref/c38src_c1/src/core/main.cpp ref/c38src_c2/src/core/main.cpp
+--- ref/c38src_c1/src/core/main.cpp	2026-11-15 11:59:26.407564498 -0500
++++ ref/c38src_c2/src/core/main.cpp	2026-11-15 12:02:23.441930346 -0500
+@@ -960,7 +960,7 @@
+       std::printf(", idle sleeps %.0f/s (%.0f%% of the time)%s\n",
+                   (sleeps - sleeps0) / dt, (sleep_us - sleep_us0) / dt / 1e4, gov);
+       if (nwii::runtime::s2::g_enabled) {  // r34s2
+-        char s2l[768];
++        char s2l[1400];  // r38c: + linea [C38]
+         nwii::runtime::s2::stats_line(s2l, sizeof s2l, dt);
+         std::printf("%s\n", s2l);
+       }
+diff --color -ruN ref/c38src_c1/src/core/s2.cpp ref/c38src_c2/src/core/s2.cpp
+--- ref/c38src_c1/src/core/s2.cpp	2026-11-15 11:59:26.408564500 -0500
++++ ref/c38src_c2/src/core/s2.cpp	2026-11-15 12:02:23.442930348 -0500
+@@ -151,6 +151,48 @@
+   if (v > m.load(std::memory_order_relaxed)) m.store(v, std::memory_order_relaxed);
+ }
+ 
++// ---- r38c: prioridad dinamica de la CPU de sonido ------------------------------------------
++// Base NWII_S2_PRIO (p. ej. 0x2E, por debajo del trabajador de render 0x2D); sube a NWII_C_PRIO_HI (p. ej. 0x2C) solo
++// mientras haga falta: bit 1 = va tarde (un evento de su agenda vencido hace mas de NWII_C_LATE_US), bit 2 = el juego
++// espera S y lo tiene el sonido (herencia), bit 4 = un hilo del juego va a dormir en un mutex del sonido (herencia).
++// Sin NWII_C_PRIO_HI no cambia nada (como m5).
++int g_prio_lo = 0x2C, g_prio_hi = 0;
++uint64_t g_late_boost_us = 3000;
++std::atomic<uint32_t> g_boost{0};
++std::atomic<int> g_prio_now{0};
++std::atomic<uint64_t> st_boost_n[3] = {}, st_boost_ns{0};
++std::atomic<uint64_t> g_boost_t0{0};
++#ifndef __SWITCH__
++pthread_t g_snd_pthread{};
++#endif
++void set_snd_prio(int p) {
++  if (g_prio_now.load(std::memory_order_relaxed) == p) return;
++  g_prio_now.store(p, std::memory_order_relaxed);
++#ifdef __SWITCH__
++  if (const Handle h = nx::thread_handle(nx::kThreadS2)) svcSetThreadPriority(h, p);
++#else
++  if (std::getenv("NWII_C_PCSCHED")) {
++    sched_param sp{};
++    sp.sched_priority = std::max(1, 0x3C - p);
++    pthread_setschedparam(g_snd_pthread, SCHED_FIFO, &sp);
++  }
++#endif
++}
++inline void boost(uint32_t bit) {  // cualquier hilo
++  if (!g_prio_hi) return;
++  const uint32_t old = g_boost.fetch_or(bit, std::memory_order_acq_rel);
++  if (!(old & bit)) st_boost_n[bit == 1 ? 0 : bit == 2 ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
++  if (old == 0) { g_boost_t0.store(now_ns(), std::memory_order_relaxed); set_snd_prio(g_prio_hi); }
++}
++inline void unboost(uint32_t bits) {  // solo el hilo de sonido
++  if (!g_prio_hi || !(g_boost.load(std::memory_order_relaxed) & bits)) return;
++  if ((g_boost.fetch_and(~bits, std::memory_order_acq_rel) & ~bits) != 0) return;
++  const uint64_t t0 = g_boost_t0.load(std::memory_order_relaxed);
++  set_snd_prio(g_prio_lo);
++  if (g_boost.load(std::memory_order_acquire) != 0) set_snd_prio(g_prio_hi);  // alguien la pidio entretanto
++  else if (t0) st_boost_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
++}
++
+ // ---- candado S ----------------------------------------------------------------------------
+ std::atomic<uint32_t> s_lock{0};  // 0 libre, 1 juego, 2 sonido
+ enum : uint32_t { kHoldNone = 0, kHoldSection = 1, kHoldIrq = 2 };
+@@ -306,6 +348,7 @@
+       exp = 0;
+       if (s_lock.compare_exchange_weak(exp, 1, std::memory_order_acquire, std::memory_order_relaxed)) break;
+       if (g_check && exp == 1) { check_fail("el juego ya tenia S"); }
++      if (exp == 2 && spins == 64) boost(2);  // r38c: herencia (la CPU de sonido tiene S y puede estar expulsada)
+       if (can_service && g_req.load(std::memory_order_relaxed) == 1) service(ctx);
+       cpu_relax();
+       if (++spins > 4000) { std::this_thread::yield(); }
+@@ -382,6 +425,7 @@
+   } else if (ee && snd_holds) {
+     snd_holds = false;
+     s_lock.store(0, std::memory_order_release);
++    unboost(2);
+   }
+ }
+ 
+@@ -418,6 +462,7 @@
+     const uint64_t late = now - e.due;
+     const uint64_t late_us = late * 1000000 / ctx.tb_freq;
+     if (late_us > st.late_max_us.load(std::memory_order_relaxed)) st.late_max_us.store(late_us, std::memory_order_relaxed);
++    if (late_us > g_late_boost_us) boost(1);  // r38c
+     e.cb(ctx, late);
+   }
+   // interrupciones de sonido, solo con EE = 1 (como en la consola)
+@@ -613,6 +658,7 @@
+   if (--*d > 0) return;
+   for (size_t i = 0; i < snd_mtx.size(); ++i)
+     if (snd_mtx[i].m == m) { snd_mtx.erase(snd_mtx.begin() + i); break; }
++  if (snd_mtx.empty()) unboost(4);
+   add(st.req_unlock);
+   request(ctx, kReqUnlock, m, snd_cur_thread());
+ }
+@@ -856,12 +902,15 @@
+     const char *pe = std::getenv("NWII_S2_PRIO");
+     const int prio = pe ? (int)std::strtol(pe, nullptr, 0) : 0x2C;
+     const Result prc = svcSetThreadPriority(CUR_THREAD_HANDLE, prio);
++    g_prio_now.store(prio);
+     std::printf("[NX] S2: CPU de sonido en el nucleo %d, prioridad 0x%X%s\n", core, prio, R_SUCCEEDED(prc) ? "" : " (fallo)");
+     nx::note_thread(nx::kThreadS2);
+   }
+ #endif
+ #ifndef __SWITCH__
++  g_snd_pthread = pthread_self();
+   pc_sched(5);
++  g_prio_now.store(g_prio_lo);
+ #endif
+   for (;;) {
+     {
+@@ -891,6 +940,7 @@
+       if (snd_state.load(std::memory_order_relaxed) == kQuit) { snd_quit_release(); return; }
+       if (hb_req.load(std::memory_order_relaxed) && snd_mtx.empty() && hw::s2_dsp_quiescent() && !hw::s2_dsp_irq()) break;
+       s.note_idle();
++      unboost(snd_holds ? 1u : snd_mtx.empty() ? 7u : 3u);  // r38c: al dia (y sin S / mutex): vuelve a la base
+       snd_sleep_until(s, next_due());
+     }
+     if (snd_holds) { snd_holds = false; s_lock.store(0, std::memory_order_release); }
+@@ -1155,6 +1205,13 @@
+ 
+ void init(CPUContext *main_ctx) {
+   { const char *e = NWII_ENV("NWII_C_SPIN_OFF"); g_spin_old = e && *e; }
++  {  // r38c: prioridad dinamica (sin NWII_C_PRIO_HI: nada)
++    const char *pl = NWII_ENV("NWII_S2_PRIO"), *ph = NWII_ENV("NWII_C_PRIO_HI"), *lt = NWII_ENV("NWII_C_LATE_US");
++    g_prio_lo = pl ? (int)std::strtol(pl, nullptr, 0) : 0x2C;
++    g_prio_hi = ph ? (int)std::strtol(ph, nullptr, 0) : 0;
++    if (g_prio_hi >= g_prio_lo) g_prio_hi = 0;  // solo tiene sentido si sube
++    if (lt) g_late_boost_us = std::strtoull(lt, nullptr, 0);
++  }
+   vigia_start(main_ctx);  // r38c
+   // [r35m4 m5] S2 ENCENDIDO por defecto. Apagado: NWII_S2_OFF=1 (llega desde debug.toml; apply_env borra los
+   // "0"/"off") o NWII_S2=0 explicito (PC).
+@@ -1236,6 +1293,20 @@
+                 (unsigned long long)late, lk * k, lf * k, mw * k, self * k, rw * k / 1e6, snd * k, wk * k, gsec * k, girq * k, gw * k / 1e6, gwn * k,
+                 (unsigned long long)st.takeovers.load(), (unsigned long long)st.handbacks.load(), (unsigned long long)st.msg_drop.load(),
+                 (unsigned long long)st.traps.load(), (unsigned long long)st.checks_bad.load(), (unsigned long long)st.g_stash.load());
++  // r38c: segunda linea [C38] (subidas de prioridad, recuperacion de pasadas del DMA, esperas maximas, siestas)
++  static uint64_t q[8] = {0};
++  auto dq = [&](int i, uint64_t v) { const uint64_t r = v - q[i]; q[i] = v; return r; };
++  const uint64_t b0 = dq(0, st_boost_n[0].load()), b1 = dq(1, st_boost_n[1].load()), b2 = dq(2, st_boost_n[2].load());
++  const uint64_t bns = dq(3, st_boost_ns.load()), sl = dq(4, st_backoff_sleeps.load());
++  uint64_t cu = 0, rs = 0;
++  hw::c38_dsp_catchup_stats(&cu, &rs);
++  const uint64_t dcu = dq(5, cu), drs = dq(6, rs);
++  const size_t used = std::strlen(buf);
++  std::snprintf(buf + used, n - (int)used,
++                "\n[C38] prio base 0x%X alta 0x%X | subidas: tarde %.0f/s juego-S %.0f/s juego-mutex %.0f/s, en alta %.1f ms/s | DMA: "
++                "pasadas recuperadas %.0f/s, reinicios %.0f/s | max espera S: juego %llu us, sonido %llu us | siestas %.0f/s",
++                g_prio_lo, g_prio_hi, b0 * k, b1 * k, b2 * k, bns * k / 1e6, dcu * k, drs * k,
++                (unsigned long long)st_game_wait_max_us.exchange(0), (unsigned long long)st_snd_wait_max_us.exchange(0), sl * k);
+ }
+ 
+ }  // namespace s2
+@@ -1282,6 +1353,12 @@
+       }
+   } else if (fn == F_OSSendMessage) {
+     if (g_active.load(std::memory_order_relaxed) && fiber_of_queue(ctx.gpr[3])) do_handback(ctx);
++  } else if (fn == F_OSLockMutex && g_prio_hi && g_active.load(std::memory_order_relaxed)) {
++    // r38c: herencia: si el mutex es de un hilo que corre la CPU de sonido, el juego va a dormir esperandolo
++    const uint32_t owner = rd32(ctx.gpr[3] + kMtxThread);
++    if (owner)
++      for (Fiber &f : fibers)
++        if (owner == f.thread && f.hosted.load(std::memory_order_relaxed)) { boost(4); break; }
+   }
+   return false;
+ }
+diff --color -ruN ref/c38src_c1/src/core/s2.h ref/c38src_c2/src/core/s2.h
+--- ref/c38src_c1/src/core/s2.h	2026-11-15 11:59:26.409564502 -0500
++++ ref/c38src_c2/src/core/s2.h	2026-11-15 12:02:23.443930350 -0500
+@@ -58,6 +58,7 @@
+ int s2_dsp_irq();         // CPU de sonido: 5 (AID), 7 (DSP) o 0
+ bool s2_dsp_quiescent();  // sin eventos de correo en vuelo ni interrupciones de sonido pendientes
+ bool c38_dsp_lock_busy();  // r38c: vigia
++void c38_dsp_catchup_stats(uint64_t *caught, uint64_t *resets);  // r38c: NWII_C_CATCHUP
+ }  // namespace hw
+ // r38c: vigia (gx.cpp / plataforma)
+ uint64_t c38_frames_render();
+diff --color -ruN ref/c38src_c1/src/hw/hw_dsp.cpp ref/c38src_c2/src/hw/hw_dsp.cpp
+--- ref/c38src_c1/src/hw/hw_dsp.cpp	2026-11-15 11:59:26.410564504 -0500
++++ ref/c38src_c2/src/hw/hw_dsp.cpp	2026-11-15 12:02:23.444930353 -0500
+@@ -379,6 +379,22 @@
+     return on;
+ }
+ 
++// r38c NWII_C_CATCHUP=<n pasadas> (CPU de sonido): si el fin de pasada se atiende tarde, la hora TEORICA se conserva
++// hasta n pasadas de retraso (antes: solo hasta 1; con mas, se reprogramaba desde ahora y se perdian ticks -> AID < 333/s
++// cuando la CPU de sonido va por debajo del trabajador de render). Las pasadas atrasadas se recuperan seguidas, pero
++// separadas al menos NWII_C_CATCHUP_GAP_US (1200: el correo DSP_YIELD de la lista anterior llega a 1 ms).
++static uint64_t s_c38_theo_next = 0;  // hora teorica (reloj de sonido) del siguiente fin de pasada; 0 = no se sigue
++static uint64_t s_c38_caught = 0, s_c38_resets = 0;
++static uint32_t c38_catchup() {
++    static const uint32_t n = [] { const char *e = NWII_ENV("NWII_C_CATCHUP"); return e ? (uint32_t)std::atoi(e) : 0u; }();
++    return n;
++}
++static uint64_t c38_gap_ticks() {
++    static const uint64_t us = [] { const char *e = NWII_ENV("NWII_C_CATCHUP_GAP_US"); return e ? (uint64_t)std::atol(e) : 1200ull; }();
++    return us * g_ctx_ptr->tb_freq / 1000000;
++}
++void c38_dsp_catchup_stats(uint64_t *caught, uint64_t *resets) { *caught = s_c38_caught; *resets = s_c38_resets; }
++
+ static void adma_start_pass() {
+     s_adma_pass_blocks = adma_control & 0x7FFF;
+     s_adma_pass_start = dsp_now();
+@@ -390,7 +406,24 @@
+     const uint32_t blocks = std::max<uint32_t>(s_adma_pass_blocks, 1);
+     uint64_t ticks = (uint64_t)blocks * 8 * g_ctx_ptr->tb_freq / kAudioRate;
+     // r34s2: en la CPU de sonido siempre desde la hora teorica (32 kHz justos, 333,3 listas/s).
+-    if ((adma_abs_on() || s_route_snd) && s_adma_late < ticks) ticks -= s_adma_late;
++    const uint32_t cn = c38_catchup();
++    if (cn && s_route_snd) {  // r38c
++        const uint64_t now = dsp_now();
++        if (s_adma_late < (uint64_t)cn * ticks) {
++            const uint64_t theo = now - s_adma_late + ticks;
++            const uint64_t gap = c38_gap_ticks();
++            const uint64_t due = std::max(theo, now + std::min(gap, ticks));
++            if (due > theo) ++s_c38_caught;
++            s_c38_theo_next = theo;
++            ticks = due - now;
++        } else {
++            if (s_c38_theo_next) ++s_c38_resets;
++            s_c38_theo_next = now + ticks;
++        }
++    } else {
++        s_c38_theo_next = 0;
++        if ((adma_abs_on() || s_route_snd) && s_adma_late < ticks) ticks -= s_adma_late;
++    }
+     s_adma_late = 0;
+     s_adma_on_snd = s_route_snd && nwii::runtime::s2::on_snd_thread();
+     s_adma_event_id = dsp_sched(ticks, adma_event_cb, false);
+@@ -400,6 +433,10 @@
+     s_adma_event_id = 0;
+     if (!(adma_control & 0x8000))
+         return;
++    if (s_c38_theo_next && s_route_snd) {  // r38c: retraso contra la hora teorica (no contra la programada)
++        const uint64_t now = dsp_now();
++        late = now > s_c38_theo_next ? now - s_c38_theo_next : 0;
++    }
+     s_adma_late = late;
+     adma_start_pass();
+     dsp_control |= 0x0008;
+diff --color -ruN ref/c38src_c1/src/platform/switch/switch_platform.cpp ref/c38src_c2/src/platform/switch/switch_platform.cpp
+--- ref/c38src_c1/src/platform/switch/switch_platform.cpp	2026-11-15 11:59:26.411564506 -0500
++++ ref/c38src_c2/src/platform/switch/switch_platform.cpp	2026-11-15 12:02:23.445930355 -0500
+@@ -749,7 +749,7 @@
+     std::printf("[NX] game %.1f fps, host loop %.1f/s, cpu %u MHz, gpu %u MHz%s%s%s\n", (frames - last_frames) / dt,
+                 host_frames / dt, cpu_hz / 1000000, gpu_hz / 1000000, gov, thr, aud);
+     if (nwii::runtime::s2::g_enabled) {  // r34s2
+-      char s2l[768];
++      char s2l[1400];  // r38c: + linea [C38]
+       nwii::runtime::s2::stats_line(s2l, sizeof s2l, dt);
+       std::printf("%s\n", s2l);
+     }

@@ -1,0 +1,768 @@
+diff --color -ruN -x '*.orig' base/nWiiRuntime/include/runtime/cpu_context.h guestloop/nWiiRuntime/include/runtime/cpu_context.h
+--- base/nWiiRuntime/include/runtime/cpu_context.h	2026-10-31 03:38:55.954975995 -0500
++++ guestloop/nWiiRuntime/include/runtime/cpu_context.h	2026-10-31 07:36:37.763865443 -0500
+@@ -20,10 +20,12 @@
+ #define NWII_FORCEINLINE inline __attribute__((always_inline))
+ #define NWII_NOINLINE __attribute__((noinline))
+ #define NWII_LIKELY(x) __builtin_expect(!!(x), 1)
++#define NWII_UNLIKELY(x) __builtin_expect(!!(x), 0)
+ #else
+ #define NWII_FORCEINLINE inline
+ #define NWII_NOINLINE
+ #define NWII_LIKELY(x) (x)
++#define NWII_UNLIKELY(x) (x)
+ #endif
+ 
+ namespace nwii {
+@@ -54,7 +56,19 @@
+ struct CPUContext;
+ void init_ipc_client(CPUContext &ctx);
+ bool handle_syscall(CPUContext &ctx);
+-bool process_pending_callbacks(CPUContext &ctx);
++// R9 guestloop: inline fast path of the interrupt poll (defined after
++// CPUContext); the rest of the poll is in ios.cpp.
++inline bool process_pending_callbacks(CPUContext &ctx);
++bool process_pending_callbacks_slow(CPUContext &ctx);
++// Kicks the poll countdown of the game CPU context (g_ctx_ptr), for code
++// without a CPUContext at hand (ios.cpp).
++void poll_kick_global();
++namespace hw {
++// Hidden: one static executable, so AArch64 code addresses them directly
++// (adrp + ldr) instead of through the GOT (same in hw/hw.h).
++extern std::atomic<uint32_t> pi_intsr __attribute__((visibility("hidden")));  // hw_pi.cpp
++extern std::atomic<uint32_t> pi_intmr __attribute__((visibility("hidden")));
++}
+ 
+ struct CallbackInfo {
+     uint32_t cb_addr;
+@@ -66,7 +80,7 @@
+ 
+ 
+ void watch_hit(uint32_t addr, uint32_t value, int width);
+-extern uint32_t g_watch_addr;
++extern uint32_t g_watch_addr __attribute__((visibility("hidden")));  // R9: direct access on AArch64
+ 
+ // Strict Dolphin-accurate MMU
+ struct MMU {
+@@ -413,10 +427,22 @@
+ // so the host stack grows with the guest's call chain. Generated code checks
+ // this before a call that could recurse without bound and falls back to
+ // returning to run_game (which unwinds the host stack) when it is low.
+-extern thread_local uintptr_t g_native_stack_limit;
++//
++// R9 guestloop: r8 kept the limit in a thread_local. On the Switch (-mtp=soft)
++// every check then called the TLS wrapper test and __aarch64_read_tp, which
++// also forced a stack frame on every guest call site (22 350 indirect calls).
++// Only the game CPU thread runs generated code, so its stack's red zone is
++// now two plain globals: the check fails only for a stack pointer inside
++// [lo, lo + span], the last 1 MiB of the CPU thread's stack, exactly where
++// the r8 check failed (r8: sp <= limit; below the red zone the stack has
++// already overflowed). Any other thread (and every thread before
++// cpu_thread_func sets it: 0, 0) passes, as with r8's thread_local limit of 0.
++// One hidden struct: a single adrp + ldp on AArch64.
++struct NativeStackGuard { uintptr_t lo, span; };
++extern NativeStackGuard g_native_stack __attribute__((visibility("hidden")));
+ inline bool native_stack_ok() {
+   char probe;
+-  return (uintptr_t)&probe > g_native_stack_limit;
++  return (uintptr_t)&probe - g_native_stack.lo > g_native_stack.span;
+ }
+ 
+ // Called by generated code inside the SDK's "no runnable thread" spin
+@@ -745,12 +771,10 @@
+     return wall;
+   }
+ 
+-  uint64_t wall_timebase_now() const {
+-    uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+-                      std::chrono::steady_clock::now() - tb_start)
+-                      .count();
+-    return us / 1000000 * tb_freq + us % 1000000 * tb_freq / 1000000;
+-  }
++  // R9 guestloop: out of line (os_hle_stubs.cpp), so the host clock source
++  // can change without recompiling the generated code. PC: steady_clock in
++  // microseconds, as before. Switch: the system tick counter (NWII_TB_SRC).
++  NWII_NOINLINE uint64_t wall_timebase_now() const;
+ 
+   // A clock read costs ~25 ns and the interrupt poll on every guest back-edge
+   // reads the timebase up to three times (31% of the CPU thread in a profile).
+@@ -758,7 +782,26 @@
+   // slightly coarser steps. tb_invalidate() forces a fresh read (after a sleep).
+   mutable uint64_t tb_cached = 0;
+   mutable uint32_t tb_reads = 0;
+-  void tb_invalidate() { tb_reads = 0; }
++  void tb_invalidate() { tb_reads = 0; poll_left.store(1, std::memory_order_relaxed); }
++
++  // ---- R9 guestloop: interrupt poll countdown ---------------------------
++  // process_pending_callbacks() runs at every guest back-edge (~3 M/s). Its
++  // inline part only decrements poll_left and, with MSR[EE] set, looks for
++  // a pending external interrupt, a queued callback or an expired
++  // decrementer (poll_dec_due); everything else (host clock refresh,
++  // scheduler events, the rare cases) waits until poll_left runs out, every
++  // kPollTbEvery polls: as often as r8 refreshed the clock (every 32 timebase
++  // reads, two per poll), and the guest time only changes at a refresh.
++  // Whatever can change the outcome before that kicks the countdown
++  // (poll_kick: decrementer writes, a timebase refresh elsewhere, an event
++  // scheduled for now, IPC/DI interrupt delays, the legacy callback path),
++  // so the next poll takes the full path, as r8 would have. Written by other
++  // threads only to kick it (main.cpp, virtual-clock VI), hence atomic.
++  static constexpr int32_t kPollTbEvery = 16;
++  static constexpr int32_t kPollKick = -(1 << 30);  // < 0: next poll is slow, no clock refresh
++  std::atomic<int32_t> poll_left{0};
++  bool poll_dec_due = false;  // decrementer expired at the last full poll
++  void poll_kick() { poll_left.store(kPollKick, std::memory_order_relaxed); }
+ 
+   // ---- Overload governor (real-time clock only) ---------------------------
+   // The wall clock drives the AX audio DMA and DSP mails (~1000 interrupts/s),
+@@ -801,7 +844,10 @@
+       static const uint32_t refresh_mask = NWII_ENV("NWII_TB_NOCACHE") ? 0 : 31;
+       if ((tb_reads++ & refresh_mask) == 0) {
+         uint64_t tb = guest_timebase_from_wall(wall_timebase_now());
+-        if (tb > tb_cached) tb_cached = tb;
++        if (tb > tb_cached) {
++          tb_cached = tb;
++          const_cast<CPUContext *>(this)->poll_kick();  // R9: the poll sees the new time
++        }
+       }
+       return tb_cached;
+     }
+@@ -825,6 +871,7 @@
+     dec_value = v;
+     dec_written_tb = read_timebase();
+     dec_irq_pending = (v != 0xFFFFFFFF);
++    poll_kick();  // R9 guestloop: recompute poll_dec_due at the next poll
+   }
+ 
+   uint32_t read_dec() {
+@@ -1134,6 +1181,23 @@
+   inline void ps_cmpo1(uint32_t crD, uint32_t A, uint32_t B) { fcmp(crD, ps1[A], ps1[B]); }
+ };
+ 
++// R9 guestloop: the per-back-edge poll (see poll_left above). In generated
++// code ctx.pc was just set to a constant, so the first test folds away.
++inline bool process_pending_callbacks(CPUContext &ctx) {
++  const uint32_t pc = ctx.pc;
++  const int32_t left = ctx.poll_left.load(std::memory_order_relaxed) - 1;
++  ctx.poll_left.store(left, std::memory_order_relaxed);
++  if (NWII_UNLIKELY((pc + 4u <= 4u) | (left <= 0)))  // 0xFFFFFFFC / 0: dispatcher cases
++    return process_pending_callbacks_slow(ctx);
++  if (!(ctx.msr & 0x8000)) return false;
++  if (NWII_UNLIKELY(ctx.poll_dec_due |
++                    ((hw::pi_intsr.load(std::memory_order_relaxed) &
++                      hw::pi_intmr.load(std::memory_order_relaxed)) != 0) |
++                    (ctx.pending_cb_count.load(std::memory_order_relaxed) != 0)))
++    return process_pending_callbacks_slow(ctx);
++  return false;
++}
++
+ void hle_set_ipc_arm_msg(uint32_t req_addr);
+ void micro_interpret(CPUContext& ctx, uint32_t opcode, uint32_t pc);
+ 
+diff --color -ruN -x '*.orig' base/nWiiRuntime/include/runtime/event_scheduler.h guestloop/nWiiRuntime/include/runtime/event_scheduler.h
+--- base/nWiiRuntime/include/runtime/event_scheduler.h	2026-10-26 12:30:57.421677337 -0500
++++ guestloop/nWiiRuntime/include/runtime/event_scheduler.h	2026-10-31 07:03:51.949097102 -0500
+@@ -22,10 +22,10 @@
+ 
+     // Inline: the interrupt poll on every guest back-edge calls get() and
+     // advance(); out of line they were ~12% of the CPU thread in a busy loop.
+-    static EventScheduler& get() {
+-        static EventScheduler instance;
+-        return instance;
+-    }
++    // R9 guestloop: a namespace-scope object (constant-initialized, see
++    // event_scheduler.cpp) instead of a function-local static, so get() has
++    // no initialization guard (an acquire load + branch per poll on AArch64).
++    static EventScheduler& get();
+ 
+     EventId schedule_after(uint64_t delay, Callback cb);
+ 
+@@ -36,16 +36,18 @@
+ 
+     // Moves the clock to `now` and fires every event due by then. The common
+     // case (nothing due yet) is decided here without a call.
++    // R9 guestloop: m_next_due caches m_heap.front().due (UINT64_MAX when
++    // empty), so the common case is one compare.
+     void advance(CPUContext& ctx, uint64_t now) {
+         if (now < m_now) return;
+         m_now = now;
+-        if (m_firing || m_heap.empty() || m_heap.front().due > now) return;
++        if (now < m_next_due || m_firing) return;
+         fire_due(ctx);
+     }
+ 
+     void reset();
+     uint64_t now() const { return m_now; }
+-    uint64_t next_due() const { return m_heap.empty() ? UINT64_MAX : m_heap.front().due; }
++    uint64_t next_due() const { return m_next_due; }
+ 
+ private:
+     struct Event {
+@@ -57,6 +59,7 @@
+ 
+     std::vector<Event> m_heap;
+     uint64_t m_now = 0;
++    uint64_t m_next_due = UINT64_MAX;  // m_heap.front().due, UINT64_MAX if empty
+     EventId m_next_id = 1;
+     bool m_firing = false;
+ 
+@@ -64,6 +67,10 @@
+     void push(Event e);
+     void sift_up(size_t i);
+     void sift_down(size_t i);
++    void update_next_due() { m_next_due = m_heap.empty() ? UINT64_MAX : m_heap.front().due; }
+ };
+ 
++extern EventScheduler g_event_scheduler;  // event_scheduler.cpp
++inline EventScheduler& EventScheduler::get() { return g_event_scheduler; }
++
+ }
+diff --color -ruN -x '*.orig' base/nWiiRuntime/include/runtime/hw/hw.h guestloop/nWiiRuntime/include/runtime/hw/hw.h
+--- base/nWiiRuntime/include/runtime/hw/hw.h	2026-10-22 13:33:57.344531236 -0500
++++ guestloop/nWiiRuntime/include/runtime/hw/hw.h	2026-10-31 07:36:05.725273602 -0500
+@@ -10,8 +10,8 @@
+ 
+ namespace nwii::runtime::hw {
+ 
+-extern std::atomic<uint32_t> pi_intsr;
+-extern std::atomic<uint32_t> pi_intmr;
++extern std::atomic<uint32_t> pi_intsr __attribute__((visibility("hidden")));  // R9: see cpu_context.h
++extern std::atomic<uint32_t> pi_intmr __attribute__((visibility("hidden")));
+ extern std::atomic<uint32_t> g_pe_sr;       
+ extern int g_di_interrupt_delay; 
+ 
+diff --color -ruN -x '*.orig' base/nWiiRuntime/src/core/event_scheduler.cpp guestloop/nWiiRuntime/src/core/event_scheduler.cpp
+--- base/nWiiRuntime/src/core/event_scheduler.cpp	2026-10-26 12:30:58.232597967 -0500
++++ guestloop/nWiiRuntime/src/core/event_scheduler.cpp	2026-10-31 07:28:20.723424252 -0500
+@@ -4,6 +4,10 @@
+ 
+ namespace nwii::runtime {
+ 
++// R9 guestloop: constant-initialized (std::vector's default constructor is
++// constexpr), so it exists before any dynamic initializer runs.
++constinit EventScheduler g_event_scheduler;
++
+ void EventScheduler::sift_up(size_t i) {
+     while (i > 0) {
+         size_t parent = (i - 1) / 2;
+@@ -31,9 +35,16 @@
+     }
+ }
+ 
++extern CPUContext *g_ctx_ptr;  // main.cpp
++
+ void EventScheduler::push(Event e) {
++    // R9 guestloop: an event that is already due fires at the next poll, as
++    // in r8 (the poll's countdown only covers clock refreshes).
++    if (e.due <= m_now)
++        if (CPUContext *c = g_ctx_ptr) c->poll_kick();
+     m_heap.push_back(std::move(e));
+     sift_up(m_heap.size() - 1);
++    update_next_due();
+ }
+ 
+ EventScheduler::EventId EventScheduler::schedule_after(uint64_t delay, Callback cb) {
+@@ -58,6 +69,7 @@
+                 sift_up(i);
+                 sift_down(i);
+             }
++            update_next_due();
+             return true;
+         }
+     }
+@@ -75,6 +87,7 @@
+         m_heap[0] = std::move(m_heap.back());
+         m_heap.pop_back();
+         if (!m_heap.empty()) sift_down(0);
++        update_next_due();
+ 
+         uint64_t late = m_now - e.due;
+         if (e.period) {
+@@ -93,6 +106,7 @@
+ 
+ void EventScheduler::reset() {
+     m_heap.clear();
++    m_next_due = UINT64_MAX;
+     m_now = 0;
+     m_next_id = 1;
+     m_firing = false;
+diff --color -ruN -x '*.orig' base/nWiiRuntime/src/core/main.cpp guestloop/nWiiRuntime/src/core/main.cpp
+--- base/nWiiRuntime/src/core/main.cpp	2026-10-31 03:38:55.951329536 -0500
++++ guestloop/nWiiRuntime/src/core/main.cpp	2026-10-31 07:36:23.545081516 -0500
+@@ -80,7 +80,9 @@
+     constexpr uintptr_t kStack = 8u << 20;
+ #endif
+     char top;
+-    nwii::runtime::g_native_stack_limit = (uintptr_t)&top - (kStack - (1u << 20));
++    // R9 guestloop: red zone [lo, lo + span] (r8: sp <= limit fails).
++    const uintptr_t limit = (uintptr_t)&top - (kStack - (1u << 20));
++    nwii::runtime::g_native_stack = {limit - (1u << 20), 1u << 20};
+   }
+   std::cout << "[Thread] CPU Core started. pc=" << std::hex << ctx->pc << " is_running=" << ctx->is_running << std::endl;
+   std::flush(std::cout);
+@@ -637,7 +639,7 @@
+ 
+       extern void ProcessGXFifo();
+       ProcessGXFifo();
+-      if (host_vi) ctx->vblank_pending = true;
++      if (host_vi) { ctx->vblank_pending = true; ctx->poll_kick(); }  // R9: poll sees it
+       if (std::getenv("NWII_SAMPLE") && (++tick % 60) == 0) {
+         std::cout << "[Sample] pc=0x" << std::hex << ctx->pc << " lr=0x"
+                   << ctx->lr << " msr=0x" << ctx->msr << " r3=0x" << ctx->gpr[3]
+@@ -847,7 +849,7 @@
+         std::printf(", host thread %.0f%%", 100.0 * (host_cpu - host_cpu0) / dt);
+       if (cpu_cpu >= 0)
+         std::printf(", cpu thread %.0f%%", 100.0 * (cpu_cpu - cpu_cpu0) / dt);
+-      char gov[160];
++      char gov[320];
+       nwii::runtime::governor_report(gov, sizeof gov, dt);
+       std::printf(", idle sleeps %.0f/s (%.0f%% of the time)%s\n",
+                   (sleeps - sleeps0) / dt, (sleep_us - sleep_us0) / dt / 1e4, gov);
+@@ -1210,7 +1212,7 @@
+         }
+       }
+ 
+-      if (host_vi) ctx->vblank_pending = true;
++      if (host_vi) { ctx->vblank_pending = true; ctx->poll_kick(); }  // R9: poll sees it
+       if (frame_paced)
+         wait_next_frame();
+       else
+diff --color -ruN -x '*.orig' base/nWiiRuntime/src/core/os_hle_stubs.cpp guestloop/nWiiRuntime/src/core/os_hle_stubs.cpp
+--- base/nWiiRuntime/src/core/os_hle_stubs.cpp	2026-10-29 13:19:23.550849010 -0500
++++ guestloop/nWiiRuntime/src/core/os_hle_stubs.cpp	2026-10-31 07:36:23.544345118 -0500
+@@ -13,6 +13,9 @@
+ #include <thread>
+ #include <algorithm>
+ #include "runtime/event_scheduler.h"
++#ifdef __SWITCH__
++#include <switch.h>
++#endif
+ 
+ using namespace nwii::runtime;
+ 
+@@ -232,13 +235,82 @@
+ }
+ namespace nwii::runtime {
+ 
+-thread_local uintptr_t g_native_stack_limit = 0;
++NativeStackGuard g_native_stack = {0, 0};  // R9 guestloop (cpu_context.h)
+ 
+ extern int g_ipc_interrupt_delay;
+ 
+ // Time the CPU thread spent asleep in idle_wait (NWII_FPS=1 reports it).
+ std::atomic<uint64_t> g_idle_sleeps{0}, g_idle_sleep_us{0};
+ 
++// ---- R9 guestloop: host clock -> guest timebase -----------------------------
++// r8: steady_clock::now() in whole microseconds (std::chrono, then two
++// divisions). On the Switch steady_clock is clock_gettime(CLOCK_MONOTONIC)
++// from libnx, which reads the 19.2 MHz system tick and converts it to ns.
++// NWII_TB_SRC=tick (Switch default) reads the tick directly: 40.5 MHz =
++// 19.2 MHz x 135/64 exactly, so tb = ticks * 135 / 64 (finer than 1 us).
++// NWII_TB_SRC=chrono keeps the r8 path. The tick clock continues the r8 one
++// from its first read (same origin, tb_start).
++// NWII_TB_BENCH=1 prints the cost of each clock read once at start-up.
++static uint64_t chrono_timebase(const CPUContext &c) {
++  uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
++                    std::chrono::steady_clock::now() - c.tb_start)
++                    .count();
++  return us / 1000000 * c.tb_freq + us % 1000000 * c.tb_freq / 1000000;
++}
++#ifdef __SWITCH__
++// Continues the r8 clock: at the first read, guest time = chrono_timebase()
++// and the tick count is taken as the base; afterwards only ticks are read.
++static uint64_t g_tick0 = 0, g_tick_tb0 = 0;
++static uint64_t tick_timebase(const CPUContext &c) {
++  if (__builtin_expect(g_tick0 == 0, 0)) {
++    g_tick_tb0 = chrono_timebase(c);
++    g_tick0 = armGetSystemTick() | 1;
++  }
++  const uint64_t d = armGetSystemTick() - g_tick0;
++  if (c.tb_freq == 40500000) return g_tick_tb0 + d / 64 * 135 + (d % 64) * 135 / 64;
++  return g_tick_tb0 + d / 19200000 * c.tb_freq + (d % 19200000) * c.tb_freq / 19200000;
++}
++#endif
++static void tb_bench(const CPUContext &c) {
++  using clk = std::chrono::steady_clock;
++  volatile uint64_t sink = 0;
++  auto run = [&](const char *name, auto fn) {
++    const int n = 200000;
++    const auto t0 = clk::now();
++    for (int i = 0; i < n; ++i) sink = sink + fn();
++    const double ns = std::chrono::duration<double, std::nano>(clk::now() - t0).count() / n;
++    std::printf("[TB] bench %s: %.1f ns per read\n", name, ns);
++  };
++  run("steady_clock::now", [] { return (uint64_t)clk::now().time_since_epoch().count(); });
++  run("chrono timebase (r8)", [&] { return chrono_timebase(c); });
++#ifdef __SWITCH__
++  run("armGetSystemTick", [] { return armGetSystemTick(); });
++  run("tick timebase", [&] { return tick_timebase(c); });
++  run("svcGetSystemTick", [] { return svcGetSystemTick(); });
++#endif
++  std::fflush(stdout);
++}
++
++uint64_t CPUContext::wall_timebase_now() const {
++  // 0 = not decided yet, 1 = chrono, 2 = tick
++  static int src = 0;
++  if (__builtin_expect(src == 0, 0)) {
++    const char *e = NWII_ENV("NWII_TB_SRC");
++#ifdef __SWITCH__
++    src = (e && std::strcmp(e, "chrono") == 0) ? 1 : 2;
++#else
++    src = 1;
++    (void)e;
++#endif
++    std::printf("[TB] host clock: %s\n", src == 2 ? "system tick (x135/64)" : "steady_clock (us)");
++    if (NWII_ENV("NWII_TB_BENCH")) tb_bench(*this);
++  }
++#ifdef __SWITCH__
++  if (src == 2) return tick_timebase(*this);
++#endif
++  return chrono_timebase(*this);
++}
++
+ // The OS idle loop (SelectThread with an empty run queue, e.g. 0x801B4FF8 in
+ // SMNE01) calls this on every turn. With the real-time clock nothing in the
+ // guest can change until the next timed event, so sleep until then instead
+@@ -265,6 +337,8 @@
+ 
+ // ", busy max .. ms, clock x.. , slip .. ms, interp ../s" for the periodic
+ // NWII_FPS / Switch fps_log lines; resets the per-report maxima.
++void poll_stats_report(char *buf, size_t n, double dt);  // ios.cpp (R9 guestloop)
++
+ void governor_report(char *buf, size_t n, double dt) {
+   static uint64_t interp0 = 0;
+   const uint64_t interp = g_interp_calls.load(std::memory_order_relaxed);
+@@ -275,6 +349,8 @@
+                 (unsigned long long)(g_gov_slip_us.load(std::memory_order_relaxed) / 1000),
+                 dt > 0 ? (interp - interp0) / dt : 0.0);
+   interp0 = interp;
++  const size_t used = std::strlen(buf);
++  if (used + 1 < n) poll_stats_report(buf + used, n - used, dt);
+ }
+ 
+ void CPUContext::governor_step(uint64_t wall) const {
+@@ -307,6 +383,15 @@
+   static uint64_t last_cut = 0, last_starve = 0;
+   static uint32_t ceiling = kGovOne;
+   static bool in_episode = false;
++  // R9 guestloop: longest busy stretch over the current and the previous 2 s
++  // window (see the climb below).
++  static uint64_t win_start = 0, win_max = 0, prev_win_max = UINT64_MAX;
++  if (wall - win_start >= 2 * tb_freq) {
++    prev_win_max = win_max;
++    win_max = 0;
++    win_start = wall;
++  }
++  win_max = std::max(win_max, busy);
+   if (busy >= starve) {
+     if (!in_episode) {
+       in_episode = true;
+@@ -323,9 +408,21 @@
+     in_episode = false;
+     if (ceiling < kGovOne && wall - last_starve >= 20 * tb_freq)
+       ceiling = kGovOne;
++    // R9 guestloop: above the ceiling the slow climb (1/4096 per step, ~10 s
++    // from x0.75 to x1) is only needed while the guest is still close to
++    // starving. A guest that idled within the last starve/4 (250 ms: in
++    // citron the World 1 map idles every 60-140 ms at x1) truly keeps up, so
++    // it climbs at the fast rate to real time (r8: the map ran 10-13 s at
++    // x0.78-0.90 after its loading episode, with audio and timers slowed).
++    // NWII_GOV_SLOWCLIMB=1 restores the r8 rule.
++    // "Within the last 250 ms" must hold for the last 2-4 s (windowed max
++    // of `busy`), so a host that only just keeps up at the ceiling still
++    // settles slowly instead of oscillating around its limit.
++    static const bool slow_climb = NWII_ENV("NWII_GOV_SLOWCLIMB") != nullptr;
++    const bool keeps_up = std::max(prev_win_max, win_max) < starve / 4;
++    const bool fast = gov_rate < ceiling || (!slow_climb && keeps_up);
+     if (gov_rate < kGovOne)
+-      gov_rate = std::min<uint32_t>(
+-          gov_rate + (gov_rate < ceiling ? kGovOne / 256 : kGovOne / 4096), kGovOne);
++      gov_rate = std::min<uint32_t>(gov_rate + (fast ? kGovOne / 256 : kGovOne / 4096), kGovOne);
+   }
+   if (gov_rate < g_gov_min_rate.load(std::memory_order_relaxed))
+     g_gov_min_rate.store(gov_rate, std::memory_order_relaxed);
+diff --color -ruN -x '*.orig' base/nWiiRuntime/src/hle/ios.cpp guestloop/nWiiRuntime/src/hle/ios.cpp
+--- base/nWiiRuntime/src/hle/ios.cpp	2026-10-29 12:42:34.444946892 -0500
++++ guestloop/nWiiRuntime/src/hle/ios.cpp	2026-10-31 07:33:55.877000146 -0500
+@@ -4,6 +4,7 @@
+ #include "runtime/cpu_context.h"
+ #include <algorithm>
+ #include <cstring>
++#include <cstdio>
+ #include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
+@@ -871,6 +872,7 @@
+ // tick, timebase read + scheduler advance, decrementer check) and enters
+ // ppc_tail at the same point, so behaviour is unchanged.
+ static bool g_vi_registered = false;
++static bool g_hb_due = false;  // R9 guestloop: ppc_full prints the [Heartbeat] block
+ namespace hw { extern int g_di_interrupt_delay; }
+ static bool ppc_tail(CPUContext &ctx, bool dec_exp);
+ 
+@@ -985,7 +987,7 @@
+     }
+   }
+ 
+-  if ((ctx.inst_count % 20000000) == 0) {
++  if (g_hb_due) {
+       std::cout << "[Heartbeat] PC: 0x" << std::hex << ctx.pc << " LR: 0x" << ctx.lr
+                 << " intmr=0x" << nwii::runtime::hw::pi_intmr.load()
+                 << " intsr=0x" << nwii::runtime::hw::pi_intsr.load()
+@@ -1477,6 +1479,7 @@
+                       ctx.backup_stack.push(bk);
+ 
+                       ctx.in_callback = true;
++                      ctx.poll_kick();  // R9: ppc_full on every poll in a callback
+                       ctx.callback_depth++;
+                       ctx.srr0 = ctx.pc;
+                       ctx.srr1 = ctx.msr | 0x8000;
+@@ -1575,6 +1578,7 @@
+   ctx.backup_stack.push(bk);
+ 
+   ctx.in_callback = true;
++  ctx.poll_kick();  // R9: ppc_full on every poll in a callback
+   ctx.callback_depth++;
+ 
+   ctx.gpr[3] = cb.arg1;
+@@ -1590,25 +1594,174 @@
+   longjmp(ctx.exception_jmp_buf, 1);
+ }
+ 
+-bool process_pending_callbacks(CPUContext &ctx) {
+-  // Debug switches of ppc_full, read once (all off in normal play).
+-  static const bool s_debug = g_env_sample || NWII_ENV("NWII_LOOPTRACE") != nullptr;
+-  if (__builtin_expect(s_debug || g_trace_after_dec > 0 || ctx.pc == 0xFFFFFFFC ||
+-                           ctx.pc == 0 || (ctx.inst_count % 20000000) == 0 ||
+-                           g_ipc_interrupt_delay > 0 || ctx.vblank_pending ||
+-                           ctx.in_callback || !g_vi_registered ||
+-                           hw::g_di_interrupt_delay > 0,  // di_tick() has work
++// ---- R9 guestloop: the per-back-edge poll ---------------------------------
++// The inline part (cpu_context.h, process_pending_callbacks) decides most
++// polls with a countdown and, with MSR[EE] set, three flag tests. This slow
++// part takes the same decisions as the r8 poll did:
++//   - the rare conditions (debug switches, VI not registered yet, IPC/DI
++//     interrupt delays counted in polls, virtual-clock VI, the legacy callback
++//     path, the dispatcher's 0xFFFFFFFC / 0 cases, the heartbeat) go to
++//     ppc_full on every poll while they last (the countdown is kicked);
++//   - otherwise: refresh the guest clock from the host clock when the
++//     countdown ran out (every kPollTbEvery polls, as often as r8 did),
++//     move the scheduler clock, fire due events, deliver a decrementer /
++//     external interrupt / queued callback when MSR[EE] allows it.
++// The scheduler's next due time is cached (one compare) and
++// EventScheduler::get() has no initialization guard; PI_INTSR/PI_INTMR are
++// read with relaxed loads (seq_cst loads are acquire loads on AArch64).
++// NWII_POLL_STATS=1 (PC: environment, Switch: debug.toml) counts slow polls,
++// clock refreshes and ppc_full / ppc_tail entries for the fps_log lines.
++static bool g_poll_force = true;   // ppc_full on every poll (until it says otherwise)
++static bool g_tb_wall = false;     // CPUContext::wall_clock_tb(), read by ppc_full
++static bool g_poll_stats = false;
++static bool g_poll_check = false;  // NWII_POLL_CHECK (below)
++static uint64_t g_hb_next = 1ull << 30;
++std::atomic<uint64_t> g_poll_slow_n{0}, g_poll_full_n{0}, g_poll_tail_n{0}, g_poll_tb_n{0};
++
++static void poll_update_force() {
++  static const bool s_debug = g_env_sample || NWII_ENV("NWII_LOOPTRACE") != nullptr ||
++                              NWII_ENV("NWII_TB_NOCACHE") != nullptr;
++  static const bool s_stats = NWII_ENV("NWII_POLL_STATS") != nullptr;
++  static const bool s_check = NWII_ENV("NWII_POLL_CHECK") != nullptr;
++  g_tb_wall = CPUContext::wall_clock_tb();
++  g_poll_stats = s_stats;
++  g_poll_check = s_check;
++  g_poll_force = s_debug || g_trace_after_dec > 0 || !g_vi_registered;
++}
++
++static inline void poll_count(std::atomic<uint64_t> &c) {
++  if (__builtin_expect(g_poll_stats, 0))
++    c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
++}
++
++extern CPUContext *g_ctx_ptr;  // main.cpp
++void poll_kick_global() {
++  if (CPUContext *c = g_ctx_ptr) c->poll_kick();
++}
++
++static NWII_NOINLINE bool ppc_full_entry(CPUContext &ctx) {
++  poll_count(g_poll_full_n);
++  // Every poll takes this path while the condition lasts; ppc_full may not
++  // return (it longjmps into an interrupt handler).
++  ctx.poll_kick();
++  if (ctx.inst_count >= g_hb_next) {
++    // [Heartbeat] (r8: when a poll saw inst_count % 20000000 == 0, about every
++    // 0.9 G guest instructions on average): every 2^30 instructions.
++    g_hb_due = true;
++    g_hb_next = (ctx.inst_count | ((1ull << 30) - 1)) + 1;
++  }
++  const bool r = ppc_full(ctx);
++  g_hb_due = false;
++  poll_update_force();
++  return r;
++}
++
++// Same as CPUContext::read_timebase() on its refresh path (wall clock).
++static NWII_NOINLINE void poll_tb_refresh(CPUContext &ctx) {
++  poll_count(g_poll_tb_n);
++  const uint64_t tb = ctx.guest_timebase_from_wall(ctx.wall_timebase_now());
++  if (tb > ctx.tb_cached) ctx.tb_cached = tb;
++}
++
++// ---- NWII_POLL_CHECK=1 (test only): is the inline skip ever wrong? ---------
++// Every poll comes here (the countdown is pinned to kCheckForce); the real
++// countdown is kept in s_vleft, kicks included. For each poll the inline
++// part would have skipped, this checks that the full logic would not have
++// done anything either at the same guest time (no ppc_full condition, no
++// event due, no decrementer / interrupt / callback to deliver with EE set),
++// and then skips it as the inline part would. Mismatches are counted and the
++// first ones logged ([POLL] check). The heartbeat (log only) is not counted.
++static constexpr int32_t kCheckForce = -(1 << 29);
++static int32_t s_vleft = 0;
++static uint64_t s_chk_polls = 0, s_chk_skips = 0, s_chk_bad = 0;
++
++static NWII_NOINLINE int32_t poll_check_entry(CPUContext &ctx, int32_t left, bool &skip) {
++  ++s_chk_polls;
++  if (left == kCheckForce - 1) s_vleft -= 1;        // no kick since the last poll
++  else if (left == 0) s_vleft = 0;                  // tb_invalidate
++  else s_vleft = CPUContext::kPollKick - 1;         // kicked
++  ctx.poll_left.store(kCheckForce, std::memory_order_relaxed);
++  const bool ee = ctx.msr & 0x8000;
++  const bool ints = (hw::pi_intsr.load(std::memory_order_relaxed) &
++                     hw::pi_intmr.load(std::memory_order_relaxed)) != 0;
++  const bool cb = ctx.pending_cb_count.load(std::memory_order_relaxed) != 0;
++  skip = ((uint32_t)(ctx.pc + 4u) > 4u) && s_vleft > 0 && !(ee && (ctx.poll_dec_due | ints | cb));
++  if (skip) {
++    ++s_chk_skips;
++    const uint64_t tb = g_tb_wall ? ctx.tb_cached : ctx.inst_count;
++    const bool force = g_poll_force || ((g_ipc_interrupt_delay | hw::g_di_interrupt_delay) != 0) ||
++                       ctx.vblank_pending.load(std::memory_order_relaxed) || ctx.in_callback;
++    const bool event = tb >= EventScheduler::get().next_due();
++    const bool dec = ctx.dec_irq_pending && (tb - ctx.dec_written_tb) >= ctx.dec_value;
++    if (force || event || (ee && (dec || ints || cb))) {
++      if (s_chk_bad++ < 20)
++        std::printf("[POLL] check: skipped poll would act: force=%d event=%d dec=%d ee=%d pc=0x%08x "
++                    "vleft=%d tb=%llu next_due=%llu\n", (int)force, (int)event, (int)dec, (int)ee,
++                    ctx.pc, s_vleft, (unsigned long long)tb,
++                    (unsigned long long)EventScheduler::get().next_due());
++    }
++  }
++  if ((s_chk_polls & ((1u << 26) - 1)) == 0)
++    std::printf("[POLL] check: %llu polls, %llu skipped by the inline path, %llu mismatches\n",
++                (unsigned long long)s_chk_polls, (unsigned long long)s_chk_skips,
++                (unsigned long long)s_chk_bad);
++  return s_vleft;
++}
++
++bool process_pending_callbacks_slow(CPUContext &ctx) {
++  poll_count(g_poll_slow_n);
++  int32_t left = ctx.poll_left.load(std::memory_order_relaxed);
++  if (__builtin_expect(g_poll_check, 0)) {
++    bool skip;
++    left = poll_check_entry(ctx, left, skip);
++    if (skip) return false;
++  }
++  bool refresh = false;
++  if (left <= 0) {
++    // 0: the countdown ran out (or tb_invalidate); < 0: kicked.
++    refresh = left == 0;
++    const int32_t k = g_tb_wall ? CPUContext::kPollTbEvery : 1;
++    if (__builtin_expect(g_poll_check, 0)) s_vleft = k;
++    else ctx.poll_left.store(k, std::memory_order_relaxed);
++  }
++  if (__builtin_expect(g_poll_force | ((uint32_t)(ctx.pc + 4u) <= 4u) |  // 0xFFFFFFFC / 0
++                           (ctx.inst_count >= g_hb_next) |                 // [Heartbeat]
++                           ((g_ipc_interrupt_delay | hw::g_di_interrupt_delay) != 0) |
++                           ctx.vblank_pending.load(std::memory_order_relaxed) |
++                           ctx.in_callback,
+                        0))
+-    return ppc_full(ctx);
+-  nwii::runtime::EventScheduler::get().advance(ctx, ctx.read_timebase());
+-  const bool dec_exp = ctx.dec_expired();
+-  const uint32_t msr_ee = ctx.msr & 0x8000;
+-  if (!(dec_exp && msr_ee && !ctx.in_callback) &&
+-      !((nwii::runtime::hw::pi_intsr & nwii::runtime::hw::pi_intmr) != 0 && msr_ee)) {
+-    if (!msr_ee) return false;
+-    if (ctx.pending_cb_count.load(std::memory_order_relaxed) == 0) return false;
++    return ppc_full_entry(ctx);
++  uint64_t tb;
++  if (__builtin_expect(g_tb_wall, 1)) {
++    if (refresh) poll_tb_refresh(ctx);
++    tb = ctx.tb_cached;
++  } else {
++    tb = ctx.inst_count;
+   }
++  EventScheduler::get().advance(ctx, tb);
++  const bool dec_exp = ctx.dec_irq_pending && (tb - ctx.dec_written_tb) >= ctx.dec_value;
++  ctx.poll_dec_due = dec_exp;
++  if (!(ctx.msr & 0x8000)) return false;
++  if (!dec_exp &&
++      (hw::pi_intsr.load(std::memory_order_relaxed) & hw::pi_intmr.load(std::memory_order_relaxed)) == 0 &&
++      ctx.pending_cb_count.load(std::memory_order_relaxed) == 0)
++    return false;
++  poll_count(g_poll_tail_n);
+   return ppc_tail(ctx, dec_exp);
+ }
+ 
++// ", slow polls ../s (full .., tail .., clock ..)" for the fps lines (NWII_POLL_STATS).
++void poll_stats_report(char *buf, size_t n, double dt) {
++  static uint64_t p0 = 0, f0 = 0, t0 = 0, c0 = 0;
++  if (n == 0) return;
++  buf[0] = 0;
++  if (!g_poll_stats) return;
++  const uint64_t p = g_poll_slow_n.load(std::memory_order_relaxed), f = g_poll_full_n.load(std::memory_order_relaxed),
++                 t = g_poll_tail_n.load(std::memory_order_relaxed), c = g_poll_tb_n.load(std::memory_order_relaxed);
++  const double k = dt > 0 ? 1.0 / dt : 0.0;
++  std::snprintf(buf, n, ", slow polls %.0fk/s (full %.0f/s, tail %.0f/s, clock %.0fk/s)",
++                (p - p0) * k / 1000, (f - f0) * k, (t - t0) * k, (c - c0) * k / 1000);
++  p0 = p; f0 = f; t0 = t; c0 = c;
++}
++
+ } 
+diff --color -ruN -x '*.orig' base/nWiiRuntime/src/hw/hw_ipc.cpp guestloop/nWiiRuntime/src/hw/hw_ipc.cpp
+--- base/nWiiRuntime/src/hw/hw_ipc.cpp	2026-10-22 11:54:28.456074091 -0500
++++ guestloop/nWiiRuntime/src/hw/hw_ipc.cpp	2026-10-31 07:28:20.722882344 -0500
+@@ -43,7 +43,7 @@
+   ipc_arm_msg = req_addr & 0x1FFFFFFF;
+   ipc_arm_ctrl = 0x00000002;
+   ipc_ppc_ctrl |= 0x00000004;
+-  g_ipc_interrupt_delay = 5000;
++  g_ipc_interrupt_delay = 5000; poll_kick_global();  // R9 guestloop
+ }
+ 
+ 
+@@ -52,7 +52,7 @@
+   ipc_arm_msg = req_addr & 0x1FFFFFFF;
+   ipc_ppc_ctrl &= ~0x01;
+   ipc_ppc_ctrl |= 0x26; 
+-  g_ipc_interrupt_delay = 50;
++  g_ipc_interrupt_delay = 50; poll_kick_global();  // R9 guestloop
+ }
+ 
+ void register_ipc(MMIODispatcher& dispatcher) {{
+@@ -91,14 +91,14 @@
+                         ipc_ppc_ctrl &= ~0x01;
+                         ipc_ppc_ctrl |= 0x26; 
+                         
+-                        g_ipc_interrupt_delay = 50;
++                        g_ipc_interrupt_delay = 50; poll_kick_global();  // R9 guestloop
+                     } else {
+ 
+                         
+ 
+                         ipc_ppc_ctrl &= ~0x01;
+                         ipc_ppc_ctrl |= 0x2C; 
+-                        g_ipc_interrupt_delay = 50;
++                        g_ipc_interrupt_delay = 50; poll_kick_global();  // R9 guestloop
+                     }
+                 }
+ 
+diff --color -ruN -x '*.orig' base/nWiiRuntime/src/platform/switch/switch_platform.cpp guestloop/nWiiRuntime/src/platform/switch/switch_platform.cpp
+--- base/nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-10-31 03:38:55.966958404 -0500
++++ guestloop/nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-10-31 07:04:40.103197081 -0500
+@@ -627,7 +627,7 @@
+       now - last_stat >= std::chrono::seconds(5)) {
+     const double dt = std::chrono::duration<double>(now - last_stat).count();
+     const uint64_t frames = g_stat_frames;
+-    char gov[160];
++    char gov[320];
+     nwii::runtime::governor_report(gov, sizeof gov, dt);
+     std::printf("[NX] game %.1f fps, host loop %.1f/s%s\n", (frames - last_frames) / dt,
+                 host_frames / dt, gov);

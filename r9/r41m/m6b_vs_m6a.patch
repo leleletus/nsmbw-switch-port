@@ -1,0 +1,1097 @@
+diff --color -ruN r41m/nWiiRuntime/src/hle/gx/renderer_gl.cpp r41m/nWiiRuntime_m6b/src/hle/gx/renderer_gl.cpp
+--- r41m/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-15 14:01:02.815458154 -0500
++++ r41m/nWiiRuntime_m6b/src/hle/gx/renderer_gl.cpp	2026-11-15 14:46:23.845888475 -0500
+@@ -155,6 +155,19 @@
+ }
+ static uint64_t s_acc[kN], s_t = 0;
+ static int s_cur = -1;
++// r39r2: EFB copy sub-phases (NWII_RPHASE=1 only), per frame in the report.
++enum { cAcq, cSetup, cDraw, cBack, cDone, cClear, cXfb, kCN };
++static const char *const kCNames[kCN] = {"acq", "setup", "draw", "back", "done", "clear", "xfb"};
++static uint64_t s_cacc[kCN], s_ncopy = 0, s_nclear = 0, s_nxfb = 0;
++static uint64_t s_gld_after = 0, s_n_after = 0, s_gld_n = 0;
++static bool s_after = false;  // a copy/clear happened; the next GL draw is timed apart
++static inline uint64_t T();
++static inline void C(int k, uint64_t &t0) {  // add [t0, now) to sub-phase k
++  if (!s_level) return;
++  const uint64_t t = T();
++  s_cacc[k] += t - t0;
++  t0 = t;
++}
+ static uint64_t s_frames = 0, s_draws = 0, s_dirty = 0, s_keychg = 0, s_verts = 0,
+                 s_idx = 0, s_bytes = 0, s_flushes = 0, s_hits = 0;
+ // Switch to phase p; returns the previous one.
+@@ -166,6 +179,10 @@
+   }
+   const uint64_t t = Now();
+   if (s_cur >= 0) s_acc[s_cur] += t - s_t;
++  if (s_cur == kGlDraw) {  // r39r2
++    ++s_gld_n;
++    if (s_after) { s_gld_after += t - s_t; ++s_n_after; s_after = false; }
++  }
+   s_t = t;
+   const int o = s_cur;
+   s_cur = p;
+@@ -182,10 +199,19 @@
+          "upKB=%.0f emit_hits=%.0f\n",
+          s_draws / f, s_dirty / f, s_keychg / f, s_flushes / f, s_verts / f, s_idx / f,
+          s_bytes / f / 1024.0, s_hits / f);
++  // r39r2: copy sub-phases (us per frame) and the GL draw right after a copy
++  printf("[RPHASE2] per frame: copies=%.1f clears=%.1f xfb=%.1f |", s_ncopy / f, s_nclear / f, s_nxfb / f);
++  for (int i = 0; i < kCN; ++i) printf(" %s=%.0f", kCNames[i], TicksToUs(s_cacc[i]) / f);
++  printf(" | gldraw n=%.1f, first after copy n=%.1f %.1f us each, others %.1f us each\n", s_gld_n / f,
++         s_n_after / f, s_n_after ? TicksToUs(s_gld_after) / s_n_after : 0.0,
++         s_gld_n > s_n_after ? (TicksToUs(s_acc[kGlDraw]) - TicksToUs(s_gld_after)) / (s_gld_n - s_n_after) : 0.0);
++  for (auto &a : s_cacc) a = 0;
++  s_ncopy = s_nclear = s_nxfb = s_gld_after = s_n_after = s_gld_n = 0;
+   std::fflush(stdout);
+   for (auto &a : s_acc) a = 0;
+   s_frames = s_draws = s_dirty = s_keychg = s_verts = s_idx = s_bytes = s_flushes = s_hits = 0;
+ }
++static inline uint64_t T() { return s_level ? Now() : 0; }
+ }  // namespace rph
+ 
+ // ---- R9 render: persistent vertex/index buffers (vbuf) ------------------------
+@@ -207,6 +233,19 @@
+ // NWII_R9_FRAMECHECK (see RendererGL::Render): set while a frame is rendered
+ // a second time the r8 way (no vbuf, no emit cache) to compare the images.
+ static bool s_r8_pass = false;
++static bool s_r2_full_inval = false;
++// r39r2 NWII_R2_LAZYEFB=1: after an EFB copy to a texture the EFB goes back as
++// the draw framebuffer only when something draws or clears with glClear (the
++// ~20 animated-tile copies of a frame come one after the other: one switch
++// back instead of 20). The read framebuffer is the EFB again at once.
++static bool s_r2_efb_off = false;
++static GLuint s_r2_efb_fbo_ref = 0;
++static inline void R2EfbBack() {
++  if (s_r2_efb_off) {
++    glBindFramebuffer(GL_FRAMEBUFFER, s_r2_efb_fbo_ref);
++    s_r2_efb_off = false;
++  }
++}  // r39r2 NWII_R2_COPYST: something outside the cache moved: GLInvalidate after all
+ // R11 GPU XF (NWII_GPU_XF, see namespace xf further down): vertex transform and
+ // texgen in the vertex shader. Declared here for the code above it.
+ namespace xf {
+@@ -614,6 +653,9 @@
+   sh.uXW = glGetUniformLocation(id, "uXW");
+   sh.uXQ = glGetUniformLocation(id, "uXQ");
+   sh.uXDraw = glGetUniformLocation(id, "uXDraw");
++  // r39r2 NWII_R2_XDUBO: the draw-base block on binding point 1
++  const GLuint r2b = glGetUniformBlockIndex(id, "R2XDraw");
++  if (r2b != GL_INVALID_INDEX) glUniformBlockBinding(id, r2b, 1);
+ }
+ 
+ // ---- Separable programs (R8 shaders) ----------------------------------------
+@@ -1978,6 +2020,7 @@
+   const int pw = SE(g_state.efbSrcX + w) - sx, ph = s_efb_h - SE(g_state.efbSrcY) - sy;
+   // 1024x1024 as always at native scale; grown when a scaled copy needs more.
+   if (!s_xfb_fbo || pw > s_xfb_cap_w || ph > s_xfb_cap_h) {
++    s_r2_full_inval = true;  // r39r2: binds a texture on the active unit
+     const bool first = !s_xfb_fbo;
+     if (first) glGenTextures(1, &s_xfb_tex);
+     s_xfb_cap_w = std::max(1024, pw);
+@@ -1991,11 +2034,13 @@
+                            s_xfb_tex, 0);
+   }
+   glDisable(GL_SCISSOR_TEST);
++  g_gl.en[kEnScissor] = 0;  // r39r2
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, efb);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_xfb_fbo);
+   glBlitFramebuffer(sx, sy, sx + pw, sy + ph, 0, 0, pw, ph, GL_COLOR_BUFFER_BIT,
+                     GL_NEAREST);
+   glBindFramebuffer(GL_FRAMEBUFFER, efb);
++  s_r2_efb_off = false;  // r39r2
+   s_xfb_w = pw;
+   s_xfb_h = ph;
+   s_xfb_lw = w;
+@@ -2098,6 +2143,47 @@
+ // Like Dolphin ClearScreen: colour, alpha and Z are cleared only when their
+ // update bits (BP 0x41 bits 3/4, BP 0x40 bit 4) are on; formats without
+ // alpha clear it to 0 (it reads back as 1 anyway).
++static inline bool DrawTraceOn();
++// r39r2 NWII_R2_CLEARTEX_CHECK=1: after each colour-only clear, read the
++// rectangle back and count pixels that are not the clear colour (both paths).
++static void R2ClearCheck(bool tex_path, int x0, int y0, int x1, int y1, const unsigned char *cc) {
++  static const bool on = NWII_ENV("NWII_R2_CLEARTEX_CHECK") != nullptr;
++  if (!on || x1 <= x0 || y1 <= y0) return;
++  static uint64_t n[2] = {0, 0}, bad[2] = {0, 0}, px[2] = {0, 0};
++  std::vector<unsigned char> b((size_t)(x1 - x0) * (y1 - y0) * 4);
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, s_efb_fbo);
++  glReadPixels(x0, y0, x1 - x0, y1 - y0, GL_RGBA, GL_UNSIGNED_BYTE, b.data());
++  uint64_t d = 0;
++  for (size_t i = 0; i < b.size(); i += 4)
++    if (std::memcmp(&b[i], cc, 4)) ++d;
++  ++n[tex_path]; bad[tex_path] += d; px[tex_path] += b.size() / 4;
++  if ((n[0] + n[1]) % 600 == 0 || (d && bad[tex_path] == d))
++    printf("[R2CLR] cleartex: %llu clears %llu px %llu differ | glClear: %llu clears %llu px %llu differ\n",
++           (unsigned long long)n[1], (unsigned long long)px[1], (unsigned long long)bad[1],
++           (unsigned long long)n[0], (unsigned long long)px[0], (unsigned long long)bad[0]);
++}
++// r39r2 NWII_R2_COPYTRACE=<n>: every n-th frame, the order of draws (GX scissor
++// rectangle, texture addresses) and EFB copies (source rectangle, destination).
++static long s_r2ct_every = -1, s_r2ct_frame = 0;
++static uint32_t UsedTexMaps();
++static bool R2CopyTraceOn() {
++  if (s_r2ct_every < 0) {
++    const char *e = NWII_ENV("NWII_R2_COPYTRACE");
++    s_r2ct_every = e ? std::max(1L, std::atol(e)) : 0;
++  }
++  return s_r2ct_every && (s_r2ct_frame % s_r2ct_every) == 0;
++}
++static void R2TraceDraw() {
++  const uint32_t tl = g_state.bp[0x20], br = g_state.bp[0x21];
++  int ox, oy;
++  ScissorOffset(ox, oy);
++  printf("[R2CT] D sc=%d,%d,%d,%d tex", (int)((tl >> 12) & 0x7FF) - 342 - ox, (int)(tl & 0x7FF) - 342 - oy,
++         (int)((br >> 12) & 0x7FF) - 342 - ox + 1, (int)(br & 0x7FF) - 342 - oy + 1);
++  const uint32_t used = UsedTexMaps();
++  for (int i = 0; i < 8; ++i)
++    if ((used >> i) & 1) printf(" %08X", g_state.texStages[i].base_addr);
++  printf("\n");
++}
+ static void ClearEfbCopySource() {
+   g_state.pe_clear_pending = false;
+   const uint32_t pf = EfbPixelFormat();
+@@ -2118,6 +2204,35 @@
+     cc[3] = 0;
+   }
+   int w = g_state.efbW, h = g_state.efbH;
++  // r39r2 NWII_R2_CLEARTEX=1: a colour-only clear with the full colour mask
++  // (the animated-tile copies: ~25 a frame) is glClearTexSubImage on the EFB
++  // texture over the same rectangle the scissor would leave, with the clear
++  // colour as RGBA bytes (the EFB is RGBA8: the same bytes glClear writes).
++  // Mesa 20.1 does a scissored glClear as a quad draw that saves and restores
++  // the whole pipeline state; nouveau clears a texture box with the 3D
++  // engine's clear (pipe->clear_texture).
++  {
++    typedef void (*PFNClearTexSub)(GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei,
++                                   GLenum, GLenum, const void *);
++    static PFNClearTexSub s_cts = [] {
++      const char *e = NWII_ENV("NWII_R2_CLEARTEX");
++      if (!(e && e[0] == '1')) return (PFNClearTexSub) nullptr;
++      PFNClearTexSub f = (PFNClearTexSub)GX_GLProc("glClearTexSubImage");
++      printf("[R2] NWII_R2_CLEARTEX=1: glClearTexSubImage %s\n", f ? "on" : "NOT available (glClear)");
++      return f;
++    }();
++    if (s_cts && c && a && !z && !s_legacy && !DrawTraceOn() && !s_r8_pass) {
++      int x0 = SE(g_state.efbSrcX), x1 = SE(g_state.efbSrcX + w);
++      int y0 = s_efb_h - SE(g_state.efbSrcY + h), y1 = s_efb_h - SE(g_state.efbSrcY);
++      x0 = std::max(x0, 0); y0 = std::max(y0, 0);
++      x1 = std::min(x1, s_efb_w); y1 = std::min(y1, s_efb_h);
++      if (x1 > x0 && y1 > y0)
++        s_cts(s_efb_tex, 0, x0, y0, 0, x1 - x0, y1 - y0, 1, GL_RGBA, GL_UNSIGNED_BYTE, cc);
++      R2ClearCheck(true, x0, y0, x1, y1, cc);
++      return;
++    }
++  }
++  R2EfbBack();  // r39r2 NWII_R2_LAZYEFB: glClear clears the draw framebuffer
+   glEnable(GL_SCISSOR_TEST);
+   glScissor(SE(g_state.efbSrcX), s_efb_h - SE(g_state.efbSrcY + h),
+             SE(g_state.efbSrcX + w) - SE(g_state.efbSrcX),
+@@ -2138,6 +2253,14 @@
+   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+   glDepthMask(GL_TRUE);
+   glDisable(GL_SCISSOR_TEST);
++  // r39r2 NWII_R2_COPYST: what this clear left set, in the state cache
++  g_gl.en[kEnScissor] = 0;
++  std::memset(g_gl.sc, 0xFF, sizeof g_gl.sc);
++  g_gl.color_mask = 3;
++  g_gl.depth_mask = 1;
++  if (c && a && !z && !s_legacy)  // r39r2 check (reference path)
++    R2ClearCheck(false, std::max(SE(g_state.efbSrcX), 0), std::max(s_efb_h - SE(g_state.efbSrcY + h), 0),
++                 std::min(SE(g_state.efbSrcX + w), s_efb_w), std::min(s_efb_h - SE(g_state.efbSrcY), s_efb_h), cc);
+ }
+ 
+ // Real EFB copy format: BP 0x52 bits 3-6 hold it rotated (Dolphin
+@@ -2249,8 +2372,32 @@
+ // Set when the renderer changed GL state behind SetupDrawState's back (copy
+ // shader, clears): the next draw re-applies everything.
+ static bool s_gl_state_dirty = true;
++// r39r2 NWII_R2_COPYST=1: EFB copies, clears and XFB copies go through the GL
++// state cache (C* setters) or update it with what they changed, instead of
++// forgetting the whole cache after each copy (GLInvalidate): the first draw
++// after a copy then re-issues only the state that really differs.
++static bool R2CopySt() {
++  static const bool on = [] {
++    const char *e = NWII_ENV("NWII_R2_COPYST");
++    const bool v = e && e[0] == '1';
++    if (v) printf("[R2] NWII_R2_COPYST=1: GL state cache kept across EFB copies\n");
++    return v;
++  }();
++  return on && !s_r8_pass;
++}
++
+ 
+ static inline bool DrawTraceOn();
++}  // namespace nwii::runtime::gx
++namespace nwii { namespace runtime { namespace hle {
++bool r2_copyfbo_on();                       // r39r2 (texture_cache_gl.cpp)
++extern bool g_r2_off_pass;
++GLuint r2_tex_fbo(GLuint tex, GLenum target);
++bool r2_lazynat_on();
++void r2_native_defer(GLuint nat, GLuint src, uint32_t pw, uint32_t ph, uint32_t dw, uint32_t dh);
++void r2_native_made(GLuint nat);
++}}}
++namespace nwii::runtime::gx {
+ static void CopyEfbToTexture(uint32_t val) {
+   uint32_t dest = g_state.efbCopyDest;
+   uint32_t w = g_state.efbW, h = g_state.efbH;
+@@ -2298,11 +2445,29 @@
+     ph = (uint32_t)(SE(g_state.efbSrcY + (int)h) - sy0);
+     if (half) { pw = std::max<uint32_t>(1, pw / 2); ph = std::max<uint32_t>(1, ph / 2); }
+   }
++  uint64_t ct = rph::T();
+   GLuint tex = nwii::runtime::hle::TextureCache::get().acquire_efb_copy(dest, dw, dh, pw, ph);
++  rph::C(rph::cAcq, ct);
+   InitCopyShader();
++  const bool r2fbo = nwii::runtime::hle::r2_copyfbo_on();  // r39r2 NWII_R2_COPYFBO
++  if (r2fbo) {
++    nwii::runtime::hle::r2_tex_fbo(tex, GL_DRAW_FRAMEBUFFER);
++  } else {
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_copy_fbo);
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                          tex, 0);
++  }
++  const bool r2st = R2CopySt();
++  if (r2st) {
++    CViewport(0, 0, pw, ph);
++    CEnable(kEnScissor, GL_SCISSOR_TEST, false);
++    CEnable(kEnBlend, GL_BLEND, false);
++    CEnable(kEnDepth, GL_DEPTH_TEST, false);
++    CEnable(kEnCull, GL_CULL_FACE, false);
++    CEnable(kEnLogic, GL_COLOR_LOGIC_OP, false);
++    CColorMask(true, true);
++    CUseProgram(s_copy_prog);
++  } else {
+   glViewport(0, 0, pw, ph);
+   glDisable(GL_SCISSOR_TEST);
+   glDisable(GL_BLEND);
+@@ -2311,25 +2476,48 @@
+   glDisable(GL_COLOR_LOGIC_OP);
+   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+   glUseProgram(s_copy_prog);
+-  if (down) glUniform3i(s_cp_src, g_state.efbSrcX, g_state.efbSrcY, s_efb_h);
+-  else glUniform3i(s_cp_src, sx0, sy0, s_efb_h);
+-  glUniform1f(s_cp_down, down ? s_scale : 0.0f);
+-  glUniform1i(s_cp_half, half);
+-  glUniform1i(s_cp_fmt, (GLint)fmt);
+-  glUniform1i(s_cp_int, intensity);
+-  glUniform1i(s_cp_alpha, EfbHasAlpha());
+-  glUniform1i(s_cp_efb, 0);
++  }
++  // r39r2 NWII_R2_COPYUNI=1: the copy program keeps its uniforms between
++  // copies; only the ones whose value changed are set (same values).
++  static const bool s_cu_on = [] { const char *e = NWII_ENV("NWII_R2_COPYUNI"); return e && e[0] == '1'; }();
++  static struct { GLint v[8]; float down; bool ok; } s_cu = {{0}, 0.0f, false};
++  {
++    const GLint sx = down ? (GLint)g_state.efbSrcX : sx0, sy = down ? (GLint)g_state.efbSrcY : sy0;
++    const GLint nv[8] = {sx, sy, s_efb_h, (GLint)half, (GLint)fmt, (GLint)intensity, (GLint)EfbHasAlpha(), 0};
++    const float nd = down ? s_scale : 0.0f;
++    const bool all = !s_cu_on || !s_cu.ok;
++    if (all || nv[0] != s_cu.v[0] || nv[1] != s_cu.v[1] || nv[2] != s_cu.v[2]) glUniform3i(s_cp_src, nv[0], nv[1], nv[2]);
++    if (all || nd != s_cu.down) glUniform1f(s_cp_down, nd);
++    if (all || nv[3] != s_cu.v[3]) glUniform1i(s_cp_half, nv[3]);
++    if (all || nv[4] != s_cu.v[4]) glUniform1i(s_cp_fmt, nv[4]);
++    if (all || nv[5] != s_cu.v[5]) glUniform1i(s_cp_int, nv[5]);
++    if (all || nv[6] != s_cu.v[6]) glUniform1i(s_cp_alpha, nv[6]);
++    if (all) glUniform1i(s_cp_efb, 0);
++    std::memcpy(s_cu.v, nv, sizeof nv);
++    s_cu.down = nd;
++    s_cu.ok = true;
++  }
++  if (r2st) {
++    g_gl.unit = -1;  // the texture cache may have moved the active unit (scratch unit)
++    CBindTexture(0, (GLuint)efb_tex);
++    CBindVertexArray(s_copy_vao);
++  } else {
+   glActiveTexture(GL_TEXTURE0);
+   glBindTexture(GL_TEXTURE_2D, (GLuint)efb_tex);
+   glBindVertexArray(s_copy_vao);
++  }
++  rph::C(rph::cSetup, ct);
+   glDrawArrays(GL_TRIANGLES, 0, 3);
+-  glBindTexture(GL_TEXTURE_2D, 0);
++  if (r2st) CBindTexture(0, 0);
++  else glBindTexture(GL_TEXTURE_2D, 0);
++  rph::C(rph::cDraw, ct);
+   // NWII_COPYDUMP=<dir> (with NWII_DRAWTRACE): EFB copies of at least 64x64
+   // made in the traced frames, as <dir>/c<frame>_<dest>.pam (RGBA).
+   if (const char *cd = NWII_ENV("NWII_COPYDUMP")) {
+     if (DrawTraceOn() && dw >= 64 && dh >= 64) {
+       std::vector<unsigned char> px((size_t)pw * ph * 4);
+-      glBindFramebuffer(GL_READ_FRAMEBUFFER, s_copy_fbo);
++      if (r2fbo) nwii::runtime::hle::r2_tex_fbo(tex, GL_READ_FRAMEBUFFER);
++      else glBindFramebuffer(GL_READ_FRAMEBUFFER, s_copy_fbo);
+       glReadPixels(0, 0, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+       char path[512];
+       std::snprintf(path, sizeof path, "%s/c%06ld_%08X.pam", cd, s_xfb_copies + 1, dest);
+@@ -2346,17 +2534,45 @@
+     // 2x2 box; scissor is off and the colour mask fully on here.
+     static GLuint s_native_fbo = 0;
+     if (!s_native_fbo) glGenFramebuffers(1, &s_native_fbo);
+-    if (GLuint nat = nwii::runtime::hle::TextureCache::get().efb_copy_native(dest)) {
++    GLuint nat = nwii::runtime::hle::TextureCache::get().efb_copy_native(dest);
++    if (nat && nwii::runtime::hle::r2_lazynat_on()) {  // r39r2 NWII_R2_LAZYNAT: on demand
++      nwii::runtime::hle::r2_native_defer(nat, tex, pw, ph, dw, dh);
++      nat = 0;
++    } else if (nat) {
++      nwii::runtime::hle::r2_native_made(nat);
++    }
++    if (nat) {
++      if (r2fbo) {
++        nwii::runtime::hle::r2_tex_fbo(tex, GL_READ_FRAMEBUFFER);
++        nwii::runtime::hle::r2_tex_fbo(nat, GL_DRAW_FRAMEBUFFER);
++      } else {
+       glBindFramebuffer(GL_READ_FRAMEBUFFER, s_copy_fbo);
+       glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_native_fbo);
+       glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, nat, 0);
++      }
+       glBlitFramebuffer(0, 0, pw, ph, 0, 0, dw, dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+     }
+   }
+-  glBindFramebuffer(GL_FRAMEBUFFER, efb);
++  static const bool s_lazyefb = [] {
++    const char *e = NWII_ENV("NWII_R2_LAZYEFB");
++    const bool v = e && e[0] == '1';
++    if (v) printf("[R2] NWII_R2_LAZYEFB=1: EFB rebound as draw target on demand after copies\n");
++    return v;
++  }();
++  if (s_lazyefb && !s_r8_pass && !DrawTraceOn()) {
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, efb);
++    s_r2_efb_fbo_ref = efb;
++    s_r2_efb_off = true;
++  } else {
++    glBindFramebuffer(GL_FRAMEBUFFER, efb);
++    s_r2_efb_off = false;
++  }
+   s_gl_state_dirty = true;
++  rph::C(rph::cBack, ct);
+   nwii::runtime::hle::TextureCache::get().efb_copy_done(
+       g_ctx_ptr, dest, dw, dh, fmt, (g_state.bp[0x4D] & 0x3FF) << 5);
++  rph::C(rph::cDone, ct);
++  if (rph::On()) ++rph::s_ncopy;
+ }
+ 
+ static void ApplyCullMode() {
+@@ -2640,6 +2856,16 @@
+ static uint64_t s_batch_key = 0;
+ static bool s_state_dirty = true;
+ static GLuint s_draw_tex[8];
++// r39r2 NWII_R2_TEXMEMO (see DrawPrimitive): texture lookups remembered while
++// s_r2_tm_epoch stays (bumped at frame start, EFB copies/clears, TLUT loads and
++// any lookup that made the texture cache upload or stitch).
++struct R2TexMemo { uint32_t addr, w, h; uint8_t fmt; uint32_t toff; uint8_t tfmt; uint64_t epoch; GLuint tex; };
++static R2TexMemo s_r2_tm[32];
++static uint64_t s_r2_tm_epoch = 1, s_r2_tm_hits = 0, s_r2_tm_miss = 0;
++static bool s_r2_texmemo_on = false;
++static inline uint32_t R2TmSlot(const TexStage &st) {
++  return ((st.base_addr >> 5) ^ (st.base_addr >> 11) ^ st.width ^ (st.height << 3) ^ st.format ^ (st.tlut_offset >> 9)) & 31;
++}
+ static uint32_t s_draw_used = 0;
+ 
+ static inline uint64_t KeyMix(uint64_t h, uint32_t w) {
+@@ -2654,6 +2880,26 @@
+ // the two). Reset by DrawPrimitive after use.
+ static bool s_shader_hash_ok = false;
+ static uint64_t s_shader_hash = 0;
++// r39r2 NWII_R2_KEYSTAT=1 (debug): per key change, which parts of the batch key
++// changed from the previous batch ([R2KEY] every 300 frames).
++static bool s_r2ks_on = false;
++static uint64_t s_r2ks_part[10], s_r2ks_prev[10], s_r2ks_cnt[10], s_r2ks_n = 0, s_r2ks_frames = 0;
++static void R2KeyStat(const uint64_t *part) {
++  ++s_r2ks_n;
++  for (int i = 0; i < 10; ++i)
++    if (part[i] != s_r2ks_prev[i]) ++s_r2ks_cnt[i];
++  std::memcpy(s_r2ks_prev, part, sizeof s_r2ks_prev);
++}
++static void R2KeyStatFrame() {
++  if (!s_r2ks_on || ++s_r2ks_frames % 300) return;
++  static const char *const nm[10] = {"shader", "cull", "scissor", "tex", "texmode", "xfchan", "viewport",
++                                     "proj", "lights", "tevregs"};
++  printf("[R2KEY] per frame: keychg=%.1f |", s_r2ks_n / 300.0);
++  for (int i = 0; i < 10; ++i) printf(" %s=%.1f", nm[i], s_r2ks_cnt[i] / 300.0);
++  printf("\n");
++  s_r2ks_n = 0;
++  std::memset(s_r2ks_cnt, 0, sizeof s_r2ks_cnt);
++}
+ static uint64_t DrawKey() {
+   uint64_t h = g_state.GetShaderHash(0);
+   s_shader_hash = h;
+@@ -2690,6 +2936,25 @@
+       h = KeyMix(h, g_state.tevColorReg[i][j]);
+       h = KeyMix(h, g_state.tevKonstReg[i][j]);
+     }
++  if (s_r2ks_on) {  // r39r2 debug: the same parts, hashed one by one
++    uint64_t pt[10] = {};
++    pt[0] = s_shader_hash;
++    pt[1] = g_state.cullMode;
++    pt[2] = KeyMix(KeyMix(g_state.bp[0x20], g_state.bp[0x21]), g_state.bp[0x59]);
++    for (int i = 0; i < 8; ++i) {
++      if (!((s_draw_used >> i) & 1)) continue;
++      pt[3] = KeyMix(pt[3], s_draw_tex[i]);
++      pt[4] = KeyMix(pt[4], g_state.bp[(i < 4 ? 0x80 : 0xA0) + (i & 3)] & 0xFF);
++    }
++    for (int a = 0x0A; a <= 0x11; ++a) pt[5] = KeyMix(pt[5], g_state.xf[a]);
++    for (int a = 0x1A; a <= 0x1F; ++a) pt[6] = KeyMix(pt[6], g_state.xf[a]);
++    for (int i = 0; i < 7; ++i) { uint32_t w; std::memcpy(&w, &g_state.projection[i], 4); pt[7] = KeyMix(pt[7], w); }
++    for (int l = 0; l < 8; ++l)
++      for (int k = 3; k < 16; ++k) { uint32_t w; std::memcpy(&w, &g_state.lights[l][k], 4); pt[8] = KeyMix(pt[8], w); }
++    for (int i = 0; i < 4; ++i)
++      for (int j = 0; j < 2; ++j) pt[9] = KeyMix(KeyMix(pt[9], g_state.tevColorReg[i][j]), g_state.tevKonstReg[i][j]);
++    std::memcpy(s_r2ks_part, pt, sizeof pt);
++  }
+   // Indirect matrices/scales and texcoord scales (uniforms of indirect
+   // shaders), plus the map sizes they divide by.
+   bool ind = (g_state.bp[0x00] >> 16) & 7;
+@@ -2950,9 +3215,28 @@
+       s_draw_tex[i] = 0;
+       const auto &stage = g_state.texStages[i];
+       if (((s_draw_used >> i) & 1) && g_ctx_ptr && stage.base_addr != 0 &&
+-          stage.width > 0 && stage.height > 0)
+-        s_draw_tex[i] =
+-            nwii::runtime::hle::TextureCache::get().get_texture(*g_ctx_ptr, stage);
++          stage.width > 0 && stage.height > 0) {
++        // r39r2 NWII_R2_TEXMEMO=1: within a stretch with no EFB copy, TLUT
++        // load or texture-cache upload/stitch, the same map parameters give
++        // the same texture: remembered instead of looked up again.
++        R2TexMemo *m = (s_r2_texmemo_on && !s_r8_pass) ? &s_r2_tm[R2TmSlot(stage)] : nullptr;
++        if (m && m->epoch == s_r2_tm_epoch && m->addr == stage.base_addr && m->w == stage.width &&
++            m->h == stage.height && m->fmt == stage.format && m->toff == stage.tlut_offset &&
++            m->tfmt == stage.tlut_format) {
++          s_draw_tex[i] = m->tex;
++          ++s_r2_tm_hits;
++        } else {
++          auto &tc = nwii::runtime::hle::TextureCache::get();
++          const uint64_t t0 = tc.gl_touches();
++          s_draw_tex[i] = tc.get_texture(*g_ctx_ptr, stage);
++          if (m) {
++            if (tc.gl_touches() != t0) ++s_r2_tm_epoch;  // it uploaded or stitched: forget the rest
++            *m = R2TexMemo{stage.base_addr, stage.width, stage.height, stage.format, stage.tlut_offset,
++                           stage.tlut_format, s_r2_tm_epoch, s_draw_tex[i]};
++            ++s_r2_tm_miss;
++          }
++        }
++      }
+     }
+     rph::Set(rph::kState);
+     // get_texture binds only on its own unit (kScratchUnit), never on 0-7, so
+@@ -2988,6 +3272,7 @@
+     if (s_batch_open && key == s_batch_key) s_shader_hash_ok = false;
+     if (!s_batch_open || key != s_batch_key) {
+       if (rph::On()) ++rph::s_keychg;
++      if (s_r2ks_on) R2KeyStat(s_r2ks_part);
+       FlushBatch();
+       for (int i = 0; i < 8; ++i) {
+         if (!((s_draw_used >> i) & 1) || !s_draw_tex[i]) continue;
+@@ -4096,6 +4381,7 @@
+ static PFNDrawElementsInstancedBaseInstance s_draw_bi = nullptr;
+ static bool s_baseinst = false;
+ static int s_base_mode = 0;  // 0 uniform, 1 gl_BaseInstanceARB, 2 instanced attribute
++static bool s_r2_xdubo = false;  // r39r2 NWII_R2_XDUBO: uniform mode, the base in a uniform block
+ static GLuint s_iota = 0;    // mode 2: element i = kArenaUnits + i
+ // The base instance of draw entry unit `du` (always in the ring).
+ static inline GLuint BaseOf(uint64_t du) {
+@@ -4799,7 +5085,17 @@
+     }
+     printf("[GPUXF] multi-draw indirect: %s\n", s_mdi ? "on (static display-list indices)" : why_m);
+   }
+-  s_vs = new std::string(GenerateVertexShaderXF(variant, false, s_base_mode));
++  if (!s_base_mode) {  // r39r2 NWII_R2_XDUBO
++    const char *xe = NWII_ENV("NWII_R2_XDUBO");
++    if (xe && xe[0] == '1') {
++      GLint al = 0;
++      glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &al);
++      s_r2_xdubo = al > 0 && al <= 256;
++      printf("[R2] NWII_R2_XDUBO=1: draw base in a uniform block (offset alignment %d)%s\n", al,
++             s_r2_xdubo ? "" : ": NOT used");
++    }
++  }
++  s_vs = new std::string(GenerateVertexShaderXF(variant, false, s_r2_xdubo ? 3 : s_base_mode));
+   // (Linked mode: the vertex shader compiles with the first program; check it
+   // now so a driver that rejects it keeps the CPU path.)
+   if (GLuint t = CompileVs(*s_vs, true)) {
+@@ -4813,6 +5109,12 @@
+     printf("[GPUXF] draw base: uniform uXDraw (base-instance shader rejected)\n");
+     if (GLuint t2 = CompileVs(*s_vs, true)) glDeleteShader(t2);
+     else { printf("[GPUXF] off: vertex shader rejected\n"); return; }
++  } else if (s_r2_xdubo) {  // r39r2: back to the uniform
++    s_r2_xdubo = false;
++    *s_vs = GenerateVertexShaderXF(variant, false, 0);
++    printf("[R2] NWII_R2_XDUBO: vertex shader rejected, uniform uXDraw\n");
++    if (GLuint t2 = CompileVs(*s_vs, true)) glDeleteShader(t2);
++    else { printf("[GPUXF] off: vertex shader rejected\n"); return; }
+   } else {
+     printf("[GPUXF] off: vertex shader rejected\n");
+     return;
+@@ -5479,7 +5781,14 @@
+     rph::s_idx += s_batch_idx.size();
+     rph::s_bytes += (uint64_t)nd * 16 + ib;
+   }
+-  if (!s_baseinst) {
++  if (s_r2_xdubo) {
++    // r39r2 NWII_R2_XDUBO: 16 bytes in the ring, 256-aligned, bound as block 1
++    const uint64_t ub = Alloc(32);
++    const size_t off = ((size_t)ub * 16 + 255) & ~(size_t)255;
++    const int32_t v[4] = {(int32_t)du, 0, 0, 0};
++    std::memcpy(s_map + off, v, sizeof v);
++    glBindBufferRange(GL_UNIFORM_BUFFER, 1, s_buf, (GLintptr)off, 16);
++  } else if (!s_baseinst) {
+     GLShader &vsh = sso::s_on ? sso::Vsh(true) : *s_active;
+     if (vsh.uXDraw >= 0) {
+       if (sso::s_on) sso::pU1i(vsh.id, vsh.uXDraw, (GLint)du);
+@@ -5969,8 +6278,10 @@
+       const bool vb = vbuf::s_on;
+       if (r8) vbuf::s_on = false;
+       s_r8_pass = r8;
++      nwii::runtime::hle::g_r2_off_pass = r8;  // r39r2: the r8 pass also takes the old copy/clear paths
+       RenderOnce(commands);
+       s_r8_pass = false;
++      nwii::runtime::hle::g_r2_off_pass = false;
+       vbuf::s_on = vb;
+       s_xfb_copies = copies1;
+     };
+@@ -6030,7 +6341,20 @@
+ 
+   void RenderOnce(const std::vector<GXCommand> &commands) {
+     static bool s_flags = false;
+-    if (!s_flags) { s_flags = true; InitFlags(); }
++    if (!s_flags) {
++      s_flags = true; InitFlags(); R2CopyTraceOn(); s_r2ks_on = NWII_ENV("NWII_R2_KEYSTAT") != nullptr;
++      const char *tm = NWII_ENV("NWII_R2_TEXMEMO");
++      s_r2_texmemo_on = tm && tm[0] == '1';
++      if (s_r2_texmemo_on) printf("[R2] NWII_R2_TEXMEMO=1: texture lookups remembered between copies\n");
++    }
++    ++s_r2_tm_epoch;  // r39r2 NWII_R2_TEXMEMO
++    if (s_r2_texmemo_on && (s_r2ct_frame % 600) == 0 && s_r2_tm_hits + s_r2_tm_miss) {
++      printf("[R2TM] texture lookups: remembered %llu, looked up %llu\n", (unsigned long long)s_r2_tm_hits,
++             (unsigned long long)s_r2_tm_miss);
++      s_r2_tm_hits = s_r2_tm_miss = 0;
++    }
++    R2KeyStatFrame();
++    ++s_r2ct_frame;
+     rph::Set(rph::kFrame);
+     // The frontend binds the EFB before every drain; read it (and its
+     // colour texture) once.
+@@ -6134,6 +6458,13 @@
+       }
+       if (rph::On())
+         rph::Set(cmd.type == GXCommandType::DrawPrimitive ? rph::kState : rph::kRegs);
++      if (s_r2_efb_off && cmd.type == GXCommandType::DrawPrimitive) R2EfbBack();  // r39r2 NWII_R2_LAZYEFB
++      if (s_r2ct_every && R2CopyTraceOn()) {  // r39r2 debug
++        if (cmd.type == GXCommandType::DrawPrimitive) R2TraceDraw();
++        else if (cmd.type == GXCommandType::BPRegister && (uint8_t)cmd.reg == 0x52)
++          printf("[R2CT] C src=%u,%u %ux%u dest=%08X clear=%d xfb=%d\n", g_state.efbSrcX, g_state.efbSrcY,
++                 g_state.efbW, g_state.efbH, g_state.efbCopyDest, (cmd.val >> 11) & 1, (cmd.val >> 14) & 1);
++      }
+       if (s_nobatch && cmd.type != GXCommandType::DrawPrimitive && s_batch_open) {
+         FlushBatch();
+         s_batch_open = false;
+@@ -6230,6 +6561,7 @@
+         }
+       } else if (cmd.type == GXCommandType::BPRegister) {
+         const uint8_t reg = (uint8_t)cmd.reg;
++        if (reg == 0x52 || reg == 0x64 || reg == 0x65) ++s_r2_tm_epoch;  // r39r2 NWII_R2_TEXMEMO
+         if (reg == 0x52) {
+           rph::Set(rph::kCopy);
+           // EFB copies and clears read/write the framebuffer: everything
+@@ -6295,23 +6627,37 @@
+             g_res_gpu.Copy(xfb ? "XFB" : (cmd.val & 0x800) ? "TEX+clear" : "TEX", cw, ch,
+                            hf && !xfb ? gw / 2 : gw, hf && !xfb ? gh / 2 : gh, hf);
+           }
++          uint64_t ct52 = rph::T();
+           if (cmd.val & 0x4000) {
+             if (cmd.stale_copy)
+               ++s_xfb_copies;  // keeps the dump numbering in guest frames
+-            else
++            else {
+               CopyEfbToXfb();
++              rph::C(rph::cXfb, ct52);
++              if (rph::On()) ++rph::s_nxfb;
++            }
+           } else if (!cmd.stale_copy) {
+             // EFB copy WITHOUT bit14 = copy to a texture in guest RAM, kept
+             // as a GL texture keyed by the destination address
+             // (render-to-texture: light maps, animated tiles, previews).
+             CopyEfbToTexture(cmd.val);
+           }
+-          if (cmd.val & 0x800)
++          if (cmd.val & 0x800) {
++            ct52 = rph::T();
+             ClearEfbCopySource();
++            rph::C(rph::cClear, ct52);
++            if (rph::On()) ++rph::s_nclear;
++          }
++          rph::s_after = rph::On();
+           if (DrawTraceOn()) PixWatch("copy");
++          if (ResGpuProf::On()) R2EfbBack();  // r39r2 (debug profiler)
+           if (ResGpuProf::On() && !cmd.stale_copy) g_res_gpu.AfterCopy();
+           // Copies and clears changed GL state behind the cache.
+-          GLInvalidate();
++          // r39r2 NWII_R2_COPYST: they kept the cache up to date instead.
++          if (!R2CopySt() || s_r2_full_inval || ResGpuProf::On() || DrawTraceOn() ||
++              NWII_ENV("NWII_COPYDUMP"))
++            GLInvalidate();
++          s_r2_full_inval = false;
+           s_state_dirty = true;
+         }
+       } else if (cmd.type == GXCommandType::DrawPrimitive) {
+@@ -6375,6 +6721,7 @@
+     }
+     }  // r36r: pass (prefix, frame)
+     rph::Set(rph::kFrame);
++    R2EfbBack();  // r39r2 NWII_R2_LAZYEFB
+     if (s_batch_open) {
+       FlushBatch();
+       s_batch_open = false;
+diff --color -ruN r41m/nWiiRuntime/src/hle/gx.cpp r41m/nWiiRuntime_m6b/src/hle/gx.cpp
+--- r41m/nWiiRuntime/src/hle/gx.cpp	2026-11-15 14:01:36.337212689 -0500
++++ r41m/nWiiRuntime_m6b/src/hle/gx.cpp	2026-11-15 14:46:23.847965403 -0500
+@@ -1040,6 +1040,7 @@
+ std::condition_variable s_cv_worker, s_cv_main;
+ FramePacket s_pkts[2];
+ FramePacket *s_ready = nullptr, *s_rendering = nullptr;
++FramePacket *s_late_pkt = nullptr;  // r39r2 NWII_R2_LATEFREE (render thread only)
+ bool s_stop = false;
+ std::atomic<bool> s_worker_on{false};
+ thread_local bool t_on_worker = false;
+@@ -2428,12 +2429,59 @@
+ #endif
+ }
+ 
++namespace nwii::runtime::hle { bool r2_prehash_idle(bool (*more)()); bool r2_prehash_pending(); }  // r39r2 (texture_cache_gl.cpp)
++static bool R2FrameWaiting() {
++    std::lock_guard<std::mutex> lk(s_pm);
++    return s_ready != nullptr;
++}
+ void ProcessGXFifo() {
+     static const bool worker = [] {
+         if (WorkerWanted()) StartWorker();
+         return s_worker_on.load();
+     }();
+     if (worker) {
++        // r39r2 NWII_R2_LATEFREE=1: the commands of the frame drawn last are
++        // freed here, on the next call (after the buffer swap), and only while
++        // no new frame waits; else the packet goes back to the worker, which
++        // frees them when it reuses it (as without NWII_RENDER_FREE). Before,
++        // the render thread freed them between Render() and the swap (0,5-1 ms
++        // in desierto/agua/cielo). The packet stays s_rendering meanwhile, so
++        // the worker never fills it.
++        if (s_late_pkt) {
++            FramePacket *q = s_late_pkt;
++            s_late_pkt = nullptr;
++            bool waiting;
++            {
++                std::lock_guard<std::mutex> lk(s_pm);
++                waiting = s_ready != nullptr;
++            }
++            if (!waiting) {
++                const int64_t f0 = PipeNow();
++                auto &fr = q->frame;
++                bool stopped = false;
++                while (!fr.empty()) {
++                    const size_t k = std::min<size_t>(fr.size(), 2048);
++                    fr.erase(fr.end() - (ptrdiff_t)k, fr.end());
++                    if (fr.empty()) break;
++                    std::lock_guard<std::mutex> lk(s_pm);
++                    if (s_ready) { stopped = true; break; }
++                }
++                if (!stopped) {
++                    q->draws.clear();
++                    q->entries.clear();
++                    q->pack.clear();
++                    q->pre.clear();
++                }
++                wprof::s_rfree.fetch_add(1, std::memory_order_relaxed);
++                wprof::s_rfree_ns.fetch_add((uint64_t)(PipeNow() - f0), std::memory_order_relaxed);
++            }
++            std::lock_guard<std::mutex> lk(s_pm);
++            if (s_rendering == q) s_rendering = nullptr;  // the worker frees what is left
++        }
++        // r39r2 NWII_R2_PREHASH: idle (no frame waiting): hash the RAM ranges the
++        // next frame will need (texture_cache_gl.cpp).
++        if (nwii::runtime::hle::r2_prehash_pending() && !R2FrameWaiting())
++            nwii::runtime::hle::r2_prehash_idle(R2FrameWaiting);
+         FramePacket *p;
+         {
+             std::lock_guard<std::mutex> lk(s_pm);
+@@ -2465,6 +2513,24 @@
+                 return !(e && e[0] == '0');
+             }();
+             bool free_here = false;
++            static const bool s_latefree = [] {
++                const char *e = NWII_ENV("NWII_R2_LATEFREE");
++                const bool on = e && e[0] == '1';
++                if (on) std::printf("[R2] NWII_R2_LATEFREE=1: commands freed after the swap\n");
++                return on;
++            }();
++            if (s_latefree && s_rfree_on && p->render_frees) {
++                // r39r2: keep the packet (s_rendering) and free it on the next call
++                const int64_t d = PipeNow() - t0;
++                ++s_pipe_r_n;
++                const uint64_t w = p->t_ready && t0 > p->t_ready ? (uint64_t)(t0 - p->t_ready) : 0;
++                s_pipe_r_wait += w;
++                s_pipe_r_draw += (uint64_t)d;
++                s_pipe_r_wait_max = std::max(s_pipe_r_wait_max, w);
++                s_pipe_r_draw_max = std::max(s_pipe_r_draw_max, (uint64_t)d);
++                s_late_pkt = p;
++                return;
++            }
+             if (s_rfree_on && p->render_frees) {
+                 std::lock_guard<std::mutex> lk(s_pm);
+                 free_here = s_ready == nullptr;
+diff --color -ruN r41m/nWiiRuntime/src/hle/texture_cache_gl.cpp r41m/nWiiRuntime_m6b/src/hle/texture_cache_gl.cpp
+--- r41m/nWiiRuntime/src/hle/texture_cache_gl.cpp	2026-11-12 04:05:59.568541649 -0500
++++ r41m/nWiiRuntime_m6b/src/hle/texture_cache_gl.cpp	2026-11-15 14:46:23.848808413 -0500
+@@ -6,6 +6,7 @@
+ #include <algorithm>
+ #include <cstdlib>
+ #include <unordered_map>
++#include <chrono>
+ #include <vector>
+ 
+ // GX texture decoding, kept bit-exact with Dolphin's TextureDecoder:
+@@ -23,6 +24,106 @@
+ uint64_t g_prof_tex_uploads = 0;  // [RPROF]: textures decoded + uploaded
+ namespace nwii::runtime::hle {
+ 
++// r39r2 NWII_R2_COPYFBO=1: one framebuffer object per texture that EFB copies
++// are drawn into or read from (copy destinations, their native-size
++// downsamples, stitch sources), instead of re-attaching the texture to one
++// shared framebuffer for every copy (Mesa 20.1: a new renderbuffer wrapper, a
++// new pipe surface and a completeness check each time). Every texture this
++// cache deletes drops its framebuffer first (r2_del_tex), so a reused texture
++// name never finds a stale one.
++static std::unordered_map<GLuint, GLuint> s_r2_fbo;
++bool g_r2_off_pass = false;  // r39r2: set by the renderer during the r8 pass of NWII_R9_FRAMECHECK
++bool r2_copyfbo_on() {
++    if (g_r2_off_pass) return false;
++    static const bool on = [] {
++        const char* e = std::getenv("NWII_R2_COPYFBO");
++        const bool v = e && *e == '1';
++        if (v) printf("[R2] NWII_R2_COPYFBO=1: one framebuffer per EFB-copy texture\n");
++        return v;
++    }();
++    return on;
++}
++// Binds (to `target`) the framebuffer whose colour 0 is `tex`, made on first use.
++GLuint r2_tex_fbo(GLuint tex, GLenum target) {
++    auto it = s_r2_fbo.find(tex);
++    if (it != s_r2_fbo.end()) {
++        glBindFramebuffer(target, it->second);
++        return it->second;
++    }
++    GLuint f = 0;
++    glGenFramebuffers(1, &f);
++    glBindFramebuffer(target, f);
++    glFramebufferTexture2D(target, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
++    s_r2_fbo.emplace(tex, f);
++    return f;
++}
++// r39r2 NWII_R2_LAZYNAT=1: the native-size downsample of a scaled EFB copy is
++// only read when the copy is stitched into a RAM-decoded texture; the renderer
++// used to make it after every scaled copy (~27 a frame in the desert, never
++// stitched). With the switch it records here what the blit would be and the
++// blit runs only if a stitch reads that downsample, from the same scaled
++// texture, which nothing changed meanwhile (a new copy into that texture
++// first forgets the record, see r2_native_forget_src).
++struct R2LazyNat { GLuint src; uint32_t pw, ph, dw, dh; };
++static std::unordered_map<GLuint, R2LazyNat> s_r2_lazy;  // native texture -> pending blit
++bool r2_lazynat_on() {
++    if (g_r2_off_pass) return false;
++    static const bool on = [] {
++        const char* e = std::getenv("NWII_R2_LAZYNAT");
++        const bool v = e && *e == '1';
++        if (v) printf("[R2] NWII_R2_LAZYNAT=1: native downsample of scaled EFB copies on demand\n");
++        return v;
++    }();
++    return on;
++}
++GLuint r2_tex_fbo(GLuint tex, GLenum target);
++// The renderer made a scaled copy into `src` whose downsample would go to `nat`: record it
++// (a later copy into the same pair replaces the record, as it replaced the downsample).
++void r2_native_defer(GLuint nat, GLuint src, uint32_t pw, uint32_t ph, uint32_t dw, uint32_t dh) {
++    for (auto it = s_r2_lazy.begin(); it != s_r2_lazy.end();)
++        if (it->second.src == src && it->first != nat) it = s_r2_lazy.erase(it); else ++it;
++    s_r2_lazy[nat] = R2LazyNat{src, pw, ph, dw, dh};
++}
++// The renderer made the downsample into `nat` itself: nothing pending for it.
++void r2_native_made(GLuint nat) {
++    if (!s_r2_lazy.empty()) s_r2_lazy.erase(nat);
++}
++// Runs the pending blit into `nat` (if any): the same glBlitFramebuffer the renderer made
++// right after the copy (scissor off, colour mask full), then the EFB back as both targets.
++static void r2_native_resolve(GLuint nat, GLuint restore_fbo) {
++    if (s_r2_lazy.empty()) return;
++    auto it = s_r2_lazy.find(nat);
++    if (it == s_r2_lazy.end()) return;
++    const R2LazyNat z = it->second;
++    s_r2_lazy.erase(it);
++    const GLboolean sc = glIsEnabled(GL_SCISSOR_TEST);
++    GLboolean cm[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
++    glGetBooleanv(GL_COLOR_WRITEMASK, cm);
++    const bool full = cm[0] && cm[1] && cm[2] && cm[3];
++    if (sc) glDisable(GL_SCISSOR_TEST);
++    if (!full) glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    r2_tex_fbo(z.src, GL_READ_FRAMEBUFFER);
++    r2_tex_fbo(nat, GL_DRAW_FRAMEBUFFER);
++    glBlitFramebuffer(0, 0, z.pw, z.ph, 0, 0, z.dw, z.dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
++    glBindFramebuffer(GL_FRAMEBUFFER, restore_fbo);
++    if (!full) glColorMask(cm[0], cm[1], cm[2], cm[3]);
++    if (sc) glEnable(GL_SCISSOR_TEST);
++}
++static void r2_del_tex(GLsizei n, const GLuint* t) {
++    if (!s_r2_lazy.empty())
++        for (GLsizei i = 0; i < n; ++i)
++            for (auto it = s_r2_lazy.begin(); it != s_r2_lazy.end();)
++                if (it->first == t[i] || it->second.src == t[i]) it = s_r2_lazy.erase(it); else ++it;
++    if (!s_r2_fbo.empty())
++        for (GLsizei i = 0; i < n; ++i) {
++            auto it = s_r2_fbo.find(t[i]);
++            if (it == s_r2_fbo.end()) continue;
++            glDeleteFramebuffers(1, &it->second);  // never bound here (copies rebind the EFB)
++            s_r2_fbo.erase(it);
++        }
++    glDeleteTextures(n, t);
++}
++
+ TextureCache& TextureCache::get() {
+     static TextureCache instance;
+     return instance;
+@@ -54,7 +155,7 @@
+ 
+ void TextureCache::clear() {
+     for (auto& pair : cache)
+-        glDeleteTextures(1, &pair.second.tex);
++        r2_del_tex(1, &pair.second.tex);
+     cache.clear();
+     by_addr_.clear();
+     // EFB copies survive: the renderer refills them every copy.
+@@ -154,7 +255,78 @@
+ // (same words as before) instead of one serial chain, so the multiplies of
+ // four samples overlap (the serial chain was ~5 cycles per word on the A57);
+ // the value differs from the r13 one, which nothing stored keeps.
+-static uint32_t hash_ram(CPUContext* ctx, uint32_t addr, uint32_t size) {
++// r39r2: with NWII_RPHASE, time spent in hash_ram by caller (0 tex, 1 efb_get, 2 efb_done),
++// in [TCSTAT3] every 600 frames.
++static uint64_t st_r2_hash_t[3] = {0, 0, 0};
++static inline uint64_t r2_now() {
++#if defined(__SWITCH__)
++    uint64_t v; asm volatile("mrs %0, cntpct_el0" : "=r"(v)); return v;
++#else
++    return (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
++#endif
++}
++static inline bool r2_ht_on() { static const bool on = std::getenv("NWII_RPHASE") != nullptr; return on; }
++static uint32_t hash_ram_(CPUContext* ctx, uint32_t addr, uint32_t size);
++static inline uint32_t hash_ram(CPUContext* ctx, uint32_t addr, uint32_t size, int who) {
++    if (!r2_ht_on()) return hash_ram_(ctx, addr, size);
++    const uint64_t t0 = r2_now();
++    const uint32_t h = hash_ram_(ctx, addr, size);
++    st_r2_hash_t[who] += r2_now() - t0;
++    return h;
++}
++static uint32_t hash_ram_(CPUContext* ctx, uint32_t addr, uint32_t size);
++// r39r2 NWII_R2_PREHASH=1: the RAM hashes a frame needs (texel data of the
++// textures it samples, destinations of its EFB copies) are computed in the
++// render thread's idle time before the frame (after the swap, while no new
++// frame waits: ProcessGXFifo -> r2_prehash_idle), for the ranges the previous
++// frame used; the frame then takes them instead of hashing inline. Same
++// function, same ranges; the RAM is read a little earlier (the render thread
++// reads guest RAM at no fixed point of the guest's timeline either way).
++struct R2Pre { uint32_t hash; uint64_t frame; };
++static std::unordered_map<uint64_t, R2Pre> s_r2_pre;           // (addr << 32 | size) -> hash for frame
++static std::vector<std::pair<uint32_t, uint32_t>> s_r2_todo;  // ranges to hash for frame s_r2_todo_frame
++static uint64_t s_r2_todo_frame = 0;
++static size_t s_r2_todo_i = 0;
++static CPUContext* s_r2_ctx = nullptr;
++static uint64_t st_r2_pre_hit = 0, st_r2_pre_done = 0, st_r2_pre_chk = 0, st_r2_pre_bad = 0;
++static bool r2_prehash_on() {
++    static const bool on = [] {
++        const char* e = std::getenv("NWII_R2_PREHASH");
++        const bool v = e && *e == '1';
++        if (v) printf("[R2] NWII_R2_PREHASH=1: RAM hashes of the next frame in the render thread's idle time\n");
++        return v;
++    }();
++    return on;
++}
++static inline bool r2_pre_take(uint32_t addr, uint32_t size, uint64_t frame, uint32_t& h) {
++    if (s_r2_pre.empty()) return false;
++    auto it = s_r2_pre.find(((uint64_t)addr << 32) | size);
++    if (it == s_r2_pre.end() || it->second.frame != frame) return false;
++    h = it->second.hash;
++    ++st_r2_pre_hit;
++    // NWII_R2_PREHASH_CHECK=1: hash inline too and count differences (RAM written
++    // between the idle hash and this use, or a wrong range).
++    static const bool chk = std::getenv("NWII_R2_PREHASH_CHECK") != nullptr;
++    if (chk && s_r2_ctx) {
++        ++st_r2_pre_chk;
++        if (hash_ram_(s_r2_ctx, addr, size) != h) ++st_r2_pre_bad;
++    }
++    return true;
++}
++// Called by the render thread while it has nothing to draw; stops as soon as
++// more() says a frame is waiting. Returns true when all is done.
++bool r2_prehash_pending() { return s_r2_todo_i < s_r2_todo.size(); }
++bool r2_prehash_idle(bool (*more)()) {
++    if (!s_r2_ctx || s_r2_todo_i >= s_r2_todo.size()) return true;
++    while (s_r2_todo_i < s_r2_todo.size()) {
++        const auto r = s_r2_todo[s_r2_todo_i++];
++        s_r2_pre[((uint64_t)r.first << 32) | r.second] = R2Pre{hash_ram_(s_r2_ctx, r.first, r.second), s_r2_todo_frame};
++        ++st_r2_pre_done;
++        if (more()) return false;  // (one hash is at most ~0.1 ms on the Switch)
++    }
++    return true;
++}
++static uint32_t hash_ram_(CPUContext* ctx, uint32_t addr, uint32_t size) {
+     uint32_t hash = 2166136261u;
+     if (!ctx || !size) return hash;
+     const uint8_t* p = ctx->mmu.get_ptr(addr);
+@@ -163,6 +335,30 @@
+     uint32_t h0 = 2166136261u, h1 = 0x01000193u, h2 = 0x9E3779B9u, h3 = 0x85EBCA6Bu;
+     uint32_t off = 0;
+     uint64_t words = 0;
++    // r39r2 NWII_R2_HASHPF=1: prefetch the samples 4 iterations ahead (same
++    // words, same order, same value). On the Switch each sample of a big range
++    // is its own cache line (DRAM latency): ~1 ms a frame in the desert.
++    static const bool s_pf = [] { const char* e = std::getenv("NWII_R2_HASHPF"); return e && *e == '1'; }();
++    if (s_pf) {
++        const uint32_t ahead = 16 * stride;
++        for (; off + 3 * stride + 4 <= size; off += 4 * stride) {
++            const uint8_t* q = p + off + ahead;
++            __builtin_prefetch(q);
++            __builtin_prefetch(q + stride);
++            __builtin_prefetch(q + 2 * stride);
++            __builtin_prefetch(q + 3 * stride);
++            uint32_t w0, w1, w2, w3;
++            std::memcpy(&w0, p + off, 4);
++            std::memcpy(&w1, p + off + stride, 4);
++            std::memcpy(&w2, p + off + 2 * stride, 4);
++            std::memcpy(&w3, p + off + 3 * stride, 4);
++            h0 = (h0 ^ w0) * 16777619u;
++            h1 = (h1 ^ w1) * 16777619u;
++            h2 = (h2 ^ w2) * 16777619u;
++            h3 = (h3 ^ w3) * 16777619u;
++            words += 4;
++        }
++    }
+     for (; off + 3 * stride + 4 <= size; off += 4 * stride) {
+         uint32_t w0, w1, w2, w3;
+         std::memcpy(&w0, p + off, 4);
+@@ -203,7 +399,7 @@
+         // R14 R5: memoised for the frame, as the texel hash below.
+         EfbCopy& cp = ec->second;
+         if (cp.seen_frame != frame_) {
+-            cp.seen_hash = hash_ram(&ctx, addr, cp.bytes);
++            cp.seen_hash = hash_ram(&ctx, addr, cp.bytes, 1);
+             cp.seen_frame = frame_;
+             ++st_hash_efb_get;
+         }
+@@ -225,7 +421,10 @@
+ 
+     // Texel hash, memoised for the frame (the 8 maps are looked up per batch).
+     if (e.data_frame != frame_) {
+-        e.data_hash = hash_ram(&ctx, addr, size);
++        uint32_t ph;
++        if (r2_prehash_on() && r2_pre_take(addr, size, frame_, ph)) e.data_hash = ph;  // r39r2
++        else e.data_hash = hash_ram(&ctx, addr, size, 0);
++        s_r2_ctx = &ctx;
+         e.data_frame = frame_;
+         ++st_hash_tex;
+     }
+@@ -297,6 +496,18 @@
+ }
+ 
+ void TextureCache::end_frame() {
++    if (r2_prehash_on()) {  // r39r2: the ranges this frame hashed, to hash for the next one
++        s_r2_todo.clear();
++        s_r2_todo_i = 0;
++        for (const auto& kv : cache)
++            if (kv.second.data_frame == frame_ && kv.second.size)
++                s_r2_todo.emplace_back(kv.first.addr, kv.second.size);
++        for (const auto& kv : efb_copies)
++            if (kv.second.frame == frame_ && kv.second.bytes)
++                s_r2_todo.emplace_back(kv.first, kv.second.bytes);
++        s_r2_todo_frame = frame_ + 1;
++        if (s_r2_pre.size() > 4096) s_r2_pre.clear();
++    }
+     ++frame_;
+     if (++st_frames == 600) {
+         const double f = (double)st_frames;
+@@ -308,19 +519,34 @@
+                "descartada por RAM cambiada=%.2f | nativa nueva=%.2f retirada=%.2f | NWII_T_EFBVAR=%d\n",
+                st_efb_new / f, st_efb_resize / f, st_efb_var_hit / f, st_efb_drop / f, st_nat_new / f,
+                st_nat_retire / f, (int)efbvar_on());
++        if (r2_prehash_on())
++            printf("[R2PRE] per frame: prehashed=%.1f used=%.1f | check: %llu compared, %llu differ\n",
++                   st_r2_pre_done / f, st_r2_pre_hit / f, (unsigned long long)st_r2_pre_chk,
++                   (unsigned long long)st_r2_pre_bad);
++        st_r2_pre_done = st_r2_pre_hit = 0;
++        if (r2_ht_on()) {
++#if defined(__SWITCH__)
++            const double us = 1.0 / 19.2;
++#else
++            const double us = 1e-3;
++#endif
++            printf("[TCSTAT3] hash_ram us/frame: tex=%.0f efb_get=%.0f efb_done=%.0f\n", st_r2_hash_t[0] * us / f,
++                   st_r2_hash_t[1] * us / f, st_r2_hash_t[2] * us / f);
++            st_r2_hash_t[0] = st_r2_hash_t[1] = st_r2_hash_t[2] = 0;
++        }
+         st_efb_new = st_efb_resize = st_efb_drop = st_nat_new = st_nat_retire = st_efb_var_hit = 0;
+         st_hash_tex = st_hash_efb_get = st_hash_efb_done = st_hash_words = 0;
+         st_efb_done = st_efb_scan = st_frames = 0;
+     }
+     if (!retired_.empty()) {
+-        glDeleteTextures((GLsizei)retired_.size(), retired_.data());
++        r2_del_tex((GLsizei)retired_.size(), retired_.data());
+         retired_.clear();
+     }
+     // Evict textures unused for 10 s worth of frames once the cache is big.
+     if (cache.size() > 512) {
+         for (auto it = cache.begin(); it != cache.end();) {
+             if (it->second.last_used + 600 < frame_) {
+-                glDeleteTextures(1, &it->second.tex);
++                r2_del_tex(1, &it->second.tex);
+                 index_erase(&*it);
+                 it = cache.erase(it);
+             } else {
+@@ -331,8 +557,8 @@
+     if (efb_copies.size() > 256) {
+         for (auto it = efb_copies.begin(); it != efb_copies.end();) {
+             if (it->second.frame + 600 < frame_) {
+-                glDeleteTextures(1, &it->second.tex);
+-                if (it->second.native) glDeleteTextures(1, &it->second.native);
++                r2_del_tex(1, &it->second.tex);
++                if (it->second.native) r2_del_tex(1, &it->second.native);
+                 efbvar_retire(it->first, retired_);
+                 it = efb_copies.erase(it);
+             } else {
+@@ -440,7 +666,9 @@
+     const uint32_t row_bytes = ((w + bw - 1) / bw) * bpb;
+     c.stride = stride ? stride : row_bytes;
+     c.bytes = ((h + bh - 1) / bh - 1) * c.stride + row_bytes;
+-    c.ram_hash = hash_ram(ctx, addr, c.bytes);
++    uint32_t ph;
++    if (r2_prehash_on() && r2_pre_take(addr, c.bytes, frame_, ph)) c.ram_hash = ph;  // r39r2
++    else c.ram_hash = hash_ram(ctx, addr, c.bytes, 2);
+     c.frame = frame_;
+     ++st_hash_efb_done;
+     ++st_efb_done;
+@@ -498,11 +726,17 @@
+     // alone. No glGet*: each one would stall Mesa's GL thread.
+     static GLuint s_rd = 0;
+     if (!s_rd) glGenFramebuffers(1, &s_rd);
+-    glBindFramebuffer(GL_READ_FRAMEBUFFER, s_rd);
+     // (A scaled copy is read from its native-size downsample.)
+     const GLuint src = c.stitch_src();
++    if (src) r2_native_resolve(src, restore_read_fbo_);  // r39r2 NWII_R2_LAZYNAT
++    if (r2_copyfbo_on()) {  // r39r2
++        if (!src) return false;
++        r2_tex_fbo(src, GL_READ_FRAMEBUFFER);
++    } else {
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, s_rd);
+     if (!src) return false;
+     glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, src, 0);
++    }
+     bind_scratch(dst);
+     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x, y, 0, 0, cw, ch);
+     glBindFramebuffer(GL_READ_FRAMEBUFFER, restore_read_fbo_);

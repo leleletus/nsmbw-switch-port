@@ -1,0 +1,616 @@
+diff --color -ruN r41m/nWiiRuntime_m6b/src/core/main.cpp r41m/nWiiRuntime_m6e/src/core/main.cpp
+--- r41m/nWiiRuntime_m6b/src/core/main.cpp	2026-11-15 14:01:44.214002388 -0500
++++ r41m/nWiiRuntime_m6e/src/core/main.cpp	2026-11-15 16:52:39.282805467 -0500
+@@ -1,3 +1,4 @@
++#include <string>
+ #if defined(__linux__) && !defined(__SWITCH__)
+ #include <malloc.h>
+ #include <unistd.h>
+@@ -194,6 +195,49 @@
+ 
+ namespace nwii::runtime::gx { void DrawPerfOverlay(); }  // renderer_gl.cpp (r10)
+ 
++// r41m (frente M) m6d/m6e: interruptores de los frentes V, D y R2 ENCENDIDOS POR DEFECTO (el arreglo de C, NWII_C_*,
++// ya va encendido en su propio codigo; NWII_C_AXLIST_OFF / NWII_C_SPIN_OFF / NWII_C_VIGIA_OFF lo quitan). Se ponen en el entorno al
++// arrancar (antes de que nadie los lea; NWII_ENV guarda el primer valor) SOLO si no estan ya: un valor explicito
++// (debug.toml / env.txt / PC) manda. Apagar (apply_env de la Switch borra los "0", por eso son variables aparte):
++//   <NOMBRE>_OFF=1  apaga uno (p. ej. NWII_V_LATE_OFF, NWII_R2_XDUBO_OFF; NWII_R_CULL_OFF deja CULL como en m5 = 1)
++//   NWII_V_OFF / NWII_D_OFF / NWII_R2_OFF = 1  apagan su grupo (NWII_R_OFF de m5 tambien quita el CULL=2)
++//   NWII_M6_OFF=1  ninguno de estos valores por defecto (= m6c con todo apagado).
++static void m6_defaults() {
++  // `def` = false: entrada preparada pero APAGADA (no se pone; se activa a mano con la variable o cambiando a true).
++  struct Def { const char *name, *val, *group; bool def = true; };
++  static const Def k[] = {
++      {"NWII_V_WAKE", "1", "NWII_V_OFF"},       {"NWII_V_LATE", "8", "NWII_V_OFF"},
++      {"NWII_D_DROPFAST", "1", "NWII_D_OFF"},
++      {"NWII_R2_LATEFREE", "1", "NWII_R2_OFF"}, {"NWII_R2_CLEARTEX", "1", "NWII_R2_OFF"},
++      {"NWII_R2_COPYFBO", "1", "NWII_R2_OFF"},  {"NWII_R2_LAZYNAT", "1", "NWII_R2_OFF"},
++      {"NWII_R2_COPYUNI", "1", "NWII_R2_OFF"},  {"NWII_R2_COPYST", "1", "NWII_R2_OFF"},
++      {"NWII_R2_LAZYEFB", "1", "NWII_R2_OFF"},  {"NWII_R2_PREHASH", "1", "NWII_R2_OFF"},
++      {"NWII_R2_TEXMEMO", "1", "NWII_R2_OFF"},  {"NWII_R2_XDUBO", "1", "NWII_R2_OFF"},
++      {"NWII_R_CULL", "2", "NWII_R_OFF"},
++      // m6e: frente K (sondeo lento cada 128); medido en consola (agua 15,4 -> 14,8 ms juego), falta repetirlo
++      {"NWII_POLL_EVERY", "128", "NWII_K_OFF", false},
++  };
++  if (std::getenv("NWII_M6_OFF")) {
++    std::printf("[M6] NWII_M6_OFF: sin valores por defecto de m6\n");
++    return;
++  }
++  std::string on, off;
++  for (const Def &d : k) {
++    const std::string o = std::string(d.name) + "_OFF";
++    if (const char *v = std::getenv(d.name)) {
++      on += std::string(" ") + d.name + "=" + v + "(explicito)";
++    } else if (!d.def) {
++      off += std::string(" ") + d.name + "(preparado)";
++    } else if (std::getenv(o.c_str()) || std::getenv(d.group)) {
++      off += std::string(" ") + d.name;
++    } else {
++      setenv(d.name, d.val, 1);
++      on += std::string(" ") + d.name + "=" + d.val;
++    }
++  }
++  std::printf("[M6] por defecto:%s | apagados:%s\n", on.c_str(), off.empty() ? " ninguno" : off.c_str());
++}
++
+ int main(int argc, char **argv) {
+ #ifdef __SWITCH__
+   // An NRO gets no arguments and no environment: default paths on the SD
+@@ -220,6 +264,7 @@
+     setenv("NWII_REALTIME", "1", 1);
+   }
+ #endif
++  m6_defaults();  // r41m (frente M) m6d
+   if (argc < 2) {
+     std::cerr << "Usage: " << argv[0]
+               << " <path_to_unpacked_game_dir> [config_path]\n";
+diff --color -ruN r41m/nWiiRuntime_m6b/src/core/os_hle_stubs.cpp r41m/nWiiRuntime_m6e/src/core/os_hle_stubs.cpp
+--- r41m/nWiiRuntime_m6b/src/core/os_hle_stubs.cpp	2026-11-15 14:01:02.808421212 -0500
++++ r41m/nWiiRuntime_m6e/src/core/os_hle_stubs.cpp	2026-11-15 16:52:21.979946452 -0500
+@@ -1,3 +1,4 @@
++#include <atomic>
+ #include "s2.h"  // r34s2
+ #include "runtime/nwii_env.h"
+ #include <cstdint>
+@@ -83,11 +84,17 @@
+   return s;
+ }();
+ 
++// r38c: contador atomico (antes `static int` sin proteger: D07 escribio 928 917 lineas hasta llenar el registro);
++// 20 lineas y luego solo el contador, que el vigilante (s2.cpp) vigila como alarma.
++std::atomic<uint64_t> g_null_calls{0};
++std::atomic<uint32_t> g_null_last_site{0};
+ void note_null_call(uint32_t site, uint32_t lr) {
+-  static int n = 0;
+-  if (n++ < 20)
+-    std::cout << "[NullCall] no-op call through null ptr at site 0x" << std::hex
+-              << site << " lr=0x" << lr << std::dec << "\n";
++  const uint64_t n = g_null_calls.fetch_add(1, std::memory_order_relaxed);
++  g_null_last_site.store(site, std::memory_order_relaxed);
++  if (n < 20)
++    std::printf("[NullCall] no-op call through null ptr at site 0x%x lr=0x%x\n", site, lr);
++  else if (n == 20)
++    std::printf("[NullCall] (mas avisos omitidos; el vigilante da el total)\n");
+ }
+ 
+ void trace_call(uint32_t func_addr, CPUContext &ctx) {
+diff --color -ruN r41m/nWiiRuntime_m6b/src/core/s2.cpp r41m/nWiiRuntime_m6e/src/core/s2.cpp
+--- r41m/nWiiRuntime_m6b/src/core/s2.cpp	2026-11-15 14:01:44.214152257 -0500
++++ r41m/nWiiRuntime_m6e/src/core/s2.cpp	2026-11-15 16:52:21.980222795 -0500
+@@ -53,7 +53,9 @@
+ 
+ namespace nwii::runtime {
+ extern CPUContext *g_ctx_ptr;
+-extern bool g_fm_alias_next;  // fastmem_impl.inc: el siguiente MMU no reserva memoria (se le dan los bloques del principal)
++extern bool g_fm_alias_next;
++extern std::atomic<uint64_t> g_null_calls;      // os_hle_stubs.cpp (r38c)
++extern std::atomic<uint32_t> g_null_last_site;  // fastmem_impl.inc: el siguiente MMU no reserva memoria (se le dan los bloques del principal)
+ namespace s2 {
+ 
+ bool g_enabled = false;
+@@ -151,6 +153,61 @@
+   if (v > m.load(std::memory_order_relaxed)) m.store(v, std::memory_order_relaxed);
+ }
+ 
++// ---- r38c: lista AX de SoundThread (segundo cuelgue, D07/m6a) --------------------------------------
++// SoundThread::AxCallbackFunc (0x8027B850) corre dentro de la interrupcion AID (CPU de sonido, con S) y recorre la lista
++// +0x388 del objeto 0x80412BF0 llamando al virtual +0x10 de cada nodo, con el siguiente nodo ya leido. El juego da de
++// alta / de baja nodos con SoundThread::Register (0x8027BA20) / Unregister (0x8027BA90) protegido SOLO por el mutex
++// del SoundThread (+0x354): en la Wii basta, porque la interrupcion nunca corre a la vez que un hilo. Con S2 el juego
++// puede quitar (y liberar / reutilizar) el nodo siguiente mientras la CPU de sonido lo recorre -> lista rota.
++// Arreglo (NWII_C_AXLIST, encendido; "off"/cualquier valor != "1" no sirve: apagar con NWII_C_AXLIST_OFF=1): el juego toma S
++// (kHoldList) desde que tiene el mutex en Register/Unregister hasta que lo suelta, igual que si la interrupcion no
++// pudiera entrar. NWII_C_AXLIST_CHECK=1: la CPU de sonido valida la lista al final de cada interrupcion.
++constexpr uint32_t kAxListObj = 0x80412BF0, kAxListHead = kAxListObj + 0x388;
++constexpr uint32_t kRegLockLr = 0x8027BA4C, kRegUnlockLr = 0x8027BA6C, kUnregLockLr = 0x8027BABC, kUnregUnlockLr = 0x8027BAD0;
++bool g_axl_fix = true, g_axl_check = false;
++bool g_axl_mutex = false;  // NWII_C_AXLIST_MUTEX=1: regla general (S mientras el juego tenga el mutex del SoundThread, en todo uso)
++constexpr uint32_t kSndMutex = kAxListObj + 0x354;
++std::atomic<uint64_t> st_axl_hold_ns{0}, st_axl_hold_max_us{0};
++uint64_t g_axl_t_lock = 0;
++std::atomic<int> g_snd_in_irq{0};
++std::atomic<uint64_t> st_axl_calls{0}, st_axl_overlap{0}, st_axl_fallback{0}, st_axl_bad{0}, st_axl_wait_ns{0};
++// r38c: ultimas altas/bajas en la lista (para el informe de NWII_C_AXLIST_CHECK)
++struct AxlEv { uint64_t t; uint32_t node, thread, lr; uint8_t side, s_held, snd_irq; };
++AxlEv g_axl_ring[32];
++std::atomic<uint32_t> g_axl_ri{0};
++inline void axl_note(uint32_t node, uint32_t thread, uint32_t lr, uint8_t side, uint8_t s_held, uint8_t snd_irq) {
++  const uint32_t i = g_axl_ri.fetch_add(1, std::memory_order_relaxed) & 31;
++  g_axl_ring[i] = {now_ns(), node, thread, lr, side, s_held, snd_irq};
++}
++void axl_ring_dump() {
++  const uint32_t e = g_axl_ri.load();
++  const uint64_t now = now_ns();
++  for (uint32_t k = e > 32 ? e - 32 : 0; k < e; ++k) {
++    const AxlEv &v = g_axl_ring[k & 31];
++    std::printf("[C38]   hace %8.3f ms: %s %s nodo 0x%08x hilo 0x%08x (S del juego %d, sonido en interrupcion %d)\n", (now - v.t) / 1e6,
++                v.side ? "SONIDO" : "juego ", (v.lr == 0x8027BA4C) ? "alta" : (v.lr == 0x8027BABC) ? "baja" : "?   ", v.node, v.thread, v.s_held, v.snd_irq);
++  }
++}
++// r38c NWII_C_AXLIST_CHECK: la lista +0x388 debe volver al centinela con enlaces coherentes y tablas virtuales.
++void axlist_check(const char *where) {
++  uint32_t n = kAxListHead;
++  for (int i = 0; i < 64; ++i) {
++    const uint32_t nx = g_main->mmu.read32(n);
++    if (nx == kAxListHead) return;
++    const bool in = (nx >= 0x80000000u && nx < 0x81800000u) || (nx >= 0x90000000u && nx < 0x94000000u);
++    if (!in || g_main->mmu.read32(nx + 4) != n || g_main->mmu.read32(nx + 8) == 0) {
++      if (st_axl_bad.load() == 0) axl_ring_dump();
++      if (st_axl_bad.fetch_add(1) < 10)
++        std::printf("[C38] LISTA AX ROTA (%s): nodo 0x%08x -> 0x%08x, paso %d; centinela 0x%08x/0x%08x cuenta %u; nodo: %08x %08x %08x %08x %08x %08x\n",
++                    where, n, nx, i, g_main->mmu.read32(kAxListHead), g_main->mmu.read32(kAxListHead + 4), g_main->mmu.read32(kAxListHead - 4),
++                    g_main->mmu.read32(nx), g_main->mmu.read32(nx + 4), g_main->mmu.read32(nx + 8), g_main->mmu.read32(nx + 12),
++                    g_main->mmu.read32(nx + 16), g_main->mmu.read32(nx + 20));
++      return;
++    }
++    n = nx;
++  }
++  if (st_axl_bad.fetch_add(1) < 10) std::printf("[C38] LISTA AX ROTA (%s): mas de 64 nodos sin volver al centinela\n", where);
++}
+ // ---- r38c: prioridad dinamica de la CPU de sonido ------------------------------------------
+ // Base NWII_S2_PRIO (p. ej. 0x2E, por debajo del trabajador de render 0x2D); sube a NWII_C_PRIO_HI (p. ej. 0x2C) solo
+ // mientras haga falta: bit 1 = va tarde (un evento de su agenda vencido hace mas de NWII_C_LATE_US), bit 2 = el juego
+@@ -195,9 +252,10 @@
+ 
+ // ---- candado S ----------------------------------------------------------------------------
+ std::atomic<uint32_t> s_lock{0};  // 0 libre, 1 juego, 2 sonido
+-enum : uint32_t { kHoldNone = 0, kHoldSection = 1, kHoldIrq = 2 };
++enum : uint32_t { kHoldNone = 0, kHoldSection = 1, kHoldIrq = 2, kHoldList = 3 /* r38c: alta/baja en la lista AX de SoundThread */ };
+ struct GameS {  // solo el hilo del juego
+   uint32_t holds = kHoldNone, owner = 0;
++  uint32_t list_owner = 0;  // r38c: hilo invitado dentro de SoundThread::Register/Unregister (kHoldList)
+   uint32_t stash[8] = {0};
+   int nstash = 0;
+ } gs;
+@@ -384,15 +442,17 @@
+     if (cur != gs.owner) {
+       // El hilo invitado que tenia la seccion ha dejado la CPU con ella abierta (OSSleepThread): el
+       // candado se suelta y ese hilo lo retoma al reanudarse. Una interrupcion no deja nada pendiente.
++      // (kHoldList: lo retoma su hilo, gs.list_owner, al volver a correr; ver abajo.)
+       if (gs.holds == kHoldSection && gs.owner != 0) {
+         if (gs.nstash < 8) gs.stash[gs.nstash++] = gs.owner; else check_fail("stash lleno");
+         add(st.g_stash);
+       }
+       game_release();
+-    } else if (ee) {
++    } else if (ee && gs.holds != kHoldList) {
+       game_release();
+     }
+   }
++  if (!gs.holds && gs.list_owner && gs.list_owner == cur) game_acquire(ctx, kHoldList, cur, true);  // r38c
+   if (!gs.holds && !ee) {
+     if (gs.nstash && stash_take(cur)) game_acquire(ctx, kHoldSection, cur, true);
+     else if (sec_open) game_acquire(ctx, kHoldSection, cur, can_service);
+@@ -542,7 +602,10 @@
+   ctx.msr &= ~0x8000u;
+   snd_ee_sync(ctx);  // toma S
+   ++in_irq;
++  g_snd_in_irq.store(1, std::memory_order_relaxed);
+   snd_run_guest(ctx, handler);
++  g_snd_in_irq.store(0, std::memory_order_relaxed);
++  if (g_axl_check) axlist_check("fin de interrupcion");
+   --in_irq;
+   regs_load(ctx, r);
+   snd_ee_sync(ctx);  // lo suelta si el contexto interrumpido tenia EE = 1
+@@ -674,7 +737,10 @@
+ // Ganchos de entrada (E2) en el contexto de sonido. true = resuelto aqui (la funcion invitada no corre).
+ S2_NO_TSAN bool snd_os(CPUContext &ctx, uint32_t fn, uint32_t lr) {
+   switch (fn) {
+-    case F_OSLockMutex: snd_lock(ctx, ctx.gpr[3]); return true;
++    case F_OSLockMutex:
++      if (lr == kRegLockLr || lr == kUnregLockLr) axl_note(ctx.gpr[30], snd_cur_thread(), lr, 1, snd_holds, (uint8_t)in_irq);
++      snd_lock(ctx, ctx.gpr[3]);
++      return true;
+     case F_OSUnlockMutex: snd_unlock(ctx, ctx.gpr[3]); return true;
+     case F_OSTryLockMutex: ctx.gpr[3] = snd_trylock(ctx, ctx.gpr[3]) ? 1 : 0; return true;
+     case F_OSSendMessage: {
+@@ -971,6 +1037,9 @@
+ }
+ void vigia_dump(int nth, double stalled_s) {
+   const uint64_t now = now_ns();
++  std::printf("[VIGIA] llamadas por puntero nulo: %llu (ultimo sitio 0x%08x)\n", (unsigned long long)g_null_calls.load(),
++              g_null_last_site.load());
++  if (g_enabled && nth <= 2) { std::printf("[VIGIA] ultimas altas/bajas en la lista AX de SoundThread:\n"); axl_ring_dump(); }
+   std::printf("[VIGIA] #%d sin progreso %.1f s (render fot %llu, copias XFB %llu)\n", nth, stalled_s,
+               (unsigned long long)c38_frames_render(), (unsigned long long)c38_frames_game());
+ #ifdef __SWITCH__
+@@ -1038,6 +1107,12 @@
+   for (;;) {
+     sleep_us(1000000);
+     const uint64_t r = c38_frames_render(), g = c38_frames_game(), now = now_ns();
++    {  // r38c: rafaga de llamadas por puntero nulo (el cuelgue de la lista AX dejaba ~100 k/s): alarma aunque haya fotogramas
++      static uint64_t last_nc = 0;
++      const uint64_t nc = g_null_calls.load(std::memory_order_relaxed);
++      if (nc - last_nc > 1000 && total < 8) { ++total; std::printf("[VIGIA] ALARMA: %llu llamadas por puntero nulo en 1 s\n", (unsigned long long)(nc - last_nc)); vigia_dump(total, 0.0); }
++      last_nc = nc;
++    }
+     if (r != lr || g != lg) { lr = r; lg = g; t_prog = now; episode = 0; continue; }
+     const double st = (now - t_prog) / 1e9;
+     if (st >= 5.0 * (episode + 1) && episode < 4 && total < 8) {
+@@ -1148,9 +1223,19 @@
+     return false;
+   }
+   if (g_check && !t_snd) check_fail("contexto de sonido ejecutado por otro hilo", ctx.pc);
+-  ctx.poll_left.store(64, std::memory_order_relaxed);
++  static const long s_irq_stress0 = [] { const char *e = NWII_ENV("NWII_C_STRESS_IRQ_US"); return e ? std::atol(e) : 0L; }();
++  // r38c: con estres, cada vuelta del bucle de la lista AX (0x8027B91C-0x8027B938) pasa por aqui y se entretiene
++  const bool in_axloop = s_irq_stress0 > 0 && in_irq && ctx.pc - 0x8027B91Cu <= 0x1Cu;
++  ctx.poll_left.store(in_axloop ? 1 : 64, std::memory_order_relaxed);
+   ctx.note_idle();
+   if (snd_state.load(std::memory_order_relaxed) == kQuit) longjmp(snd_exit_jb, 2);
++  // r38c NWII_C_STRESS_IRQ_US (solo pruebas): la CPU de sonido se entretiene dentro de sus interrupciones (agranda la
++  // ventana en que recorre la lista AX).
++  static const long s_irq_stress = [] { const char *e = NWII_ENV("NWII_C_STRESS_IRQ_US"); return e ? std::atol(e) : 0L; }();
++  if (__builtin_expect(s_irq_stress > 0, 0) && in_axloop) {
++    const uint64_t until = now_ns() + (uint64_t)s_irq_stress * 1000;
++    while (now_ns() < until) cpu_relax();
++  }
+   snd_pump(ctx);
+   return false;
+ }
+@@ -1160,7 +1245,7 @@
+     g_game_work.fetch_and(~4u, std::memory_order_relaxed);
+     ctx.dec_written_tb = ctx.read_timebase();
+   }
+-  if (gs.holds) game_rules(ctx, false, false);
++  if (gs.holds || gs.list_owner) game_rules(ctx, false, false);
+   if (g_req.load(std::memory_order_relaxed) == 1 && game_can_service(ctx)) service(ctx);
+   if ((g_game_work.load(std::memory_order_relaxed) & 1) && game_can_service(ctx) && !gs.holds) {
+     if (!g_active.load(std::memory_order_relaxed)) {
+@@ -1187,6 +1272,58 @@
+ }
+ void game_sync(CPUContext &ctx) { game_rules(ctx, false, false); }
+ 
++// r38c: SoundThread::Register/Unregister en el hilo del juego (ver kAxListHead). true = OSLockMutex resuelto aqui.
++bool game_axlist(CPUContext &ctx, uint32_t fn, uint32_t lr) {
++  const uint32_t cur = rd32(kCurThread);
++  if (fn == F_OSUnlockMutex) {  // la lista ya esta cambiada: se suelta S y el SDK suelta el mutex como siempre
++    if (g_axl_mutex && rd32(ctx.gpr[3] + kMtxCount) > 1) return false;  // desbloqueo interior (mutex recursivo)
++    if (gs.list_owner == cur) {
++      const uint64_t h = now_ns() - g_axl_t_lock;
++      add(st_axl_hold_ns, h);
++      note_max(st_axl_hold_max_us, h / 1000);
++      gs.list_owner = 0;
++      if (gs.holds == kHoldList) game_release();
++    }
++    return false;
++  }
++  add(st_axl_calls);
++  if (g_snd_in_irq.load(std::memory_order_relaxed)) add(st_axl_overlap);
++  axl_note(ctx.gpr[30], cur, lr, 0, gs.holds != 0, (uint8_t)g_snd_in_irq.load(std::memory_order_relaxed));  // la carrera: la CPU de sonido esta en su interrupcion
++  if (!g_axl_fix || gs.holds || gs.list_owner) return false;
++  const uint32_t m = ctx.gpr[3];
++  const uint64_t t0 = now_ns();
++  for (uint32_t spins = 0;; ++spins) {
++    const uint32_t owner = rd32(m + kMtxThread);
++    if (owner == 0 || owner == cur) {
++      // Primero S (la CPU de sonido nunca espera al juego con S tomado: request() lo suelta), luego el mutex en
++      // nativo, como OSLockMutex con el mutex libre (nadie mas toca el mutex: las peticiones del sonido las atiende
++      // este mismo hilo).
++      game_acquire(ctx, kHoldList, cur, true);
++      if (rd32(m + kMtxThread) == 0 || rd32(m + kMtxThread) == cur) {
++        do_trylock(m, cur);
++        gs.list_owner = cur;
++        g_axl_t_lock = now_ns();
++        add(st_axl_wait_ns, now_ns() - t0);
++        return true;
++      }
++      game_release();
++      continue;
++    }
++    bool snd_owner = false;
++    for (Fiber &f : fibers) if (owner == f.thread && f.hosted.load(std::memory_order_relaxed)) snd_owner = true;
++    if (!snd_owner || spins > 2000000) {
++      // Lo tiene otro hilo del juego: el SDK lo espera durmiendo como siempre (la alta/baja va entonces sin S; contado).
++      add(st_axl_fallback);
++      return false;
++    }
++    // Lo tiene la CPU de sonido (FrameProcess): se atienden sus peticiones (el desbloqueo es una) hasta que lo suelte.
++    if (g_req.load(std::memory_order_relaxed) == 1 && game_can_service(ctx)) service(ctx);
++    cpu_relax();
++  }
++}
++
++
++
+ void game_idle_sleep(uint64_t us) {
+   // El hilo del juego duerme en el bucle ocioso del SO invitado (EE = 1, sin hilo): mientras tanto la
+   // CPU de sonido puede atender ella misma sus peticiones (g_park), y lo despierta si encola un callback.
+@@ -1205,6 +1342,9 @@
+ 
+ void init(CPUContext *main_ctx) {
+   { const char *e = NWII_ENV("NWII_C_SPIN_OFF"); g_spin_old = e && *e; }
++  { const char *e = NWII_ENV("NWII_C_AXLIST_OFF"); g_axl_fix = !(e && *e); }      // r38c
++  { const char *e = NWII_ENV("NWII_C_AXLIST_CHECK"); g_axl_check = e && *e && *e != '0'; }
++  { const char *e = NWII_ENV("NWII_C_AXLIST_MUTEX"); g_axl_mutex = g_axl_fix && e && *e && *e != '0'; }
+   {  // r38c: prioridad dinamica (sin NWII_C_PRIO_HI: nada)
+     const char *pl = NWII_ENV("NWII_S2_PRIO"), *ph = NWII_ENV("NWII_C_PRIO_HI"), *lt = NWII_ENV("NWII_C_LATE_US");
+     g_prio_lo = pl ? (int)std::strtol(pl, nullptr, 0) : 0x2C;
+@@ -1294,19 +1434,27 @@
+                 (unsigned long long)st.takeovers.load(), (unsigned long long)st.handbacks.load(), (unsigned long long)st.msg_drop.load(),
+                 (unsigned long long)st.traps.load(), (unsigned long long)st.checks_bad.load(), (unsigned long long)st.g_stash.load());
+   // r38c: segunda linea [C38] (subidas de prioridad, recuperacion de pasadas del DMA, esperas maximas, siestas)
+-  static uint64_t q[8] = {0};
++  static uint64_t q[10] = {0};
+   auto dq = [&](int i, uint64_t v) { const uint64_t r = v - q[i]; q[i] = v; return r; };
+   const uint64_t b0 = dq(0, st_boost_n[0].load()), b1 = dq(1, st_boost_n[1].load()), b2 = dq(2, st_boost_n[2].load());
+   const uint64_t bns = dq(3, st_boost_ns.load()), sl = dq(4, st_backoff_sleeps.load());
+   uint64_t cu = 0, rs = 0;
+   hw::c38_dsp_catchup_stats(&cu, &rs);
+   const uint64_t dcu = dq(5, cu), drs = dq(6, rs);
++  static uint64_t axw_last = 0;
++  const uint64_t axw_now = st_axl_wait_ns.load(), axw_ns = axw_now - axw_last;
++  axw_last = axw_now;
+   const size_t used = std::strlen(buf);
+   std::snprintf(buf + used, n - (int)used,
+                 "\n[C38] prio base 0x%X alta 0x%X | subidas: tarde %.0f/s juego-S %.0f/s juego-mutex %.0f/s, en alta %.1f ms/s | DMA: "
+-                "pasadas recuperadas %.0f/s, reinicios %.0f/s | max espera S: juego %llu us, sonido %llu us | siestas %.0f/s",
++                "pasadas recuperadas %.0f/s, reinicios %.0f/s | max espera S: juego %llu us, sonido %llu us | siestas %.0f/s | "
++                "lista AX%s: altas/bajas %.0f/s, con la CPU de sonido en interrupcion %llu, sin S %llu, espera %.3f ms/s, rotas %llu, "
++                "S retenido %.2f ms/s (max %llu us)",
+                 g_prio_lo, g_prio_hi, b0 * k, b1 * k, b2 * k, bns * k / 1e6, dcu * k, drs * k,
+-                (unsigned long long)st_game_wait_max_us.exchange(0), (unsigned long long)st_snd_wait_max_us.exchange(0), sl * k);
++                (unsigned long long)st_game_wait_max_us.exchange(0), (unsigned long long)st_snd_wait_max_us.exchange(0), sl * k,
++                g_axl_fix ? (g_axl_mutex ? " (regla del mutex)" : "") : " (SIN arreglo)", dq(7, st_axl_calls.load()) * k, (unsigned long long)st_axl_overlap.load(),
++                (unsigned long long)st_axl_fallback.load(), axw_ns * k / 1e6, (unsigned long long)st_axl_bad.load(),
++                dq(8, st_axl_hold_ns.load()) * k / 1e6, (unsigned long long)st_axl_hold_max_us.exchange(0));
+ }
+ 
+ }  // namespace s2
+@@ -1353,7 +1501,11 @@
+       }
+   } else if (fn == F_OSSendMessage) {
+     if (g_active.load(std::memory_order_relaxed) && fiber_of_queue(ctx.gpr[3])) do_handback(ctx);
+-  } else if (fn == F_OSLockMutex && g_prio_hi && g_active.load(std::memory_order_relaxed)) {
++  } else if ((fn == F_OSLockMutex || fn == F_OSUnlockMutex) && g_active.load(std::memory_order_relaxed) &&
++             ((lr == kRegLockLr || lr == kUnregLockLr || lr == kRegUnlockLr || lr == kUnregUnlockLr) || (g_axl_mutex && ctx.gpr[3] == kSndMutex))) {
++    if (game_axlist(ctx, fn, lr)) return true;
++  }
++  if (fn == F_OSLockMutex && g_prio_hi && g_active.load(std::memory_order_relaxed)) {
+     // r38c: herencia: si el mutex es de un hilo que corre la CPU de sonido, el juego va a dormir esperandolo
+     const uint32_t owner = rd32(ctx.gpr[3] + kMtxThread);
+     if (owner)
+diff --color -ruN r41m/nWiiRuntime_m6b/src/platform/switch/switch_platform.cpp r41m/nWiiRuntime_m6e/src/platform/switch/switch_platform.cpp
+--- r41m/nWiiRuntime_m6b/src/platform/switch/switch_platform.cpp	2026-11-15 14:01:44.215039105 -0500
++++ r41m/nWiiRuntime_m6e/src/platform/switch/switch_platform.cpp	2026-11-15 15:51:21.117050476 -0500
+@@ -14,6 +14,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <condition_variable>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -110,9 +111,41 @@
+   std::mutex m;
+   std::vector<char> buf;
+ 
++  // r41m (frente M) NWII_M_LOGBG=1: los escritores solo copian a `pend` bajo `m`; un hilo de fondo de prioridad
++  // baja (logbg_main) intercambia `pend` por `wbuf` y hace fwrite/fflush/fsync SIN `m` (con `fm`, que solo
++  // toman el hilo de fondo, el vaciado síncrono del vigía y el cierre). Sin el interruptor: como antes.
++  bool bg = false;
++  std::vector<char> pend;  // bajo m
++  std::vector<char> wbuf;  // bajo fm
++  std::mutex fm;
++  size_t pend_drop = 0;    // bajo m: bytes tirados porque el hilo de fondo no daba abasto
++  static constexpr size_t kPendMax = 8u << 20;
++  // r41m: medidas ([LOGF]): tiempo de pared de write() (espera del mutex incluida)
++  std::atomic<uint64_t> st_w_n{0}, st_w_max_ticks{0};
++
+   ssize_t write(const char *ptr, size_t len) {
++    const uint64_t t0 = armGetSystemTick();
++    struct Note {
++      LogSink &s; uint64_t t0;
++      ~Note() {
++        const uint64_t d = armGetSystemTick() - t0;
++        s.st_w_n.fetch_add(1, std::memory_order_relaxed);
++        if (d > s.st_w_max_ticks.load(std::memory_order_relaxed)) s.st_w_max_ticks.store(d, std::memory_order_relaxed);
++      }
++    } note{*this, t0};
+     std::lock_guard<std::mutex> lk(m);
+     if (failed || written >= cap) return (ssize_t)len;  // dropped, not an error
++    if (bg) {
++      const size_t n = std::min(len, cap - written);
++      if (pend.size() + n > kPendMax) { pend_drop += n; return (ssize_t)len; }
++      pend.insert(pend.end(), ptr, ptr + n);
++      written += n;
++      if (written >= cap) {
++        static const char kLim[] = "\n[NX] log size limit reached, later output dropped\n";
++        pend.insert(pend.end(), kLim, kLim + sizeof kLim - 1);
++      }
++      return (ssize_t)len;
++    }
+     if (!f) {
+       // logs/ only appears once something is logged (errors, or a debug log).
+       mkdir(path.substr(0, path.rfind('/')).c_str(), 0777);
+@@ -135,7 +168,39 @@
+     }
+     return (ssize_t)len;
+   }
++  // r41m NWII_M_LOGBG: lleva `pend` a la SD (fwrite + fflush + fsync) sin tener `m` durante la escritura.
++  // La llaman el hilo de fondo, flush() (vigía, frame_tick) y close(). Devuelve los bytes escritos.
++  size_t drain() {
++    std::lock_guard<std::mutex> lf(fm);
++    {
++      std::lock_guard<std::mutex> lk(m);
++      if (!f && failed) return 0;
++      std::swap(pend, wbuf);
++    }
++    if (wbuf.empty()) return 0;
++    if (!f) {
++      mkdir(path.substr(0, path.rfind('/')).c_str(), 0777);
++      FILE *nf = std::fopen(path.c_str(), "w");
++      if (!nf) {
++        std::lock_guard<std::mutex> lk(m);
++        failed = true;
++        wbuf.clear();
++        return 0;
++      }
++      buf.resize(256 * 1024);
++      setvbuf(nf, buf.data(), _IOFBF, buf.size());
++      std::lock_guard<std::mutex> lk(m);
++      f = nf;
++    }
++    const size_t n = wbuf.size();
++    std::fwrite(wbuf.data(), 1, n, f);
++    std::fflush(f);
++    fsync(fileno(f));
++    wbuf.clear();
++    return n;
++  }
+   void flush() {
++    if (bg) { drain(); return; }
+     std::lock_guard<std::mutex> lk(m);
+     if (!f) return;
+     std::fflush(f);
+@@ -144,6 +209,8 @@
+     fsync(fileno(f));
+   }
+   void close() {
++    if (bg) drain();
++    std::lock_guard<std::mutex> lf(fm);
+     std::lock_guard<std::mutex> lk(m);
+     if (f) std::fclose(f);
+     f = nullptr;
+@@ -154,6 +221,62 @@
+ LogSink g_out_sink{"", 64u << 20, false};  // paths set by choose_root()
+ LogSink g_err_sink{"", 1u << 20, true};
+ 
++// r41m (frente M) NWII_M_LOGBG=1: hilo de fondo del registro (prioridad 0x3B, por debajo de render 0x2C, sonido 0x2C
++// y trabajador 0x2D; núcleo ideal 2, puede usar cualquiera de los permitidos si está libre). Cada 2 s (o al avisarle
++// frame_tick) vacía g_out_sink a la SD. Medidas para [LOGF]: duración de cada vaciado y bytes.
++Thread g_logbg_thr;
++std::atomic<bool> g_logbg_on{false}, g_logbg_quit{false};
++std::mutex g_logbg_mx;
++std::condition_variable g_logbg_cv;
++bool g_logbg_kick = false;
++std::atomic<uint64_t> st_bg_n{0}, st_bg_sum_ticks{0}, st_bg_max_ticks{0}, st_bg_bytes{0};
++void logbg_main(void *) {
++  u64 allowed = 0;
++  svcGetInfo(&allowed, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
++  if (allowed & 4) svcSetThreadCoreMask(CUR_THREAD_HANDLE, 2, (u32)(allowed & 7));
++  while (!g_logbg_quit.load(std::memory_order_relaxed)) {
++    {
++      std::unique_lock<std::mutex> lk(g_logbg_mx);
++      g_logbg_cv.wait_for(lk, std::chrono::seconds(2), [] { return g_logbg_kick || g_logbg_quit.load(); });
++      g_logbg_kick = false;
++    }
++    const uint64_t t0 = armGetSystemTick();
++    const size_t n = g_out_sink.drain();
++    if (n) {
++      const uint64_t d = armGetSystemTick() - t0;
++      st_bg_n.fetch_add(1, std::memory_order_relaxed);
++      st_bg_sum_ticks.fetch_add(d, std::memory_order_relaxed);
++      st_bg_bytes.fetch_add(n, std::memory_order_relaxed);
++      if (d > st_bg_max_ticks.load(std::memory_order_relaxed)) st_bg_max_ticks.store(d, std::memory_order_relaxed);
++    }
++  }
++}
++void logbg_start() {
++  const char *e = std::getenv("NWII_M_LOGBG");
++  if (!e || !*e || e[0] == '0') return;
++  {
++    std::lock_guard<std::mutex> lk(g_out_sink.m);
++    g_out_sink.bg = true;  // antes de la primera escritura de stdout (setup_logging)
++  }
++  const Result rc = threadCreate(&g_logbg_thr, logbg_main, nullptr, nullptr, 64 * 1024, 0x3B, -2);
++  if (R_SUCCEEDED(rc) && R_SUCCEEDED(threadStart(&g_logbg_thr))) {
++    g_logbg_on = true;
++  } else {
++    std::lock_guard<std::mutex> lk(g_out_sink.m);
++    g_out_sink.bg = false;  // sin hilo: modo de siempre
++  }
++}
++void logbg_stop() {
++  if (!g_logbg_on.exchange(false)) return;
++  {
++    std::lock_guard<std::mutex> lk(g_logbg_mx);
++    g_logbg_quit = true;
++  }
++  g_logbg_cv.notify_one();
++  threadWaitForExit(&g_logbg_thr);
++  threadClose(&g_logbg_thr);
++}
++
+ ssize_t out_write(struct _reent *, void *, const char *ptr, size_t len) {
+   return g_out_sink.write(ptr, len);
+ }
+@@ -507,6 +630,7 @@
+     g_out_dotab.write_r = out_write;
+     devoptab_list[STD_OUT] = &g_out_dotab;
+     setvbuf(stdout, g_stdout_buf, _IOFBF, sizeof g_stdout_buf);
++    logbg_start();  // r41m NWII_M_LOGBG
+   } else {
+     // Quiet: stdout stays on libnx's null device, and a stream in a failed
+     // state skips all std::cout formatting (~250 call sites, some per
+@@ -758,13 +882,41 @@
+     host_frames = 0;
+     last_stat = now;
+   }
++  // r41m (frente M): medida del vaciado periódico ([LOGF], cada 5 s). Sin NWII_M_LOGBG: fflush(stdout) +
++  // g_out_sink.flush() (fwrite hasta 256 KB + fsync a la SD) en ESTE hilo (render) con el mutex del sumidero tomado.
++  // Con NWII_M_LOGBG: aquí solo fflush(stdout) (copia a memoria) y aviso al hilo de fondo.
++  static uint64_t lf_n = 0, lf_sum = 0, lf_max = 0;
++  static clk::time_point last_lf = now;
+   if (now - last_flush >= std::chrono::seconds(2)) {
+     last_flush = now;
+     if (g_log_mode == LogMode::File) {
++      const uint64_t t0 = armGetSystemTick();
+       std::fflush(stdout);
+-      g_out_sink.flush();
++      if (g_logbg_on.load(std::memory_order_relaxed)) {
++        { std::lock_guard<std::mutex> lk(g_logbg_mx); g_logbg_kick = true; }
++        g_logbg_cv.notify_one();
++      } else {
++        g_out_sink.flush();
++      }
++      const uint64_t d = armGetSystemTick() - t0;
++      ++lf_n; lf_sum += d; lf_max = std::max(lf_max, d);
+     }
+   }
++  if (g_log_mode == LogMode::File && now - last_lf >= std::chrono::seconds(5)) {
++    last_lf = now;
++    auto ms = [](uint64_t t) { return armTicksToNs(t) / 1e6; };
++    const uint64_t wn = g_out_sink.st_w_n.exchange(0), wmax = g_out_sink.st_w_max_ticks.exchange(0);
++    const uint64_t bn = st_bg_n.exchange(0), bsum = st_bg_sum_ticks.exchange(0), bmax = st_bg_max_ticks.exchange(0),
++                   bb = st_bg_bytes.exchange(0);
++    size_t drop;
++    { std::lock_guard<std::mutex> lk(g_out_sink.m); drop = g_out_sink.pend_drop; }
++    std::printf("[LOGF] %s | vaciado en render: n %llu media %.2f ms max %.2f ms | write() n %llu max %.2f ms | "
++                "fondo: n %llu media %.2f ms max %.2f ms %.0f KB | tirados %zu B\n",
++                g_logbg_on.load() ? "fondo" : "sincrono", (unsigned long long)lf_n, lf_n ? ms(lf_sum) / lf_n : 0.0,
++                ms(lf_max), (unsigned long long)wn, ms(wmax), (unsigned long long)bn, bn ? ms(bsum) / bn : 0.0, ms(bmax),
++                bb / 1024.0, drop);
++    lf_n = lf_sum = lf_max = 0;
++  }
+ }
+ 
+ // r38c: el vigilante de cuelgues (s2.cpp) vuelca su informe al registro normal y lo lleva a la SD ya.
+@@ -778,6 +930,7 @@
+   rumble(false);
+   std::fflush(stdout);
+   std::fflush(stderr);
++  logbg_stop();  // r41m NWII_M_LOGBG (close() vacía lo pendiente)
+   g_out_sink.close();
+   g_err_sink.close();
+ }

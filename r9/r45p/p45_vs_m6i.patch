@@ -1,0 +1,1036 @@
+diff --color -ruN r41m/nWiiRuntime_m6i/include/runtime/gx/fifo_parser.h r45p/nWiiRuntime/include/runtime/gx/fifo_parser.h
+--- r41m/nWiiRuntime_m6i/include/runtime/gx/fifo_parser.h	2026-11-15 19:04:30.978708381 -0500
++++ r45p/nWiiRuntime/include/runtime/gx/fifo_parser.h	2026-11-16 00:49:46.040224598 -0500
+@@ -113,6 +113,7 @@
+     static void SetDoomedXfb(uint32_t n);
+     static bool RenderPrepOk(const GXCommand& c);  // r40d NWII_D_RENDERPREP (see fifo_parser.cpp)
+     static bool MergeCheckOn();                     // r40d NWII_D_MERGE_CHECK
++    static void DLMergeStats(uint64_t& groups, uint64_t& parts, uint64_t& made, uint64_t& bad);  // r45p NWII_P_DLMERGE (and resets)
+     static uint64_t Merged();                       // r40d: FIFO draws merged into the previous one so far
+     static uint64_t LightSkipped();
+     static void LightTime(uint64_t& ns, uint64_t& frames);  // parse time spent in doomed frames, their count
+diff --color -ruN r41m/nWiiRuntime_m6i/include/runtime/gx_command.h r45p/nWiiRuntime/include/runtime/gx_command.h
+--- r41m/nWiiRuntime_m6i/include/runtime/gx_command.h	2026-11-09 04:33:57.231092675 -0500
++++ r45p/nWiiRuntime/include/runtime/gx_command.h	2026-11-16 01:41:32.664267123 -0500
+@@ -156,6 +156,13 @@
+ struct DecodedVerts : std::vector<VertexData> {
+     explicit DecodedVerts(std::vector<VertexData>&& v) : std::vector<VertexData>(std::move(v)) {}
+     mutable HostPtr<void> emit_cache;
++    // r45p NWII_P_DLMERGE: a display-list draw made of several draws of the list that follow one
++    // another with no command between them (same primitive): their vertex counts, in order (the
++    // renderer makes the indices part by part: the same primitives in the same order). Empty: one draw.
++    std::vector<uint16_t> parts;
++    // r45p: the parts' own decoded vertices (owning: they live as long as this), so the renderer can
++    // give back their GPU-XF arena slots while the fused draw replaces them.
++    std::vector<HostPtr<const DecodedVerts>> part_dv;
+ };
+ 
+ // Deferred draw payload: raw vertex bytes plus the parse-time state needed to
+diff --color -ruN r41m/nWiiRuntime_m6i/src/core/main.cpp r45p/nWiiRuntime/src/core/main.cpp
+--- r41m/nWiiRuntime_m6i/src/core/main.cpp	2026-11-15 20:35:19.729051847 -0500
++++ r45p/nWiiRuntime/src/core/main.cpp	2026-11-16 03:14:04.028811010 -0500
+@@ -231,6 +231,13 @@
+       {"NWII_A_REQSPIN", "200", "NWII_A_OFF"},          // frente A: giro de peticiones
+       {"NWII_AXFX_KERNEL", "4", "NWII_A_OFF", false},    // frente A: reverb vectorizada (objeto output_24 de A), preparado
+       {"NWII_M_LOGBG", "1", "NWII_M_OFF"},              // frente M: registro en hilo de fondo (lo lee ANTES logbg_start, misma regla)
++      // r45p (frente P, selector de mundos): consola P31-P48; decisión del coordinador (tanda P42-P47: P43 DLMERGE+CULLSKIP 59,8)
++      {"NWII_P_DLMERGE", "1", "NWII_P_OFF"},            // draws seguidos de una lista fundidos (selector: render 21,7 -> 13,7 ms)
++      {"NWII_P_CULLSKIP", "1", "NWII_P_OFF"},           // sin prueba de recorte tras un fotograma sin recortes
++      {"NWII_P_TRIPLE", "1", "NWII_P_OFF", false},      // preparado: tres paquetes (selector +1 fps solo; junto con el resto, peor)
++      {"NWII_P_KEEPCOPY", "1", "NWII_P_OFF", false},    // preparado (necesita TRIPLE): no descartar un fotograma con una copia EFB única
++      {"NWII_R2_COPYMRT", "1", "NWII_P_OFF", false},    // preparado: hundía el desierto con copias grandes (P28: 59 -> 47)
++      {"NWII_P_MRT_SMALL", "32", "NWII_P_OFF", false},  // preparado: con COPYMRT, solo copias de hasta 32x32 (P36: desierto 59,1)
+   };
+   if (std::getenv("NWII_M6_OFF")) {
+     std::printf("[M6] NWII_M6_OFF: sin valores por defecto de m6\n");
+diff --color -ruN r41m/nWiiRuntime_m6i/src/hle/gx/fifo_parser.cpp r45p/nWiiRuntime/src/hle/gx/fifo_parser.cpp
+--- r41m/nWiiRuntime_m6i/src/hle/gx/fifo_parser.cpp	2026-11-15 19:04:30.980293639 -0500
++++ r45p/nWiiRuntime/src/hle/gx/fifo_parser.cpp	2026-11-16 01:41:32.669928431 -0500
+@@ -841,6 +841,21 @@
+     uint16_t reg = 0, length = 0;
+     uint32_t ci = 0, val = 0, bp_raw = 0;
+ };
++// r45p NWII_P_DLMERGE=1: a run of memo draws [k0, k1) of a list, consecutive in `cmds` (no command
++// between them: same render state, same matrices), same primitive (quads, triangles, strips or
++// fans), replayed as ONE draw whose vertices are theirs concatenated (DecodedVerts::parts = their
++// counts) with its own emit-cache entry: the renderer does the per-draw work (state test, cull
++// test, GPU-XF entry, palette, texgen record) once per run instead of once per draw, and still
++// makes the indices of each part as before. Made when every part has a valid memo; made again when
++// a part's vertices change (Retire, as the memos); not used for a frame in which a part is not valid
++// (the parts then go one by one, as without the switch).
++struct DLFuseGroup {
++    uint32_t k0 = 0, k1 = 0;               // memo range
++    HostPtr<const DecodedVerts> dv;         // the fused vertices (owning)
++    const void* entry = nullptr;            // GX_PrepDrawForRender(dv)
++    std::vector<const DecodedVerts*> src;   // the parts' memo vertices it was made from
++    bool bad = false;                       // never fused (flags differ / too many vertices)
++};
+ struct DLCacheEntry {
+     uint64_t state_hash;
+     uint64_t content_hash;
+@@ -855,6 +870,9 @@
+     uint64_t chunks_hash = 0;
+     bool chunks_ok = false;
+     bool memo_init = false;
++    std::vector<DLFuseGroup> fgroups;  // r45p NWII_P_DLMERGE
++    std::vector<int32_t> fg_of;        // r45p: memo index -> its group if it starts one, else -1
++    bool fg_init = false;
+ };
+ extern uint64_t g_gx_drain_epoch;
+ static std::unordered_map<uint64_t, DLCacheEntry> s_dl_cache;
+@@ -868,6 +886,7 @@
+ }
+ static void RetireEntry(DLCacheEntry& e) {
+     for (DLDrawMemo& m : e.memo) Retire(m.dv);
++    for (DLFuseGroup& g : e.fgroups) Retire(g.dv);  // r45p
+ }
+ void FifoParser::SetFrameSeq(uint64_t frame_seq) { s_frame_seq = frame_seq; }
+ void FifoParser::ReleaseRetired(uint64_t min_live_seq) {
+@@ -1654,12 +1673,88 @@
+         printf("[DLMEMO_CHECK] checked=%llu mismatches=%llu\n", (unsigned long long)n, (unsigned long long)bad);
+ }
+ 
++// r45p NWII_P_DLMERGE (see DLFuseGroup)
++static bool DLMergeOn() {
++    static const bool on = [] {
++        const char* v = NWII_ENV("NWII_P_DLMERGE");
++        const bool o = v && v[0] == '1';
++        if (o) std::printf("[P45DL] NWII_P_DLMERGE=1: draws seguidos de una lista sin ordenes en medio fundidos en uno\n");
++        return o;
++    }();
++    return on;
++}
++static constexpr size_t kDLMergeMaxParts = 1024;
++static constexpr size_t kDLMergeMaxVerts = 4096;
++static uint64_t s_dlm_groups = 0, s_dlm_parts = 0, s_dlm_made = 0, s_dlm_bad = 0;
++static inline bool SameVtxFlags(const VertexData& a, const VertexData& b) {
++    return a.has_pos == b.has_pos && a.has_norm == b.has_norm && a.pre_xf == b.pre_xf &&
++           a.has_color == b.has_color && std::memcmp(a.has_tex, b.has_tex, sizeof a.has_tex) == 0;
++}
++// Every part valid now (as the plain memo path tests it) and the fused vertices made of the parts'
++// current ones (made again if a part changed). False: replay the parts one by one this time.
++static bool RangesHashSpan(const std::pair<uint32_t, uint32_t>* ranges, size_t n, uint64_t& out);
++static bool DLFuseReady(DLCacheEntry& e, DLFuseGroup& G, bool list_ok) {
++    for (uint32_t j = G.k0; j < G.k1; ++j) {
++        const DLDrawMemo& mj = e.memo[j];
++        if (!mj.dv || !mj.has_entry || mj.dv->empty()) return false;
++        if (!list_ok) {
++            uint64_t h;
++            if (!(RangesHashSpan(e.ranges.data() + mj.r0, mj.rn, h) && h == mj.hash)) return false;
++        }
++    }
++    bool same = G.dv && G.src.size() == G.k1 - G.k0;
++    for (uint32_t j = G.k0; same && j < G.k1; ++j) same = G.src[j - G.k0] == e.memo[j].dv.get();
++    if (same) return true;
++    size_t total = 0;
++    const VertexData& f0 = (*e.memo[G.k0].dv)[0];
++    for (uint32_t j = G.k0; j < G.k1; ++j) {
++        const DecodedVerts& d = *e.memo[j].dv;
++        total += d.size();
++        if (d.size() > 0xFFFF || !d.parts.empty()) { G.bad = true; ++s_dlm_bad; return false; }
++        for (const VertexData& vd : d)
++            if (!SameVtxFlags(vd, f0)) { G.bad = true; ++s_dlm_bad; return false; }
++    }
++    if (total > kDLMergeMaxVerts) { G.bad = true; ++s_dlm_bad; return false; }
++    std::vector<VertexData> all;
++    all.reserve(total);
++    std::vector<uint16_t> parts;
++    parts.reserve(G.k1 - G.k0);
++    G.src.clear();
++    for (uint32_t j = G.k0; j < G.k1; ++j) {
++        const DecodedVerts& d = *e.memo[j].dv;
++        all.insert(all.end(), d.begin(), d.end());
++        parts.push_back((uint16_t)d.size());
++        G.src.push_back(&d);
++    }
++    auto nd = MakeHost<DecodedVerts>(std::move(all));
++    nd->parts = std::move(parts);
++    nd->part_dv.reserve(G.k1 - G.k0);
++    for (uint32_t j = G.k0; j < G.k1; ++j) nd->part_dv.push_back(e.memo[j].dv);
++    Retire(G.dv);
++    G.dv = nd;
++    GXCommand c;
++    c.type = GXCommandType::DrawPrimitive;
++    c.prim_type = e.memo[G.k0].prim_type;
++    c.shared_vertices = nd;
++    static std::vector<uint32_t> s_no_pack2;  // (display-list draws never write GPU XF words)
++    G.entry = GX_PrepDrawForRender(c, s_no_pack2);
++    ++s_dlm_made;
++    return true;
++}
++void FifoParser::DLMergeStats(uint64_t& groups, uint64_t& parts, uint64_t& made, uint64_t& bad) {
++    groups = s_dlm_groups; parts = s_dlm_parts; made = s_dlm_made; bad = s_dlm_bad;
++    s_dlm_groups = s_dlm_parts = s_dlm_made = 0;
++}
+ static void ReplayMemo(DLCacheEntry& e, std::vector<GXCommand>& commands) {
+     const std::vector<GXCommand>& cached = e.cmds;
+     const size_t ncached = cached.size();
+     if (!e.memo_init || e.ranges.size() > (1u << 16)) {
+         for (DLDrawMemo& m : e.memo) Retire(m.dv);
+         e.memo.clear();
++        for (DLFuseGroup& g : e.fgroups) Retire(g.dv);  // r45p
++        e.fgroups.clear();
++        e.fg_of.clear();
++        e.fg_init = false;
+         for (size_t ci = 0; ci < ncached; ++ci) {
+             const GXCommand& c = cached[ci];
+             if (c.type != GXCommandType::DrawPrimitive) continue;
+@@ -1678,6 +1773,29 @@
+         e.chunks_ok = false;
+         e.memo_init = true;
+     }
++    if (DLMergeOn() && !e.fg_init) {  // r45p: the runs of the list (from its commands only)
++        e.fg_init = true;
++        e.fg_of.assign(e.memo.size(), -1);
++        const size_t nmm = e.memo.size();
++        for (size_t j = 0; j < nmm;) {
++            const uint8_t prim = e.memo[j].prim_type & 0xF8;
++            size_t q = j + 1;
++            if (prim == 0x80 || prim == 0x90 || prim == 0x98 || prim == 0xA0)
++                while (q < nmm && e.memo[q].ci == e.memo[q - 1].ci + 1 && (e.memo[q].prim_type & 0xF8) == prim &&
++                       q - j < kDLMergeMaxParts)
++                    ++q;
++            if (q - j >= 2) {
++                e.fg_of[j] = (int32_t)e.fgroups.size();
++                DLFuseGroup g;
++                g.k0 = (uint32_t)j;
++                g.k1 = (uint32_t)q;
++                e.fgroups.push_back(std::move(g));
++                j = q;
++            } else {
++                j = j + 1;
++            }
++        }
++    }
+     static const bool s_dlvalid = [] { const char* v = NWII_ENV("NWII_DLMEMO_LIST"); return !(v && v[0] == '0'); }();
+     bool list_ok = false;  // every memo valid: the list's chunks did not change
+     if (s_dlvalid && e.chunks_ok) {
+@@ -1701,6 +1819,30 @@
+                 ++s_light_skipped;
+                 continue;
+             }
++            if (e.fg_init && e.fg_of.size() == nm && e.fg_of[k - 1] >= 0) {  // r45p NWII_P_DLMERGE
++                DLFuseGroup& G = e.fgroups[(size_t)e.fg_of[k - 1]];
++                if (!G.bad && DLFuseReady(e, G, list_ok)) {
++                    commands.emplace_back();
++                    GXCommand& c = commands.back();
++                    c.type = GXCommandType::DrawPrimitive;
++                    c.reg = m.reg;
++                    c.val = m.val;
++                    c.bp_raw = m.bp_raw;
++                    c.stale_copy = m.stale_copy;
++                    c.length = m.length;
++                    c.prim_type = m.prim_type;
++                    c.shared_vertices = HostPtr<const DecodedVerts>(HostPtr<const DecodedVerts>(), G.dv.get());
++                    g_prof_decode_hits += G.k1 - G.k0;
++                    ix.draws.push_back((uint32_t)(commands.size() - 1));
++                    ix.ents.push_back(G.entry);
++                    ++s_dlm_groups;
++                    s_dlm_parts += G.k1 - G.k0;
++                    ci = e.memo[G.k1 - 1].ci;  // the parts are consecutive commands: skip them
++                    k = G.k1;
++                    next_draw = k < nm ? e.memo[k].ci : ncached;
++                    continue;
++                }
++            }
+             if (k + 2 < nm) {
+                 const DLDrawMemo& m2 = e.memo[k + 2];
+                 __builtin_prefetch(&m2);
+diff --color -ruN r41m/nWiiRuntime_m6i/src/hle/gx/renderer_gl.cpp r45p/nWiiRuntime/src/hle/gx/renderer_gl.cpp
+--- r41m/nWiiRuntime_m6i/src/hle/gx/renderer_gl.cpp	2026-11-15 19:04:30.985338206 -0500
++++ r45p/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-16 01:41:32.673267351 -0500
+@@ -2399,6 +2399,7 @@
+ GLuint r2_mrt_fbo(const GLuint *tex, int n);
+ }}}
+ namespace nwii::runtime::gx {
++static struct { GLint v[8]; float down; bool ok; } s_copy_cu = {{0}, 0.0f, false};  // r39r2 COPYUNI cache
+ static void CopyEfbToTexture(uint32_t val) {
+   uint32_t dest = g_state.efbCopyDest;
+   uint32_t w = g_state.efbW, h = g_state.efbH;
+@@ -2481,7 +2482,7 @@
+   // r39r2 NWII_R2_COPYUNI=1: the copy program keeps its uniforms between
+   // copies; only the ones whose value changed are set (same values).
+   static const bool s_cu_on = [] { const char *e = NWII_ENV("NWII_R2_COPYUNI"); return e && e[0] == '1'; }();
+-  static struct { GLint v[8]; float down; bool ok; } s_cu = {{0}, 0.0f, false};
++  auto &s_cu = s_copy_cu;  // r45p: file scope (NWII_P_MRT_CHECK also uses the program)
+   {
+     const GLint sx = down ? (GLint)g_state.efbSrcX : sx0, sy = down ? (GLint)g_state.efbSrcY : sy0;
+     const GLint nv[8] = {sx, sy, s_efb_h, (GLint)half, (GLint)fmt, (GLint)intensity, (GLint)EfbHasAlpha(), 0};
+@@ -2576,6 +2577,70 @@
+   if (rph::On()) ++rph::s_ncopy;
+ }
+ 
++// ---- r45p NWII_P_RUNSTAT=1: entre dos draws seguidos, ¿qué órdenes hay? ----------
++// Clases del hueco: nada (draw tras draw), solo cargas de matrices XF (0x000-0x0FF posición/textura,
++// 0x400 normal, 0x500 post), otras escrituras XF, BP, CP, copia EFB. Por fotograma: draws, huecos de
++// cada clase (la más «fuerte» que contenga), y draws cuyo hueco anterior solo tuvo matrices.
++static bool s_p_runstat = false, s_p_stalelog = false;  // r45p: read once (RenderOnce's InitFlags), no guard per command
++static inline bool PRunStatOn() { return s_p_runstat; }
++static uint32_t s_prs_cls = 0;  // bits del hueco actual: 1 mtx, 2 xf otro, 4 bp, 8 cp, 16 copia, 32 otro
++static bool s_prs_seen = false;
++static uint64_t st_prs_draws = 0, st_prs_frames = 0, st_prs_gap[7] = {};
++static uint64_t st_prs_bpregs[256] = {};
++static void PRunStatCmd(const GXCommand &c) {
++  if (c.type == GXCommandType::DrawPrimitive) {
++    ++st_prs_draws;
++    if (s_prs_seen) {
++      int k = 0;
++      if (s_prs_cls == 0) k = 0;
++      else if (s_prs_cls == 1) k = 1;
++      else if (s_prs_cls & 16) k = 6;
++      else if (s_prs_cls & 4) k = 4;
++      else if (s_prs_cls & 8) k = 5;
++      else if (s_prs_cls & 2) k = 2;
++      else k = 3;
++      ++st_prs_gap[k];
++    }
++    s_prs_seen = true;
++    s_prs_cls = 0;
++    return;
++  }
++  if (c.type == GXCommandType::XFRegister) {
++    const int a = (int)c.reg;
++    if (a < 0x100 || (a >= 0x400 && a < 0x460) || (a >= 0x500 && a < 0x600)) s_prs_cls |= 1;
++    else s_prs_cls |= 2;
++  } else if (c.type == GXCommandType::BPRegister) {
++    s_prs_cls |= (c.reg == 0x52) ? 16 : 4;
++    if (c.reg != 0x52) ++st_prs_bpregs[c.reg & 0xFF];
++  } else if (c.type == GXCommandType::CPRegister) {
++    s_prs_cls |= 8;
++  } else {
++    s_prs_cls |= 32;
++  }
++}
++static void PRunStatFrame() {
++  s_prs_seen = false;
++  s_prs_cls = 0;
++  if (++st_prs_frames < 120) return;
++  const double f = (double)st_prs_frames;
++  printf("[P45RUN] por fotograma: draws %.0f | hueco antes del draw: nada %.0f, solo matrices %.0f, otro XF %.0f, "
++         "otro %.0f, BP %.0f, CP %.0f, copia %.0f | BP mas frecuentes:",
++         st_prs_draws / f, st_prs_gap[0] / f, st_prs_gap[1] / f, st_prs_gap[2] / f, st_prs_gap[3] / f, st_prs_gap[4] / f,
++         st_prs_gap[5] / f, st_prs_gap[6] / f);
++  for (int t = 0; t < 8; ++t) {
++    int best = -1;
++    for (int r = 0; r < 256; ++r)
++      if (st_prs_bpregs[r] && (best < 0 || st_prs_bpregs[r] > st_prs_bpregs[best])) best = r;
++    if (best < 0) break;
++    printf(" %02X:%.0f", best, st_prs_bpregs[best] / f);
++    st_prs_bpregs[best] = 0;
++  }
++  printf("\n");
++  st_prs_draws = st_prs_frames = 0;
++  for (auto &g : st_prs_gap) g = 0;
++  for (auto &b : st_prs_bpregs) b = 0;
++}
++
+ // ---- r39r2 NWII_R2_COPYMRT=1: EFB copies made together -----------------------
+ // The ~20 animated-tile copies of a frame come one after another with no draw
+ // between them. A copy that needs nothing but the plain path (scaled, not
+@@ -2596,7 +2661,24 @@
+   unsigned char cc[4];
+   int cr[4];             // clear rectangle, GL coords
+   GLuint tex;
++  GLuint chk = 0;        // r45p NWII_P_MRT_CHECK: the same copy made at queue time by the one-copy shader
++  bool intensity = false;
+ };
++// r45p NWII_P_MRT_CHECK=1: every queued copy is ALSO made at once (queue time, the
++// EFB as the old path reads it) with the one-copy program into a scratch texture;
++// when the queue is made, each MRT output is read back and compared byte by byte.
++static bool PMrtCheckOn() {
++  static const bool on = [] {
++    const char *e = NWII_ENV("NWII_P_MRT_CHECK");
++    const bool v = e && e[0] == '1';
++    if (v) printf("[P45] NWII_P_MRT_CHECK=1: cada copia de la cola MRT comparada con la copia de una en una\n");
++    return v;
++  }();
++  return on;
++}
++static uint64_t st_pmc_copies = 0, st_pmc_bad = 0, st_pmc_px = 0;
++static GLuint PMrtCheckSnap(const struct R2PendCopy &p);
++static void PMrtCheckCompare(const struct R2PendCopy &p);
+ static std::vector<R2PendCopy> s_r2_pend;
+ static GLuint s_copy8_prog = 0;
+ static GLint s_c8_src = -1, s_c8_h = -1, s_c8_fmt = -1, s_c8_alpha = -1, s_c8_efb = -1;
+@@ -2715,6 +2797,14 @@
+     i = j;
+   }
+   CBindTexture(0, 0);
++  if (PMrtCheckOn())  // r45p
++    for (auto &p : s_r2_pend)
++      if (p.chk) {
++        PMrtCheckCompare(p);
++        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);  // detach
++        glDeleteTextures(1, &p.chk);
++        p.chk = 0;
++      }
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, s_efb_fbo);
+   s_r2_efb_fbo_ref = s_efb_fbo;
+   s_r2_efb_off = true;
+@@ -2753,6 +2843,75 @@
+   s_r2_pend.clear();
+   rph::Set(r2ph0);
+ }
++static GLuint PMrtCheckSnap(const R2PendCopy &p) {
++  GLuint t = 0;
++  glGenTextures(1, &t);
++  CActiveUnit(0);
++  glBindTexture(GL_TEXTURE_2D, t);
++  g_gl.tex[0] = t;
++  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)p.pw, (GLsizei)p.ph, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++  CBindTexture(0, 0);
++  InitCopyShader();
++  // own framebuffer (r2_tex_fbo keys its cache by texture name: these names are deleted and reused)
++  static GLuint s_pmc_fbo = 0;
++  if (!s_pmc_fbo) glGenFramebuffers(1, &s_pmc_fbo);
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_pmc_fbo);
++  glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0);
++  CViewport(0, 0, (GLsizei)p.pw, (GLsizei)p.ph);
++  CEnable(kEnScissor, GL_SCISSOR_TEST, false);
++  CEnable(kEnBlend, GL_BLEND, false);
++  CEnable(kEnDepth, GL_DEPTH_TEST, false);
++  CEnable(kEnCull, GL_CULL_FACE, false);
++  CEnable(kEnLogic, GL_COLOR_LOGIC_OP, false);
++  CColorMask(true, true);
++  CUseProgram(s_copy_prog);
++  glUniform3i(s_cp_src, p.sx0, p.sy0, s_efb_h);
++  glUniform1f(s_cp_down, 0.0f);
++  glUniform1i(s_cp_half, 0);
++  glUniform1i(s_cp_fmt, (GLint)p.fmt);
++  glUniform1i(s_cp_int, 0);
++  glUniform1i(s_cp_alpha, p.alpha ? 1 : 0);
++  glUniform1i(s_cp_efb, 0);
++  s_copy_cu.ok = false;  // the one-copy path sets all its uniforms again
++  g_gl.unit = -1;
++  CBindTexture(0, s_efb_tex);
++  CBindVertexArray(s_copy_vao);
++  glDrawArrays(GL_TRIANGLES, 0, 3);
++  CBindTexture(0, 0);
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, s_efb_fbo);
++  s_r2_efb_fbo_ref = s_efb_fbo;
++  s_r2_efb_off = true;
++  s_gl_state_dirty = true;
++  return t;
++}
++static void PMrtCheckCompare(const R2PendCopy &p) {
++  static std::vector<unsigned char> a, b;
++  a.resize((size_t)p.pw * p.ph * 4);
++  b.resize(a.size());
++  nwii::runtime::hle::r2_tex_fbo(p.tex, GL_READ_FRAMEBUFFER);
++  glReadPixels(0, 0, (GLsizei)p.pw, (GLsizei)p.ph, GL_RGBA, GL_UNSIGNED_BYTE, a.data());
++  static GLuint s_pmc_rfbo = 0;
++  if (!s_pmc_rfbo) glGenFramebuffers(1, &s_pmc_rfbo);
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, s_pmc_rfbo);
++  glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, p.chk, 0);
++  glReadPixels(0, 0, (GLsizei)p.pw, (GLsizei)p.ph, GL_RGBA, GL_UNSIGNED_BYTE, b.data());
++  size_t d = 0;
++  for (size_t i = 0; i < a.size(); i += 4)
++    if (std::memcmp(&a[i], &b[i], 4)) ++d;
++  ++st_pmc_copies;
++  if (d) {
++    ++st_pmc_bad;
++    st_pmc_px += d;
++    if (st_pmc_bad <= 16)
++      printf("[P45MRT] DISTINTA copia dest=%08X %ux%u (gl %ux%u) fmt=%u alpha=%d: %zu px | xfb %ld\n", p.dest, p.dw,
++             p.dh, p.pw, p.ph, p.fmt, (int)p.alpha, d, s_xfb_copies);
++  }
++  if (st_pmc_copies % 5000 == 0)
++    printf("[P45MRT] copias comprobadas %llu, distintas %llu (%llu px)\n", (unsigned long long)st_pmc_copies,
++           (unsigned long long)st_pmc_bad, (unsigned long long)st_pmc_px);
++}
+ // Queues the copy of BP 0x52 `val` (a TEX copy, not stale) if it can wait; false: make it now.
+ static bool R2QueueCopy(uint32_t val) {
+   if (!R2MrtOn() || s_r8_pass || DrawTraceOn() || !R2CopySt()) return false;
+@@ -2762,6 +2921,15 @@
+   w = std::min<uint32_t>(w, kEfbWidth - g_state.efbSrcX);
+   h = std::min<uint32_t>(h, kEfbHeight - g_state.efbSrcY);
+   if (!dest || w == 0 || h == 0 || w > 1024 || h > 1024) return false;
++  // r45p NWII_P_MRT_SMALL=<n>: only copies of at most n x n texels go to the MRT queue (the 32x32 tile
++  // cells of the world selector and the animated tiles); larger ones (screen captures) the one-copy path.
++  static const uint32_t s_mrt_small = [] {
++    const char *e = NWII_ENV("NWII_P_MRT_SMALL");
++    const uint32_t v = e ? (uint32_t)std::atoi(e) : 0u;
++    if (v) printf("[P45] NWII_P_MRT_SMALL=%u: solo copias de hasta %ux%u a la cola MRT\n", v, v, v);
++    return v;
++  }();
++  if (s_mrt_small && (w > s_mrt_small || h > s_mrt_small)) return false;
+   const bool half = (val >> 9) & 1;
+   const bool intensity = ((val >> 15) & 1) && ((val >> 16) & 1);
+   if (half || intensity || s_scale == 1.0f || s_iscale) return false;
+@@ -2801,6 +2969,7 @@
+   for (const auto &q : s_r2_pend)
+     if (q.dest == dest || (q.clear && R2RectsMeet(q.cr, p.sr))) { R2FlushCopies(); break; }
+   if (val & 0x800) g_state.pe_clear_pending = false;  // as ClearEfbCopySource
++  if (PMrtCheckOn()) p.chk = PMrtCheckSnap(p);  // r45p
+   s_r2_pend.push_back(p);
+   if (s_r2_pend.size() >= 32) R2FlushCopies();
+   return true;
+@@ -3031,9 +3200,30 @@
+   s_batch.push_back(bv);
+ }
+ 
++// r45p NWII_P_DLMERGE: the parts (vertex counts) of the draw being emitted, set by DrawPrimitive
++// around EmitPrimitive; EmitIndices then makes each part's indices as its own draw did.
++static const std::vector<uint16_t> *s_emit_parts = nullptr;
++// r45p: parts of the fused draw that the cull test rejected (xf::Emit; null: none): no indices for them
++// (a part entirely outside the clip volume makes no fragment: the same image, less GPU work).
++static const std::vector<uint8_t> *s_emit_part_skip = nullptr;
++static void EmitIndices1(uint8_t prim, uint32_t b, uint32_t n);
++static void EmitIndices(uint8_t prim, uint32_t b, uint32_t n) {
++  if (__builtin_expect(s_emit_parts != nullptr, 0)) {
++    uint32_t at = 0;
++    size_t j = 0;
++    for (const uint16_t k : *s_emit_parts) {
++      if (at + k > n) break;
++      if (!(s_emit_part_skip && j < s_emit_part_skip->size() && (*s_emit_part_skip)[j])) EmitIndices1(prim, b + at, k);
++      at += k;
++      ++j;
++    }
++    return;
++  }
++  EmitIndices1(prim, b, n);
++}
+ // Expand a GX primitive into triangle indices over its vertices, which start
+ // at `b` in s_batch.
+-static void EmitIndices(uint8_t prim, uint32_t b, uint32_t n) {
++static void EmitIndices1(uint8_t prim, uint32_t b, uint32_t n) {
+   // Sized once and written in place (R5 perf: the per-triangle
+   // insert(initializer_list) was ~7% of the host thread in Peach's party).
+   auto &ix = s_batch_idx;
+@@ -3520,7 +3710,13 @@
+     return; // shader for this state not ready yet
+   const size_t trace_base = s_batch.size();
+   rph::Set(rph::kEmit);
++  {
++    const DecodedVerts *pdv = cmd.shared_vertices.get();  // r45p NWII_P_DLMERGE
++    s_emit_parts = (pdv && !pdv->parts.empty()) ? &pdv->parts : nullptr;
++  }
+   EmitPrimitive(cmd);
++  s_emit_parts = nullptr;
++  s_emit_part_skip = nullptr;
+   if (DrawTraceOn()) {
+     if (DrawTrace(cmd, trace_base)) {
+     char lbl[32];
+@@ -4102,6 +4298,12 @@
+   // set with xi when every vertex has a position (xi.ok, xi.hp).
+   bool x_bb_ok = false;
+   float x_bb[6] = {};
++  // r45p NWII_P_DLMERGE: the raw-position box of each part of a fused draw (6 floats a part) and
++  // whether it is usable (render thread only, made at its first cull test).
++  bool p_init = false;
++  bool p_freed = false;  // the parts' arena slots were given back (first emit of the fused draw)
++  std::vector<float> p_bb;
++  std::vector<uint8_t> p_ok;
+   // R14 R5, NWII_GPU_XF_MDI: the draw's triangle indices (local vertex
+   // numbers) kept in the GPU XF arena like its vertices: arena unit, count,
+   // the primitive they were made for.
+@@ -5606,6 +5808,7 @@
+ // draw is skipped (its state, textures and batch were set up before Emit).
+ // NWII_R_CULL=1 on (default off).
+ static uint64_t st_culled = 0, st_culled_packed = 0;
++static uint64_t st_p_slots_freed = 0;  // r45p: arena slots of fused parts given back
+ // r12: RenderOnce already ran the test on this draw (and kept it): Emit skips it.
+ static bool s_cull_done = false;
+ static bool CullOn() {
+@@ -5615,6 +5818,38 @@
+   }();
+   return on;
+ }
++// r45p NWII_P_CULLSKIP=1: the cull test only saves work, never changes the image
++// (a rejected draw makes no fragment either way). When a frame tests >= 1000
++// draws and rejects none (the world selector: 10 000 draws, all on screen, the
++// test ~0,8 ms a frame on the Switch), the next 15 frames skip the test; then
++// it is tried again. Frames that reject draws keep testing every frame.
++static bool s_p_cull_off = false;  // this frame: no cull test
++static uint32_t s_p_cull_tested = 0, s_p_cull_hits = 0, s_p_cull_skip = 0;
++static uint64_t st_p_cull_framesoff = 0, st_p_cull_frames = 0;
++static bool PCullSkipOn() {
++  static const bool on = [] {
++    const char *e = NWII_ENV("NWII_P_CULLSKIP");
++    const bool v = e && e[0] == '1';
++    if (v) printf("[P45] NWII_P_CULLSKIP=1: sin prueba de recorte 15 fotogramas tras uno sin recortes\n");
++    return v;
++  }();
++  return on;
++}
++static void PCullFrame() {  // start of each RenderOnce
++  if (!PCullSkipOn()) return;
++  if (!s_p_cull_off && s_p_cull_tested >= 1000 && s_p_cull_hits == 0) s_p_cull_skip = 15;
++  s_p_cull_tested = s_p_cull_hits = 0;
++  s_p_cull_off = s_p_cull_skip > 0;
++  if (s_p_cull_skip) --s_p_cull_skip;
++  ++st_p_cull_frames;
++  if (s_p_cull_off) ++st_p_cull_framesoff;
++  if (st_p_cull_frames == 600) {
++    printf("[P45C] fotogramas sin prueba de recorte: %llu de %llu\n", (unsigned long long)st_p_cull_framesoff,
++           (unsigned long long)st_p_cull_frames);
++    st_p_cull_frames = st_p_cull_framesoff = 0;
++  }
++}
++static inline bool PCullTest(const float bb[6], int mi);
+ static bool Culled(const float bb[6], int mi) {
+   // Each clip plane d = +-x_clip - w_clip (or y) is an affine function of the
+   // object-space position: d(P) = c0*x + c1*y + c2*z + c3, built from the
+@@ -5670,6 +5905,13 @@
+   return false;
+ }
+ 
++static inline bool PCullTest(const float bb[6], int mi) {  // r45p: Culled + counters
++  const bool c = Culled(bb, mi);
++  ++s_p_cull_tested;
++  s_p_cull_hits += c;
++  return c;
++}
++
+ // ---- per draw ----------------------------------------------------------------
+ static void Emit(const GXCommand &cmd, uint8_t prim) {
+   const auto &v = cmd.verts();  // (a reference: read only when needed)
+@@ -5687,19 +5929,63 @@
+   // One position matrix, in range: the GPU path transforms by it, and so does
+   // the CPU path (EmitRange) of a draw with colour-sourced texgen.
+   if (ce && !s_cull_done && ce->x_bb_ok && ce->xi.ok && ce->xi.hp && ce->xi.npos == 1 && n &&
+-      (ce->xi.pos[0] & 0x3F) * 4 + 12 <= 256 && CullOn() &&
+-      Culled(ce->x_bb, ce->xi.pos[0] & 0x3F)) {
++      (ce->xi.pos[0] & 0x3F) * 4 + 12 <= 256 && CullOn() && !s_p_cull_off &&
++      PCullTest(ce->x_bb, ce->xi.pos[0] & 0x3F)) {
+     ++st_culled;
+     return;
+   }
+   // r36r NWII_R_CULL: the same for a draw packed on the worker (not a display list).
+   if (ph && ph->bb_ok && ph->xi.ok && ph->xi.hp && ph->xi.npos == 1 && n &&
+-      (ph->xi.pos[0] & 0x3F) * 4 + 12 <= 256 && CullOn() &&
+-      Culled(ph->bb, ph->xi.pos[0] & 0x3F)) {
++      (ph->xi.pos[0] & 0x3F) * 4 + 12 <= 256 && CullOn() && !s_p_cull_off &&
++      PCullTest(ph->bb, ph->xi.pos[0] & 0x3F)) {
+     ++st_culled;
+     ++st_culled_packed;
+     return;
+   }
++  // r45p NWII_P_DLMERGE: the parts' arena slots (unused while the fused draw replaces them; a part
++  // drawn alone again gets a new one) go back to the arena, a frame later as any freed slot.
++  if (ce && s_emit_parts && !ce->p_freed) {
++    ce->p_freed = true;
++    if (const DecodedVerts *fd = cmd.shared_vertices.get())
++      for (const auto &pd : fd->part_dv)
++        if (pd && pd->emit_cache) {
++          ecache::Entry *pe = static_cast<ecache::Entry *>(pd->emit_cache.get());
++          if (pe->x_slot >= 0) {
++            ArenaFree((uint32_t)pe->x_slot, pe->x_cls);
++            pe->x_slot = -1;
++            ++st_p_slots_freed;
++          }
++        }
++  }
++  // r45p NWII_P_DLMERGE: a fused draw kept whole: its parts one by one (same test, same matrix)
++  if (ce && s_emit_parts && !s_mdi && ce->x_bb_ok && ce->xi.ok && ce->xi.hp && ce->xi.npos == 1 &&
++      (ce->xi.pos[0] & 0x3F) * 4 + 12 <= 256 && CullOn() && !s_p_cull_off) {
++    const std::vector<uint16_t> &parts = *s_emit_parts;
++    if (!ce->p_init) {
++      ce->p_init = true;
++      ce->p_bb.assign(parts.size() * 6, 0.0f);
++      ce->p_ok.assign(parts.size(), 0);
++      size_t at = 0;
++      for (size_t j = 0; j < parts.size() && at + parts[j] <= v.size(); at += parts[j], ++j) {
++        float *b = &ce->p_bb[j * 6];
++        bool ok = parts[j] > 0;
++        for (size_t i = at; ok && i < at + parts[j]; ++i)
++          for (int q = 0; q < 3; ++q) {
++            const float x = v[i].pos[q];
++            if (!(x == x) || std::isinf(x)) { ok = false; break; }
++            if (i == at) { b[q] = b[3 + q] = x; }
++            else { b[q] = std::min(b[q], x); b[3 + q] = std::max(b[3 + q], x); }
++          }
++        ce->p_ok[j] = ok;
++      }
++    }
++    static std::vector<uint8_t> s_skip;
++    s_skip.assign(parts.size(), 0);
++    bool any = false;
++    for (size_t j = 0; j < parts.size(); ++j)
++      if (ce->p_ok[j] && PCullTest(&ce->p_bb[j * 6], ce->xi.pos[0] & 0x3F)) { s_skip[j] = 1; any = true; }
++    if (any) s_emit_part_skip = &s_skip;
++  }
+   TexGenCfg cfg;
+   PrepTexGen(cfg);
+   if (!ce && !ph) local = Analyze(v);
+@@ -6695,6 +6981,8 @@
+     static bool s_flags = false;
+     if (!s_flags) {
+       s_flags = true; InitFlags(); R2CopyTraceOn(); s_r2ks_on = NWII_ENV("NWII_R2_KEYSTAT") != nullptr;
++      s_p_runstat = NWII_ENV("NWII_P_RUNSTAT") != nullptr;  // r45p (diagnóstico)
++      s_p_stalelog = NWII_ENV("NWII_P_STALELOG") != nullptr;  // r45p (diagnóstico)
+       const char *tm = NWII_ENV("NWII_R2_TEXMEMO");
+       s_r2_texmemo_on = tm && tm[0] == '1';
+       if (s_r2_texmemo_on) printf("[R2] NWII_R2_TEXMEMO=1: texture lookups remembered between copies\n");
+@@ -6720,6 +7008,7 @@
+       s_efb_tex = (GLuint)tex;
+       nwii::runtime::hle::TextureCache::get().set_restore_read_fbo(s_efb_fbo);
+     }
++    xf::PCullFrame();  // r45p NWII_P_CULLSKIP
+     // The frontend touches GL between frames: forget the cached state.
+     GLInvalidate();
+     s_depth_range[0] = s_depth_range[1] = -1.0;
+@@ -6800,6 +7089,8 @@
+     const size_t ncmd = pass == 0 ? pre->size() : commands.size();
+     for (size_t ci = pass == 0 ? 0 : std::min(g_render_start, ncmd); ci < ncmd; ++ci) {  // r40d: start
+       const GXCommand &cmd = cmd0[ci];
++      // r45p NWII_P_RUNSTAT=1 (diagnóstico): qué hay entre un draw y el siguiente
++      if (__builtin_expect(s_p_runstat, 0)) PRunStatCmd(cmd);
+       // R14 R5: the command array is walked once, in order, 136 bytes a
+       // command (~45 000 per world-map frame, ~6 MB: the first load of each was
+       // the top miss of RenderOnce). Fetch 8 commands ahead.
+@@ -7002,6 +7293,13 @@
+             // (render-to-texture: light maps, animated tiles, previews).
+             CopyEfbToTexture(cmd.val);
+           }
++          // r45p NWII_P_STALELOG=1: copies to a texture of at least 128x128 (made, queued or stale)
++          if (__builtin_expect(s_p_stalelog, 0) && !(cmd.val & 0x4000) && !s_r8_pass) {
++            if (g_state.efbW * g_state.efbH >= 128u * 128u)
++              printf("[P45S] copia %s dest=%08X %ux%u src=%u,%u xfb=%ld\n",
++                     cmd.stale_copy ? "STALE (fotograma descartado: solo el borrado)" : (r2q ? "encolada" : "hecha"),
++                     g_state.efbCopyDest, g_state.efbW, g_state.efbH, g_state.efbSrcX, g_state.efbSrcY, s_xfb_copies);
++          }
+           if ((cmd.val & 0x800) && !r2q) {
+             ct52 = rph::T();
+             ClearEfbCopySource();
+@@ -7055,13 +7353,13 @@
+         // rejected draw does not set it up either (no texture lookup, no batch
+         // key, no GL state): the next drawn draw does, and joins the open batch
+         // when its state equals the batch's (same GL draws, fewer of them).
+-        if (s_early_cull && ecache::s_hint_ok && ecache::s_hint &&
++        if (s_early_cull && !xf::s_p_cull_off && ecache::s_hint_ok && ecache::s_hint &&
+             (s_cull_state || (s_batch_open && !s_state_dirty && !s_skip_draw)) && xf::Active() &&
+             !DrawTraceOn() && !DrawStatsOn() && (cmd.prim_type & 0xF8) < 0xA8) {
+           const ecache::Entry *ce = ecache::s_hint;
+           if (ce->x_init && ce->x_bb_ok && ce->xi.ok && ce->xi.hp && ce->xi.npos == 1 && ce->x_n &&
+               (ce->xi.pos[0] & 0x3F) * 4 + 12 <= 256) {
+-            if (xf::Culled(ce->x_bb, ce->xi.pos[0] & 0x3F)) {
++            if (xf::PCullTest(ce->x_bb, ce->xi.pos[0] & 0x3F)) {
+               ++g_prof_gx_draws;
+               ++s_cap_cur.gx_draws;
+               if (rph::On()) { ++rph::s_draws; rph::s_verts += ce->x_n; }
+@@ -7082,6 +7380,7 @@
+     }  // r36r: pass (prefix, frame)
+     rph::Set(rph::kFrame);
+     R2FlushCopies();  // r39r2 NWII_R2_COPYMRT
++    if (PRunStatOn()) PRunStatFrame();  // r45p
+     R2EfbBack();  // r39r2 NWII_R2_LAZYEFB
+     if (s_batch_open) {
+       FlushBatch();
+diff --color -ruN r41m/nWiiRuntime_m6i/src/hle/gx.cpp r45p/nWiiRuntime/src/hle/gx.cpp
+--- r41m/nWiiRuntime_m6i/src/hle/gx.cpp	2026-11-15 19:04:41.090145353 -0500
++++ r45p/nWiiRuntime/src/hle/gx.cpp	2026-11-16 00:59:31.305978711 -0500
+@@ -1046,7 +1046,7 @@
+ // one the worker fills; a filled one waits in s_ready until it is taken.
+ std::mutex s_pm;
+ std::condition_variable s_cv_worker, s_cv_main;
+-FramePacket s_pkts[2];
++FramePacket s_pkts[3];  // r45p NWII_P_TRIPLE: the third only with it
+ FramePacket *s_ready = nullptr, *s_rendering = nullptr;
+ FramePacket *s_late_pkt = nullptr;  // r39r2 NWII_R2_LATEFREE (render thread only)
+ bool s_stop = false;
+@@ -1312,6 +1312,152 @@
+     }
+ }
+ 
++// ---- r45p (frente P): NWII_P_TRIPLE ------------------------------------------
++// With two packets the worker, when a new frame end is parsed and the render
++// thread has not taken the waiting packet yet, TAKES IT BACK at once (acquire:
++// RetractToPrefix) and refills it: from then until the new frame is handed over
++// (the rest of PrepFrame: retraction with its destruction of ~30 000 commands,
++// split, decode, prep: 4-10 ms in the world selector) there is NO frame for the
++// render thread, which, when it is the slow side, finishes in that window and
++// waits (console, selector: 2,4 ms per drawn frame "sin fotograma que dibujar").
++// NWII_P_TRIPLE=1: three packets. The worker fills one that is neither drawn nor
++// waiting; the waiting one stays available to the render thread until the new
++// one is complete. Only then, if it is still waiting, it is retracted exactly as
++// before (same RetractToPrefix rules: its kept register writes, rcoal's dead
++// writes removed, EFB copies stale) and those commands go FIRST in the new
++// packet's `pre` (before the new batch's own dropped part), its parser seeds
++// first (the new ones override), its counters added: the render thread gets
++// the same command stream as when the retraction happened at acquire. The
++// retracted packet's dropped commands are destroyed after the hand-over (not in
++// the window). Needs NWII_R_PREFIX and NWII_R_COALESCE (defaults); off with
++// NWII_NOFRAMESKIP.
++static std::vector<nwii::runtime::gx::GXCommand> s_p_junk;  // worker only
++static uint64_t s_p_merges = 0, s_p_win_ns = 0, s_p_win_max = 0, s_p_pub = 0;
++static bool PTripleOn() {
++    static const bool on = [] {
++        const char *e = NWII_ENV("NWII_P_TRIPLE");
++        const bool want = e && e[0] == '1';
++        const bool ok = want && RPrefixOn() && rcoal::On() && NWII_ENV("NWII_NOFRAMESKIP") == nullptr;
++        if (want)
++            std::printf("[P45] NWII_P_TRIPLE=1: tres paquetes, el que espera sigue disponible hasta que el "
++                        "nuevo esta listo%s\n", ok ? "" : " -- NO se usa (necesita R_PREFIX y R_COALESCE, sin NOFRAMESKIP)");
++        return ok;
++    }();
++    return on;
++}
++// r45p (p45b): retracting the waiting packet with s_ready taken away left the render thread
++// without a frame for ~3,7 ms on the Switch (Compact over ~30 000 commands; first version). Now the waiting packet's kept
++// commands are COPIED while it is still available (rcoal::Mark only reads it; the copies get
++// stale_copy, as the moved ones did), and only if it is still waiting once that is done it is
++// taken: then the window is the splice of three vectors. s_p_reading (under s_pm) keeps the
++// render thread from freeing a packet the worker is reading (it then leaves it to the worker).
++static FramePacket *s_p_reading = nullptr;
++static std::vector<nwii::runtime::gx::GXCommand> s_p_kept;  // worker only
++static uint64_t s_p_kept_dropped = 0;
++static void CopyKept(const FramePacket &pkt) {
++    using nwii::runtime::gx::GXCommand;
++    using nwii::runtime::gx::GXCommandType;
++    const auto &v = pkt.frame;
++    const size_t b = std::min(pkt.start, v.size()), e = v.size();
++    s_p_kept.clear();
++    s_p_kept_dropped = 0;
++    rcoal::st_dead += rcoal::Mark(v, b, e);
++    ++rcoal::st_calls;
++    rcoal::st_in += e - b;
++    for (size_t i = b; i < e; ++i) {
++        const GXCommand &c = v[i];
++        if (c.type == GXCommandType::DrawPrimitive) { ++rcoal::st_draws; continue; }
++        if (rcoal::s_dead[i - b]) continue;
++        s_p_kept.push_back(c);
++        if (c.type == GXCommandType::BPRegister && c.reg == 0x52) {
++            if ((c.val & 0x4000) && !c.stale_copy) ++s_p_kept_dropped;
++            s_p_kept.back().stale_copy = true;
++        }
++    }
++}
++// r45p NWII_P_KEEPCOPY=1 (with NWII_P_TRIPLE): a waiting frame that holds an EFB copy to a texture
++// whose destination (BP 0x4B) the newer frame does not copy to again is NOT dropped: retracted, that
++// copy would only be cleared (stale) and the texture never made (the world selector's background:
++// one copy of the map, 640x456, when «−» is pressed; dropped, the background stays black). The worker
++// waits until the render thread takes it (at most ~100 ms) and hands the new one over after it.
++static bool PKeepCopyOn() {
++    static const bool on = [] {
++        const char *e = NWII_ENV("NWII_P_KEEPCOPY");
++        const bool v = e && e[0] == '1';
++        if (v) std::printf("[P45] NWII_P_KEEPCOPY=1: no se descarta un fotograma con una copia EFB que el siguiente no repite\n");
++        return v;
++    }();
++    return on;
++}
++static uint64_t s_p_kept_frames = 0, s_p_keep_wait_ns = 0;
++// The copy destinations (BP 0x4B value, 0xFFFFFFFF if the list set none before the copy) of the
++// texture copies (not XFB, not stale) in v[b, e).
++static void CopyDests(const std::vector<nwii::runtime::gx::GXCommand> &v, size_t b, std::vector<uint32_t> &out) {
++    using nwii::runtime::gx::GXCommandType;
++    uint32_t dest = 0xFFFFFFFFu;
++    for (size_t i = b; i < v.size(); ++i) {
++        const auto &c = v[i];
++        if (c.type != GXCommandType::BPRegister) continue;
++        if (c.reg == 0x4B) dest = c.val & 0xFFFFFF;
++        else if (c.reg == 0x52 && !(c.val & 0x4000) && !c.stale_copy) out.push_back(dest);
++    }
++}
++static bool HasLoneCopy(const FramePacket &old, const FramePacket &n) {
++    static std::vector<uint32_t> a, b;
++    a.clear();
++    b.clear();
++    CopyDests(old.frame, std::min(old.start, old.frame.size()), a);
++    if (a.empty()) return false;
++    CopyDests(n.pre, 0, b);
++    CopyDests(n.frame, std::min(n.start, n.frame.size()), b);
++    for (uint32_t d : a) {
++        if (d == 0xFFFFFFFFu) return true;
++        if (std::find(b.begin(), b.end(), d) == b.end()) return true;
++    }
++    return false;
++}
++// `old` was waiting and is now taken (s_ready cleared); its kept commands are in s_p_kept (CopyKept).
++static void SpliceRetracted(FramePacket &old, FramePacket &n) {
++    std::vector<nwii::runtime::gx::GXCommand> fin;
++    fin.swap(old.pre);
++    fin.reserve(fin.size() + s_p_kept.size() + n.pre.size());
++    fin.insert(fin.end(), std::make_move_iterator(s_p_kept.begin()), std::make_move_iterator(s_p_kept.end()));
++    fin.insert(fin.end(), std::make_move_iterator(n.pre.begin()), std::make_move_iterator(n.pre.end()));
++    n.pre.swap(fin);
++    s_p_junk.swap(fin);  // the moved-from shells, freed after the hand-over
++    s_p_kept.clear();
++    old.rprep.clear();
++    old.merges.clear();
++    old.draws.clear();
++    old.entries.clear();
++    old.pack.clear();
++    old.has_draws = false;
++    old.stats.dropped += s_p_kept_dropped;
++    ++old.stats.retracts;
++    // parser seeds (the retracted frame first, the new one overrides; as PrepFrame) and counters
++    auto &ns = n.state;
++    const auto &os = old.state;
++    for (int w = 0; w < 4; ++w) {
++        for (uint64_t m = os.seed_mask[w] & ~ns.seed_mask[w]; m; m &= m - 1) {
++            const int r = w * 64 + __builtin_ctzll(m);
++            ns.seed_bp[r] = os.seed_bp[r];
++        }
++        ns.seed_mask[w] |= os.seed_mask[w];
++    }
++    for (int k = 0; k < 8; ++k) {
++        if ((os.seed_kmask & ~ns.seed_kmask) & (1u << k))
++            ns.seed_konst[k / 2][k & 1] = os.seed_konst[k / 2][k & 1];
++        if ((os.seed_cmask & ~ns.seed_cmask) & (1u << k))
++            ns.seed_color[k / 2][k & 1] = os.seed_color[k / 2][k & 1];
++    }
++    ns.seed_kmask |= os.seed_kmask;
++    ns.seed_cmask |= os.seed_cmask;
++    PrepStats st = old.stats;
++    st.add(n.stats);
++    n.stats = st;
++    old.stats = PrepStats{};
++}
++
+ // ---- r40d (frente D): NWII_D_DROPFAST ----------------------------------------
+ // A drain whose batch holds two or more frame ends (the worker fell behind)
+ // drops the frames before the last one. The old path (PrepFrame, `else` below)
+@@ -2230,6 +2376,12 @@
+                 std::printf("[D40G] draws del FIFO fundidos con el anterior: %.0f por fotograma preparado\n",
+                             (m - m0) / (double)f);
+             m0 = m;
++            uint64_t g, pa, mk, bd;  // r45p NWII_P_DLMERGE
++            nwii::runtime::gx::FifoParser::DLMergeStats(g, pa, mk, bd);
++            if (g || mk)
++                std::printf("[P45DL] por fotograma preparado: %.0f draws de listas fundidos en %.0f | grupos hechos %llu, "
++                            "nunca fundibles %llu\n", pa / (double)f, g / (double)f, (unsigned long long)mk,
++                            (unsigned long long)bd);
+             f = 0;
+         }
+     }
+@@ -2501,7 +2653,15 @@
+                 return e ? std::max(1L, std::atol(e)) : 0L;
+             }();
+             static long s_mc_n = 0;
+-            if (s_mc_every && !pkt.merges.empty() && (++s_mc_n % s_mc_every) == 0) {
++            // r45p NWII_P_DLMERGE_CHECK=<n>: also every n-th frame, display-list draws fused by
++            // NWII_P_DLMERGE (DecodedVerts::parts) split back into their parts (same [D40MERGE_CHECK] line).
++            static const long s_pdl_every = [] {
++                const char *e = NWII_ENV("NWII_P_DLMERGE_CHECK");
++                return e ? std::max(1L, std::atol(e)) : 0L;
++            }();
++            static long s_pdl_n = 0;
++            const bool pdl_now = s_pdl_every && (++s_pdl_n % s_pdl_every) == 0;
++            if ((s_mc_every && !pkt.merges.empty() && (++s_mc_n % s_mc_every) == 0) || pdl_now) {
+                 using nwii::runtime::gx::GXCommand;
+                 using nwii::runtime::gx::GXCommandType;
+                 std::unordered_map<const GXCommand *, const std::vector<uint16_t> *> parts;
+@@ -2519,6 +2679,18 @@
+                     if (c.raw) { ok = false; break; }  // not decoded: no comparison for this frame
+                     auto it = parts.find(&c);
+                     const std::vector<nwii::runtime::gx::VertexData> &v = c.verts();
++                    if (it == parts.end() && c.shared_vertices && !c.shared_vertices->parts.empty()) {  // r45p
++                        size_t at = 0;
++                        for (const uint16_t k : c.shared_vertices->parts) {
++                            if (at + k > v.size()) { ok = false; break; }
++                            GXCommand &n = s_alt.emplace_back();
++                            n.type = c.type; n.prim_type = c.prim_type; n.reg = c.reg; n.length = c.length; n.val = c.val;
++                            n.vertices.assign(v.begin() + (ptrdiff_t)at, v.begin() + (ptrdiff_t)(at + k));
++                            at += k;
++                        }
++                        if (at != v.size()) ok = false;
++                        continue;
++                    }
+                     if (it == parts.end()) {
+                         GXCommand &n = s_alt.emplace_back();
+                         n.type = c.type; n.prim_type = c.prim_type; n.reg = c.reg; n.length = c.length; n.val = c.val;
+@@ -2637,6 +2809,10 @@
+         static const bool noskip = NWII_ENV("NWII_NOFRAMESKIP") != nullptr;
+         std::unique_lock<std::mutex> lk(s_pm);
+         if (noskip) s_cv_worker.wait(lk, [] { return !s_ready || s_stop; });
++        if (PTripleOn()) {  // r45p: one neither drawn nor waiting (never takes the waiting one back here)
++            for (FramePacket &q : s_pkts)
++                if (&q != s_rendering && &q != s_ready) return &q;
++        }
+         if (FramePacket *p = s_ready) {
+             s_ready = nullptr;
+             retracted = true;
+@@ -2678,6 +2854,54 @@
+         }
+ #endif
+         if (fill) {
++            // r45p NWII_P_TRIPLE: the packet still waiting (if the render thread did not take it
++            // meanwhile) is retracted into the new one now that the new one is complete.
++            if (PTripleOn()) {
++                FramePacket *cand = nullptr, *old = nullptr;
++                {
++                    std::lock_guard<std::mutex> lk(s_pm);
++                    cand = s_ready;
++                    s_p_reading = cand;
++                }
++                if (cand && cand != fill && PKeepCopyOn() && HasLoneCopy(*cand, *fill)) {
++                    // r45p NWII_P_KEEPCOPY: let the render thread take it first (see PKeepCopyOn)
++                    const int64_t k0 = PipeNow();
++                    std::unique_lock<std::mutex> lk(s_pm);
++                    s_p_reading = nullptr;
++                    s_cv_worker.wait_for(lk, std::chrono::milliseconds(100), [&] { return s_ready != cand || s_stop; });
++                    cand = nullptr;  // taken (or, after 100 ms, retracted as before: below it is still s_ready)
++                    if (s_ready) { cand = s_ready; s_p_reading = cand; }
++                    lk.unlock();
++                    ++s_p_kept_frames;
++                    s_p_keep_wait_ns += (uint64_t)(PipeNow() - k0);
++                    std::printf("[P45K] fotograma con copia EFB unica conservado (espera %.1f ms; %llu en total)\n",
++                                (PipeNow() - k0) / 1e6, (unsigned long long)s_p_kept_frames);
++                }
++                if (cand && cand != fill) CopyKept(*cand);  // the packet stays available meanwhile
++                const int64_t w0 = PipeNow();
++                {
++                    std::lock_guard<std::mutex> lk(s_pm);
++                    if (cand && cand != fill && s_ready == cand) {
++                        old = cand;
++                        s_ready = nullptr;
++                    }
++                    s_p_reading = nullptr;
++                }
++                if (!old) s_p_kept.clear();  // taken by the render thread meanwhile
++                if (old) {
++                    SpliceRetracted(*old, *fill);
++                    const uint64_t d = (uint64_t)(PipeNow() - w0);
++                    ++s_p_merges;
++                    s_p_win_ns += d;
++                    s_p_win_max = std::max(s_p_win_max, d);
++                }
++                if (++s_p_pub % 600 == 0) {
++                    std::printf("[P45T] paquetes publicados %llu: fusiones %llu, ventana sin fotograma media %.0f us max %.0f us\n",
++                                (unsigned long long)s_p_pub, (unsigned long long)s_p_merges,
++                                s_p_merges ? s_p_win_ns / 1e3 / (double)s_p_merges : 0.0, s_p_win_max / 1e3);
++                    s_p_merges = s_p_win_ns = s_p_win_max = 0;
++                }
++            }
+             {
+                 const int64_t t = PipeNow();
+                 const int64_t x = s_pipe_xfb_last.load(std::memory_order_relaxed);
+@@ -2696,6 +2920,7 @@
+             }
+             s_cv_main.notify_one();
+             last_frame = clk::now();
++            if (!s_p_junk.empty()) s_p_junk.clear();  // r45p: the retracted commands, after the hand-over
+         }
+         // Look again in a poll interval (4 of them after 25 ms without a
+         // frame), like the frontend's drain loop did.
+@@ -2832,7 +3057,7 @@
+             bool waiting;
+             {
+                 std::lock_guard<std::mutex> lk(s_pm);
+-                waiting = s_ready != nullptr;
++                waiting = s_ready != nullptr || q == s_p_reading;  // r45p: the worker reads it: it frees it
+             }
+             if (!waiting) {
+                 const int64_t f0 = PipeNow();
+@@ -2875,7 +3100,7 @@
+             s_held_frames -= (uint32_t)p->stats.held;
+         }
+         static const bool noskip = NWII_ENV("NWII_NOFRAMESKIP") != nullptr;
+-        if (noskip) s_cv_worker.notify_one();  // the worker may wait for this
++        if (noskip || PKeepCopyOn()) s_cv_worker.notify_one();  // the worker may wait for this (r45p: KEEPCOPY)
+         const uint64_t c0 = thread_cpu_us();
+         const int64_t t0 = PipeNow();
+         if (__builtin_expect(vtl::g_on, 0)) vtl::NoteAt(t0, 7, (uint32_t)p->seq);
+@@ -2912,7 +3137,7 @@
+             }
+             if (s_rfree_on && p->render_frees) {
+                 std::lock_guard<std::mutex> lk(s_pm);
+-                free_here = s_ready == nullptr;
++                free_here = s_ready == nullptr && p != s_p_reading;  // r45p
+             }
+             // r36r NWII_R_FREECHUNK=1: free from the back in chunks of 2048
+             // commands and stop as soon as the worker hands a new frame over (the

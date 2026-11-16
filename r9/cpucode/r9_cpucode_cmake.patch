@@ -1,0 +1,19 @@
+--- switch/cmake/nsmbw-switch.cmake	2026-10-26 14:16:58.327175509 -0500
++++ switch/cmake/nsmbw-switch.cmake	2026-10-31 07:35:29.603744122 -0500
+@@ -11,7 +11,14 @@
+ # x86-64 (where the port is tested) never does and the Gekko only does for its
+ # explicit fmadd family (already std::fma in cpu_context.h). Separately rounded
+ # guest fmul/fadd must stay separately rounded, or float results drift from PC.
+-set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG -ffp-contract=off" CACHE STRING "" FORCE)
+-set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG -ffp-contract=off" CACHE STRING "" FORCE)
++# R9 cpucode: -fomit-frame-pointer (devkitA64 GCC keeps x29 as frame pointer by
++# default: one more free register and no frame setup in every generated
++# function) and -fvisibility=hidden (the NRO is one statically linked module:
++# hidden definitions are reached PC-relative instead of through the GOT, which
++# ld does not relax on AArch64, and the -fPIC runtime library stops treating its
++# own functions as interposable). Neither changes what the code computes.
++set(NWII_NX_OPT "-O2 -DNDEBUG -ffp-contract=off -fomit-frame-pointer -fvisibility=hidden")
++set(CMAKE_C_FLAGS_RELEASE "${NWII_NX_OPT}" CACHE STRING "" FORCE)
++set(CMAKE_CXX_FLAGS_RELEASE "${NWII_NX_OPT}" CACHE STRING "" FORCE)
+ set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+ add_compile_definitions(NWII_PLATFORM_SWITCH=1)

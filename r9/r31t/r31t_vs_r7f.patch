@@ -1,0 +1,725 @@
+diff --color -ruN ../r24m2/nWiiRuntime_r7f_src/CMakeLists.txt nWiiRuntime/CMakeLists.txt
+--- ../r24m2/nWiiRuntime_r7f_src/CMakeLists.txt	2026-11-09 04:30:39.594220193 -0500
++++ nWiiRuntime/CMakeLists.txt	2026-11-12 03:07:51.236303759 -0500
+@@ -28,6 +28,7 @@
+     src/core/os_hle_stubs.cpp
+     src/core/event_scheduler.cpp
+     src/core/force_demo.cpp
++    src/core/tprof.cpp
+     src/input/input_manager.cpp
+     src/input/wii_remotes.cpp
+     src/input/sources/mouse_keyboard_source.cpp
+diff --color -ruN ../r24m2/nWiiRuntime_r7f_src/src/core/force_demo.cpp nWiiRuntime/src/core/force_demo.cpp
+--- ../r24m2/nWiiRuntime_r7f_src/src/core/force_demo.cpp	2026-11-09 04:30:39.594519297 -0500
++++ nWiiRuntime/src/core/force_demo.cpp	2026-11-12 03:07:51.236447204 -0500
+@@ -25,6 +25,7 @@
+ #include "runtime/cpu_context.h"
+ #include "runtime/nwii_env.h"
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -36,6 +37,7 @@
+ namespace nwii::runtime {
+ 
+ bool g_force_demo_on = false;
++extern std::atomic<int> g_tprof_scene;  // r31t tprof.cpp
+ 
+ namespace {
+ 
+@@ -216,6 +218,7 @@
+     std::fflush(stdout);
+     g_active = running;
+     g_active_t = t;
++    g_tprof_scene.store(running, std::memory_order_relaxed);
+   }
+   // NWII_FORCE_LEVEL: la primera vez que el arranque pide la pantalla de título (startTitle(0):
+   // mundo 1, STAGE_TITLE=39, modo TITLE) se cambia por un nivel en modo normal, como haría
+diff --color -ruN ../r24m2/nWiiRuntime_r7f_src/src/core/main.cpp nWiiRuntime/src/core/main.cpp
+--- ../r24m2/nWiiRuntime_r7f_src/src/core/main.cpp	2026-11-08 21:22:46.300305129 -0500
++++ nWiiRuntime/src/core/main.cpp	2026-11-12 03:07:51.236749308 -0500
+@@ -62,6 +62,7 @@
+ void shutdown() {}
+ } 
+ 
++#include "tprof.h"  // r31t
+ extern "C" void run_game(nwii::runtime::CPUContext &ctx);
+ 
+ // Window-loop presentation counters. g_stat_frames (gx.cpp) counts host
+@@ -89,6 +90,7 @@
+   }
+   std::cout << "[Thread] CPU Core started. pc=" << std::hex << ctx->pc << " is_running=" << ctx->is_running << std::endl;
+   std::flush(std::cout);
++  nwii::runtime::tprof::attach_cpu_thread();  // r31t (NWII_TPROF, solo PC)
+   run_game(*ctx);
+ 
+   
+diff --color -ruN ../r24m2/nWiiRuntime_r7f_src/src/core/tprof.cpp nWiiRuntime/src/core/tprof.cpp
+--- ../r24m2/nWiiRuntime_r7f_src/src/core/tprof.cpp	1969-12-31 19:00:00.000000000 -0500
++++ nWiiRuntime/src/core/tprof.cpp	2026-11-12 03:35:01.753503562 -0500
+@@ -0,0 +1,351 @@
++// r31t (frente T): perfil del hilo del juego con la pila invitada (NWII_TPROF=1).
++//
++// Cada muestra (1 ms) guarda: tiempo, pc/lr del anfitrion (relativos a la
++// imagen), numero de fotograma del juego (copias XFB), escena de NWII_FORCE_DEMO,
++// hilo invitado actual (0x800000E4) y dos pilas invitadas:
++//   pila 1: la del contexto en marcha: [ctx.pc, ctx.lr, [sp+4], y luego, siguiendo
++//           la cadena de marcos PPC (sp' = [sp]), cada direccion de retorno [sp'+4]].
++//           El codigo generado guarda r1 en un registro local y solo lo baja a
++//           ctx.gpr[1] antes de llamar: sp puede ser el marco de la funcion actual o
++//           el de quien la llamo; por eso [sp+4] es solo un indicio (la funcion
++//           exacta sale del pc del anfitrion) y el resto de la cadena es fiable.
++//   pila 2: si el hilo actual no es el principal del juego (el que mas veces sale
++//           como actual; no es el hilo por defecto del SO), la pila guardada del
++//           principal [srr0, lr, cadena desde su r1 guardado]: dice donde esta
++//           esperando (VIWaitForRetrace, GXDrawDone, lectura de disco...).
++// Pilas sin repetir en una tabla (id = orden de aparicion desde 1). Archivos, que
++// solo crecen (flush cada pocos segundos):
++//   logs/tprof_info.txt     texto: base de la imagen, build, formato
++//   logs/tprof_stacks.bin   por pila nueva: u32 n; u32 dir[n]
++//   logs/tprof_samples.bin  por muestra: struct Rec (32 bytes)
++// tools: r9/r31t/tools/tprof.py
++#include "tprof.h"
++
++#include "runtime/cpu_context.h"
++#include "runtime/nwii_env.h"
++
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++#ifndef __SWITCH__
++#include <csignal>
++#include <ctime>
++#include <sys/syscall.h>
++#include <thread>
++#include <ucontext.h>
++#include <unistd.h>
++extern char __executable_start;
++#endif
++
++namespace nwii::runtime {
++extern std::atomic<uint32_t> g_guest_xfb;  // gx.cpp: fotogramas del juego (copias XFB)
++std::atomic<int> g_tprof_scene{-1};        // force_demo.cpp la pone (indice de kDemos)
++extern CPUContext *g_ctx_ptr;
++
++namespace tprof {
++namespace {
++
++struct Rec {
++  uint32_t t_us;     // desde init
++  uint32_t pc, lr;   // anfitrion, relativos a la base de la imagen (0xFFFFFFFF: fuera)
++  uint32_t stack;    // id de la pila 1 (0: tabla llena)
++  uint32_t stack2;   // id de la pila 2 (0: no hay)
++  uint32_t cur_thr;  // OSThread* actual (0 = bucle ocioso del SO)
++  uint32_t hstack;   // id de la pila del anfitrion (retornos rebuscados; 0: no hay)
++  uint16_t frame;    // g_guest_xfb
++  int8_t scene;      // g_tprof_scene
++  uint8_t flags;     // bit0: cur_thr == hilo principal
++};
++static_assert(sizeof(Rec) == 32, "Rec");
++
++struct HRec {
++  uint32_t t_us, pc, lr, hstack;
++  uint16_t frame;
++  int8_t scene;
++  uint8_t slot;
++};
++static_assert(sizeof(HRec) == 20, "HRec");
++constexpr uint32_t kMaxRec = 1u << 21;      // 2 M muestras (35 min a 1 kHz), 64 MB
++constexpr uint32_t kArena = 12u << 20;      // 12 M u32 (48 MB) de pilas
++constexpr uint32_t kSlots = 1u << 20;       // tabla hash: id por ranura
++constexpr int kMaxDepth = 56;
++
++Rec *g_rec = nullptr;
++HRec *g_hrec = nullptr;
++std::atomic<uint32_t> g_nhrec{0};
++uint32_t g_hrec_written = 0;
++uint32_t *g_arena = nullptr;  // [n, dir...] seguidos
++uint32_t *g_slot_off = nullptr, *g_slot_id = nullptr;
++std::atomic<uint32_t> g_nrec{0}, g_arena_used{0};
++uint32_t g_nstacks = 0, g_rec_written = 0, g_arena_written = 0;
++uint64_t g_overflow = 0;
++uint64_t g_base = 0;
++std::string g_dir;
++bool g_on = false;
++
++inline bool rd32(const CPUContext &c, uint32_t a, uint32_t &v) {
++  const uint32_t p = a & 0x3FFFFFFF;
++  const uint8_t *q;
++  if ((a & 3) || (a >> 28) != 8 && (a >> 28) != 9) return false;
++  if (p < MMU::kMem1Size - 4) q = c.mmu.mem1.data() + p;
++  else if (p - 0x10000000u < MMU::kMem2Size - 4) q = c.mmu.mem2.data() + (p - 0x10000000u);
++  else return false;
++  uint32_t x;
++  std::memcpy(&x, q, 4);
++  v = __builtin_bswap32(x);
++  return true;
++}
++
++uint32_t intern(const uint32_t *e, int n) {
++  if (n <= 0) return 0;
++  uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t)n;
++  for (int i = 0; i < n; ++i) h = (h ^ e[i]) * 0xC2B2AE3D27D4EB4Full, h ^= h >> 29;
++  for (uint32_t k = (uint32_t)(h >> 20);; ++k) {
++    const uint32_t s = k & (kSlots - 1);
++    if (g_slot_id[s] == 0) {
++      const uint32_t used = g_arena_used.load(std::memory_order_relaxed);
++      if (g_nstacks >= kSlots / 4 * 3 || used + n + 1 > kArena) {
++        ++g_overflow;
++        return 0;
++      }
++      g_arena[used] = (uint32_t)n;
++      std::memcpy(g_arena + used + 1, e, (size_t)n * 4);
++      g_slot_off[s] = used;
++      g_slot_id[s] = ++g_nstacks;
++      g_arena_used.store(used + n + 1, std::memory_order_release);
++      return g_nstacks;
++    }
++    const uint32_t *a = g_arena + g_slot_off[s];
++    if (a[0] == (uint32_t)n && std::memcmp(a + 1, e, (size_t)n * 4) == 0) return g_slot_id[s];
++  }
++}
++
++// Cadena de marcos desde sp: anade cada [sp'+4].
++int walk(const CPUContext &c, uint32_t sp, uint32_t *e, int n) {
++  for (int k = 0; k < kMaxDepth && n < kMaxDepth + 4; ++k) {
++    uint32_t nsp, ra;
++    if (!rd32(c, sp, nsp) || nsp <= sp || nsp - sp > (4u << 20)) break;
++    if (!rd32(c, nsp + 4, ra)) break;
++    e[n++] = ra;
++    sp = nsp;
++  }
++  return n;
++}
++
++}  // namespace
++
++bool init(const char *log_dir, uint64_t image_base, const char *build) {
++  const char *v = std::getenv("NWII_TPROF");
++  if (!v || !*v || !std::strcmp(v, "0")) return false;
++  if (g_on) return true;
++  g_rec = (Rec *)std::calloc(kMaxRec, sizeof(Rec));
++  g_hrec = (HRec *)std::calloc(kMaxRec, sizeof(HRec));
++  g_arena = (uint32_t *)std::calloc(kArena, 4);
++  g_slot_off = (uint32_t *)std::calloc(kSlots, 4);
++  g_slot_id = (uint32_t *)std::calloc(kSlots, 4);
++  if (!g_rec || !g_hrec || !g_arena || !g_slot_off || !g_slot_id) {
++    std::printf("[TPROF] sin memoria para las tablas: apagado\n");
++    return false;
++  }
++  g_base = image_base;
++  g_dir = log_dir;
++  std::remove((g_dir + "/tprof_stacks.bin").c_str());
++  std::remove((g_dir + "/tprof_samples.bin").c_str());
++  std::remove((g_dir + "/tprof_host.bin").c_str());
++  if (FILE *f = std::fopen((g_dir + "/tprof_info.txt").c_str(), "w")) {
++    std::fprintf(f, "tprof v1\nbuild %s\nbase 0x%llx\nrec_bytes %u\n", build,
++                 (unsigned long long)image_base, (unsigned)sizeof(Rec));
++    std::fclose(f);
++  }
++  g_on = true;
++  std::printf("[TPROF] encendido: pila invitada por muestra -> %s/tprof_*.bin\n", log_dir);
++  return true;
++}
++
++void sample(const CPUContext &c, uint64_t host_pc, uint64_t host_lr, uint32_t t_us,
++            const uint64_t *host_ret, int n_host_ret) {
++  if (!g_on) return;
++  const uint32_t i = g_nrec.load(std::memory_order_relaxed);
++  if (i >= kMaxRec) return;
++  Rec &r = g_rec[i];
++  r.t_us = t_us;
++  r.pc = host_pc - g_base < 0xFFFFFFFFull ? (uint32_t)(host_pc - g_base) : 0xFFFFFFFFu;
++  r.lr = host_lr - g_base < 0xFFFFFFFFull ? (uint32_t)(host_lr - g_base) : 0xFFFFFFFFu;
++  r.frame = (uint16_t)g_guest_xfb.load(std::memory_order_relaxed);
++  r.scene = (int8_t)g_tprof_scene.load(std::memory_order_relaxed);
++  uint32_t e[kMaxDepth + 8];
++  int n = 0;
++  const uint32_t sp = *(const volatile uint32_t *)&c.gpr[1];
++  e[n++] = *(const volatile uint32_t *)&c.pc;
++  e[n++] = *(const volatile uint32_t *)&c.lr;
++  uint32_t v = 0;
++  e[n++] = rd32(c, sp + 4, v) ? v : 0;
++  n = walk(c, sp, e, n);
++  r.stack = intern(e, n);
++  // Hilo principal del juego = el hilo invitado que mas veces sale como actual
++  // (en NSMBW no es el hilo por defecto: dMain::main01 corre en uno creado aparte).
++  uint32_t cur = 0, mainthr = 0;
++  rd32(c, 0x800000E4, cur);
++  {
++    static uint32_t thr[8], cnt[8];
++    int best = -1, slot = -1;
++    for (int k = 0; k < 8; ++k) {
++      if (cur && thr[k] == cur) slot = k;
++      if (thr[k] && (best < 0 || cnt[k] > cnt[best])) best = k;
++    }
++    if (cur && slot < 0)
++      for (int k = 0; k < 8; ++k)
++        if (!thr[k]) { thr[k] = cur; slot = k; break; }
++    if (slot >= 0) {
++      ++cnt[slot];
++      if (best < 0 || cnt[slot] > cnt[best]) best = slot;
++    }
++    if (best >= 0) mainthr = thr[best];
++  }
++  r.cur_thr = cur;
++  r.flags = (cur == mainthr && cur) ? 1 : 0;
++  r.stack2 = 0;
++  if (cur != mainthr && mainthr) {
++    uint32_t msp = 0, srr0 = 0, mlr = 0;
++    if (rd32(c, mainthr + 4, msp) && rd32(c, mainthr + 0x198, srr0) && rd32(c, mainthr + 0x84, mlr)) {
++      n = 0;
++      e[n++] = srr0;
++      e[n++] = mlr;
++      e[n++] = rd32(c, msp + 4, v) ? v : 0;
++      n = walk(c, msp, e, n);
++      r.stack2 = intern(e, n);
++    }
++  }
++  r.hstack = 0;
++  if (host_ret && n_host_ret > 0) {
++    n = 0;
++    e[n++] = 0xFFFFFFFFu;  // marca: pila del anfitrion
++    for (int k = 0; k < n_host_ret && k < 12; ++k)
++      e[n++] = host_ret[k] - g_base < 0xFFFFFFFFull ? (uint32_t)(host_ret[k] - g_base) : 0xFFFFFFFEu;
++    r.hstack = intern(e, n);
++  }
++  g_nrec.store(i + 1, std::memory_order_release);
++}
++
++void sample_host(int slot, uint64_t host_pc, uint64_t host_lr, uint32_t t_us,
++                 const uint64_t *host_ret, int n_host_ret) {
++  if (!g_on) return;
++  const uint32_t i = g_nhrec.load(std::memory_order_relaxed);
++  if (i >= kMaxRec) return;
++  HRec &r = g_hrec[i];
++  r.t_us = t_us;
++  r.pc = host_pc - g_base < 0xFFFFFFFFull ? (uint32_t)(host_pc - g_base) : 0xFFFFFFFFu;
++  r.lr = host_lr - g_base < 0xFFFFFFFFull ? (uint32_t)(host_lr - g_base) : 0xFFFFFFFFu;
++  r.frame = (uint16_t)g_guest_xfb.load(std::memory_order_relaxed);
++  r.scene = (int8_t)g_tprof_scene.load(std::memory_order_relaxed);
++  r.slot = (uint8_t)slot;
++  r.hstack = 0;
++  if (host_ret && n_host_ret > 0) {
++    uint32_t e[16];
++    int n = 0;
++    e[n++] = 0xFFFFFFFFu;
++    for (int k = 0; k < n_host_ret && k < 12; ++k)
++      e[n++] = host_ret[k] - g_base < 0xFFFFFFFFull ? (uint32_t)(host_ret[k] - g_base) : 0xFFFFFFFEu;
++    r.hstack = intern(e, n);
++  }
++  g_nhrec.store(i + 1, std::memory_order_release);
++}
++
++void flush() {
++  if (!g_on) return;
++  // Primero cuantas muestras hay y despues cuantas pilas: asi toda muestra escrita
++  // tiene ya sus pilas en el archivo.
++  const uint32_t nr = g_nrec.load(std::memory_order_acquire);
++  const uint32_t nh = g_nhrec.load(std::memory_order_acquire);
++  const uint32_t au = g_arena_used.load(std::memory_order_acquire);
++  if (au > g_arena_written)
++    if (FILE *f = std::fopen((g_dir + "/tprof_stacks.bin").c_str(), "ab")) {
++      std::fwrite(g_arena + g_arena_written, 4, au - g_arena_written, f);
++      std::fclose(f);
++      g_arena_written = au;
++    }
++  if (nh > g_hrec_written)
++    if (FILE *f = std::fopen((g_dir + "/tprof_host.bin").c_str(), "ab")) {
++      std::fwrite(g_hrec + g_hrec_written, sizeof(HRec), nh - g_hrec_written, f);
++      std::fclose(f);
++      g_hrec_written = nh;
++    }
++  if (nr > g_rec_written)
++    if (FILE *f = std::fopen((g_dir + "/tprof_samples.bin").c_str(), "ab")) {
++      std::fwrite(g_rec + g_rec_written, sizeof(Rec), nr - g_rec_written, f);
++      std::fclose(f);
++      g_rec_written = nr;
++    }
++}
++
++#ifndef __SWITCH__
++namespace {
++uint64_t g_t0_ns = 0;
++uint64_t now_ns() {
++  timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
++}
++void on_sig(int, siginfo_t *, void *uc_) {
++  const CPUContext *c = g_ctx_ptr;
++  if (!c) return;
++  const ucontext_t *uc = (const ucontext_t *)uc_;
++#if defined(__x86_64__)
++  const uint64_t pc = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
++#else
++  const uint64_t pc = 0;
++#endif
++  sample(*c, pc, 0, (uint32_t)((now_ns() - g_t0_ns) / 1000), nullptr, 0);
++}
++}  // namespace
++
++void attach_cpu_thread() {
++  if (!init(".", (uint64_t)(uintptr_t)&__executable_start, __DATE__ " " __TIME__)) return;
++  const char *d = std::getenv("NWII_TPROF_DIR");
++  if (d && *d) {
++    g_dir = d;
++    std::remove((g_dir + "/tprof_stacks.bin").c_str());
++    std::remove((g_dir + "/tprof_samples.bin").c_str());
++    if (FILE *f = std::fopen((g_dir + "/tprof_info.txt").c_str(), "w")) {
++      std::fprintf(f, "tprof v1\nbuild %s\nbase 0x%llx\nrec_bytes %u\n", __DATE__ " " __TIME__,
++                   (unsigned long long)g_base, (unsigned)sizeof(Rec));
++      std::fclose(f);
++    }
++  }
++  g_t0_ns = now_ns();
++  struct sigaction sa = {};
++  sa.sa_sigaction = on_sig;
++  sa.sa_flags = SA_SIGINFO | SA_RESTART;
++  sigaction(SIGRTMIN + 5, &sa, nullptr);
++  sigevent sev = {};
++  sev.sigev_notify = SIGEV_THREAD_ID;
++  sev.sigev_signo = SIGRTMIN + 5;
++  sev._sigev_un._tid = (pid_t)syscall(SYS_gettid);
++  timer_t tm;
++  if (timer_create(CLOCK_MONOTONIC, &sev, &tm) != 0) {
++    std::printf("[TPROF] timer_create fallo\n");
++    return;
++  }
++  const char *us_s = std::getenv("NWII_TPROF_US");
++  const long us = us_s ? std::max(100, std::atoi(us_s)) : 1000;
++  itimerspec its = {};
++  its.it_interval.tv_nsec = us * 1000;
++  its.it_value.tv_nsec = us * 1000;
++  timer_settime(tm, 0, &its, nullptr);
++  std::thread([] {
++    for (;;) {
++      std::this_thread::sleep_for(std::chrono::seconds(2));
++      flush();
++    }
++  }).detach();
++  std::printf("[TPROF] PC: senal cada %ld us al hilo de la CPU\n", us);
++}
++#else
++void attach_cpu_thread() {}
++#endif
++
++}  // namespace tprof
++}  // namespace nwii::runtime
+diff --color -ruN ../r24m2/nWiiRuntime_r7f_src/src/core/tprof.h nWiiRuntime/src/core/tprof.h
+--- ../r24m2/nWiiRuntime_r7f_src/src/core/tprof.h	1969-12-31 19:00:00.000000000 -0500
++++ nWiiRuntime/src/core/tprof.h	2026-11-12 03:34:53.930011986 -0500
+@@ -0,0 +1,26 @@
++// r31t (frente T): perfil del hilo del juego con la PILA INVITADA de cada muestra.
++// NWII_TPROF=1 lo enciende (solo depuracion). Ver tprof.cpp.
++#pragma once
++#include <cstdint>
++
++namespace nwii::runtime {
++struct CPUContext;
++namespace tprof {
++// True si NWII_TPROF esta puesto. Reserva las tablas la primera vez.
++bool init(const char *log_dir, uint64_t image_base, const char *build);
++// Una muestra del hilo del juego. Se llama con ese hilo detenido (Switch: desde
++// el muestreador, entre pausa y reanudacion; PC: desde su manejador de senal).
++// No usa malloc ni stdio. host_ret: direcciones de retorno del anfitrion
++// (rebuscadas en su pila) o nullptr.
++void sample(const CPUContext &c, uint64_t host_pc, uint64_t host_lr, uint32_t t_us,
++            const uint64_t *host_ret, int n_host_ret);
++// Muestra de otro hilo del anfitrion (render = 0, trabajador gxw = 4...): pc/lr y, si
++// espera en el nucleo, sus retornos. Mismo hilo muestreador que sample().
++void sample_host(int slot, uint64_t host_pc, uint64_t host_lr, uint32_t t_us,
++                 const uint64_t *host_ret, int n_host_ret);
++// Anade lo nuevo a logs/tprof_*.bin (fuera de la pausa).
++void flush();
++// PC (Linux): temporizador + senal para el hilo que llama (el de la CPU).
++void attach_cpu_thread();
++}  // namespace tprof
++}  // namespace nwii::runtime
+diff --color -ruN ../r24m2/nWiiRuntime_r7f_src/src/hle/gx.cpp nWiiRuntime/src/hle/gx.cpp
+--- ../r24m2/nWiiRuntime_r7f_src/src/hle/gx.cpp	2026-11-09 04:19:55.311882174 -0500
++++ nWiiRuntime/src/hle/gx.cpp	2026-11-12 03:28:33.321869387 -0500
+@@ -1606,6 +1606,15 @@
+             nwii::runtime::gx::g_render_entries =
+                 pkt.entries.size() == pkt.draws.size() ? &pkt.entries : nullptr;
+             nwii::runtime::gx::g_render_pack = &pkt.pack;
++            // r31t (frente T), SOLO MEDIR: NWII_T_NORENDER=N dibuja 1 de cada N fotogramas
++            // (el hilo de render queda casi parado) para ver cuanto frena al hilo del juego
++            // el trabajo del render en los otros nucleos (cache L2 compartida, memoria).
++            static const long s_t_norender = [] {
++                const char *e = NWII_ENV("NWII_T_NORENDER");
++                return e ? std::atol(e) : 0L;
++            }();
++            static long s_t_n = 0;
++            if (s_t_norender <= 1 || (s_t_n++ % s_t_norender) == 0)
+             g_renderer->Render(pkt.frame);
+             nwii::runtime::gx::g_render_draws = nullptr;
+             nwii::runtime::gx::g_render_entries = nullptr;
+diff --color -ruN ../r24m2/nWiiRuntime_r7f_src/src/hle/ios.cpp nWiiRuntime/src/hle/ios.cpp
+--- ../r24m2/nWiiRuntime_r7f_src/src/hle/ios.cpp	2026-11-09 04:30:39.595150750 -0500
++++ nWiiRuntime/src/hle/ios.cpp	2026-11-12 03:24:02.727840854 -0500
+@@ -1732,7 +1732,16 @@
+   if (left <= 0) {
+     // 0: the countdown ran out (or tb_invalidate); < 0: kicked.
+     refresh = left == 0;
+-    const int32_t k = g_tb_wall ? CPUContext::kPollTbEvery : 1;
++    // r31t (frente T): NWII_POLL_EVERY=N -> el sondeo lento (reloj + agenda) cada N
++    // sondeos en vez de cada kPollTbEvery (16). Quien levanta una interrupcion o
++    // encola un evento ya fuerza el sondeo siguiente (poll_kick), asi que solo
++    // cambia la finura con que el hilo del juego mira el reloj.
++    static const int32_t s_every = [] {
++      const char *e = NWII_ENV("NWII_POLL_EVERY");
++      const int v = e ? std::atoi(e) : 0;
++      return v >= 1 && v <= 4096 ? (int32_t)v : CPUContext::kPollTbEvery;
++    }();
++    const int32_t k = g_tb_wall ? s_every : 1;
+     if (__builtin_expect(g_poll_check, 0)) s_vleft = k;
+     else ctx.poll_left.store(k, std::memory_order_relaxed);
+   }
+diff --color -ruN ../r24m2/nWiiRuntime_r7f_src/src/hle/texture_cache_gl.cpp nWiiRuntime/src/hle/texture_cache_gl.cpp
+--- ../r24m2/nWiiRuntime_r7f_src/src/hle/texture_cache_gl.cpp	2026-11-08 21:22:33.749107120 -0500
++++ nWiiRuntime/src/hle/texture_cache_gl.cpp	2026-11-12 04:05:59.568541649 -0500
+@@ -4,6 +4,9 @@
+ #include <iostream>
+ #include <cstring>
+ #include <algorithm>
++#include <cstdlib>
++#include <unordered_map>
++#include <vector>
+ 
+ // GX texture decoding, kept bit-exact with Dolphin's TextureDecoder:
+ 
+@@ -119,6 +122,31 @@
+ // words, by caller; EFB copies and the cache entries they examined.
+ static uint64_t st_hash_tex = 0, st_hash_efb_get = 0, st_hash_efb_done = 0, st_hash_words = 0,
+                 st_efb_done = 0, st_efb_scan = 0, st_frames = 0;
++// r31t (frente T): cuantas veces por fotograma se crea o redimensiona la textura de una
++// copia EFB (cada una es un bloque nuevo del driver: ioctl al nucleo + esperar a la GPU al
++// soltar el viejo), y por que.
++static uint64_t st_efb_new = 0, st_efb_resize = 0, st_efb_drop = 0, st_nat_new = 0, st_nat_retire = 0,
++                st_efb_var_hit = 0;
++// NWII_T_EFBVAR (por defecto encendido; =0 apaga): una copia EFB cuyo tamano en pixeles GL cambia (a escala fraccionaria el
++// redondeo depende de la posicion del rectangulo copiado) guarda una textura por tamano en
++// vez de reasignar la misma. El contenido y el tamano de la textura que se usa son los de
++// siempre; solo se evita crear y destruir memoria de la GPU en cada copia.
++struct EfbVar { GLuint tex, native; uint32_t gl_w, gl_h, w, h; };
++static std::unordered_map<uint32_t, std::vector<EfbVar>> s_efb_var;
++static bool efbvar_on() {
++    // Encendido por defecto desde t1 (medido en consola: T06 vs T02/T07); NWII_T_EFBVAR=0 lo apaga.
++    static const bool on = [] { const char* e = std::getenv("NWII_T_EFBVAR"); return !(e && *e == '0'); }();
++    return on;
++}
++static void efbvar_retire(uint32_t addr, std::vector<GLuint>& retired) {
++    auto it = s_efb_var.find(addr);
++    if (it == s_efb_var.end()) return;
++    for (const EfbVar& v : it->second) {
++        retired.push_back(v.tex);
++        if (v.native) retired.push_back(v.native);
++    }
++    s_efb_var.erase(it);
++}
+ 
+ // Content hash of guest RAM [addr, addr+size): one word every 32 bytes (one
+ // every size/4096 for large ranges). Only ever compared with another value of
+@@ -184,6 +212,8 @@
+         // A batch not yet drawn may still sample it: delete at frame end.
+         retired_.push_back(ec->second.tex);
+         if (ec->second.native) retired_.push_back(ec->second.native);
++        efbvar_retire(addr, retired_);
++        ++st_efb_drop;
+         efb_copies.erase(ec);
+     }
+ 
+@@ -274,6 +304,11 @@
+                "efb copies=%.1f scanned=%.1f | entries=%zu efb=%zu max_size=%u\n",
+                st_hash_tex / f, st_hash_efb_get / f, st_hash_efb_done / f, st_hash_words / f,
+                st_efb_done / f, st_efb_scan / f, cache.size(), efb_copies.size(), max_size_);
++        printf("[TCSTAT2] por fotograma: copia EFB nueva=%.2f redimensionada=%.2f (reusada por tamano=%.2f) "
++               "descartada por RAM cambiada=%.2f | nativa nueva=%.2f retirada=%.2f | NWII_T_EFBVAR=%d\n",
++               st_efb_new / f, st_efb_resize / f, st_efb_var_hit / f, st_efb_drop / f, st_nat_new / f,
++               st_nat_retire / f, (int)efbvar_on());
++        st_efb_new = st_efb_resize = st_efb_drop = st_nat_new = st_nat_retire = st_efb_var_hit = 0;
+         st_hash_tex = st_hash_efb_get = st_hash_efb_done = st_hash_words = 0;
+         st_efb_done = st_efb_scan = st_frames = 0;
+     }
+@@ -298,6 +333,7 @@
+             if (it->second.frame + 600 < frame_) {
+                 glDeleteTextures(1, &it->second.tex);
+                 if (it->second.native) glDeleteTextures(1, &it->second.native);
++                efbvar_retire(it->first, retired_);
+                 it = efb_copies.erase(it);
+             } else {
+                 ++it;
+@@ -311,9 +347,48 @@
+     addr &= 0x1FFFFFFF;
+     EfbCopy& c = efb_copies[addr];
+     const uint32_t gw = gl_w ? gl_w : w, gh = gl_h ? gl_h : h;
++    if (c.tex && (c.gl_w != gw || c.gl_h != gh || c.w != w || c.h != h) && efbvar_on()) {
++        // r31t: esta direccion recibe copias de varios tamanos (en el desierto, dos por
++        // fotograma). Se aparta la textura de este tamano (con su reduccion nativa) y se
++        // recupera la del tamano pedido si ya existe.
++        std::vector<EfbVar>& v = s_efb_var[addr];
++        v.push_back({c.tex, c.native, c.gl_w, c.gl_h, c.w, c.h});
++        c.tex = 0;
++        c.native = 0;
++        for (size_t i = 0; i < v.size(); ++i)
++            if (v[i].gl_w == gw && v[i].gl_h == gh && v[i].w == w && v[i].h == h) {
++                c.tex = v[i].tex;
++                c.native = v[i].native;
++                c.gl_w = gw;
++                c.gl_h = gh;
++                c.w = w;
++                c.h = h;
++                v.erase(v.begin() + (long)i);
++                ++st_efb_var_hit;
++                // como al crearlas de nuevo: filtros en NEAREST
++                bind_scratch(c.tex);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++                if (c.native) {
++                    bind_scratch(c.native);
++                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++                }
++                break;
++            }
++        if (v.size() > 8) {  // demasiados tamanos distintos: fuera el mas viejo
++            retired_.push_back(v.front().tex);
++            if (v.front().native) retired_.push_back(v.front().native);
++            v.erase(v.begin());
++        }
++    }
+     if (!c.tex || c.gl_w != gw || c.gl_h != gh) {
+-        if (!c.tex)
++        if (!c.tex) {
+             glGenTextures(1, &c.tex);
++            ++st_efb_new;
++        } else {
++            ++st_efb_resize;
++        }
+         bind_scratch(c.tex);
+         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, gw, gh, 0, GL_RGBA,
+                      GL_UNSIGNED_BYTE, nullptr);
+@@ -324,6 +399,7 @@
+     }
+     if (c.native && (c.w != w || c.h != h)) {
+         retired_.push_back(c.native);  // wrong size: a new one on demand
++        ++st_nat_retire;
+         c.native = 0;
+     }
+     c.w = w;
+@@ -336,6 +412,7 @@
+     if (it == efb_copies.end() || !it->second.tex) return 0;
+     EfbCopy& c = it->second;
+     if (!c.native) {
++        ++st_nat_new;
+         glGenTextures(1, &c.native);
+         bind_scratch(c.native);
+         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, c.w, c.h, 0, GL_RGBA,
+diff --color -ruN ../r24m2/nWiiRuntime_r7f_src/src/platform/switch/switch_platform.cpp nWiiRuntime/src/platform/switch/switch_platform.cpp
+--- ../r24m2/nWiiRuntime_r7f_src/src/platform/switch/switch_platform.cpp	2026-11-09 05:53:25.642238604 -0500
++++ nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-11-12 04:05:59.569023711 -0500
+@@ -211,7 +211,9 @@
+                             key == "NWII_FIFO_MAX_FRAMES" || key == "NWII_SHADER_PREWARM_BAR" ||
+                             // R22 R7: on by default, "0" turns them off
+                             key == "NWII_DLMEMO" || key == "NWII_PINDEX" || key == "NWII_RENDER_FREE" ||
+-                            key == "NWII_DLMEMO_LIST" || key == "NWII_WPROF";
++                            key == "NWII_DLMEMO_LIST" || key == "NWII_WPROF" ||
++                            // r31t: encendido por defecto, "0" lo apaga
++                            key == "NWII_T_EFBVAR";
+     const bool off = lv.empty() || lv == "off" || lv == "false" || lv == "no" ||
+                      (lv == "0" && !keeps_zero);
+     if (off)
+diff --color -ruN ../r24m2/nWiiRuntime_r7f_src/src/platform/switch/switch_profiler.cpp nWiiRuntime/src/platform/switch/switch_profiler.cpp
+--- ../r24m2/nWiiRuntime_r7f_src/src/platform/switch/switch_profiler.cpp	2026-11-08 22:15:27.091921371 -0500
++++ nWiiRuntime/src/platform/switch/switch_profiler.cpp	2026-11-12 03:34:53.930771566 -0500
+@@ -19,6 +19,7 @@
+ #include "switch_platform.h"
+ 
+ #include "runtime/cpu_context.h"
++#include "../../core/tprof.h"  // r31t
+ 
+ #include <switch.h>
+ #include <sys/stat.h>
+@@ -155,7 +156,9 @@
+ };
+ 
+ uint64_t g_base = 0, g_text_end = 0;
+-uint64_t g_wait_fn[4] = {};  // svc wrappers of the kernel waits
++uint64_t g_wait_fn[6] = {};
++bool g_tprof = false;  // r31t: pila invitada por muestra (NWII_TPROF)
++u64 g_tprof_t0 = 0;  // svc wrappers of the kernel waits
+ int g_core = -1, g_prio = 0;
+ uint32_t g_interval_us = 1000, g_write_secs = 10;
+ Thread g_thread;
+@@ -228,16 +231,16 @@
+ }
+ 
+ // Paused thread in a kernel wait: count its return-address chain (see WaitHist).
+-void wait_stack(Target &t, const ThreadContext &ctx) {
++int wait_stack(Target &t, const ThreadContext &ctx, uint64_t *out) {
+   const uint64_t pc = ctx.pc.x;
+   bool wait = false;
+   for (uint64_t f : g_wait_fn) wait |= f && pc - f < 32;
+-  if (!wait || !g_text_end) return;
++  if (!wait || !g_text_end) return 0;
+   const uint64_t sp = ctx.sp;
+   if (sp < t.stack_lo || sp >= t.stack_hi) {
+     MemoryInfo mi = {};
+     u32 pi = 0;
+-    if (R_FAILED(svcQueryMemory(&mi, &pi, sp)) || !(mi.perm & Perm_R)) return;
++    if (R_FAILED(svcQueryMemory(&mi, &pi, sp)) || !(mi.perm & Perm_R)) return 0;
+     t.stack_lo = mi.addr;
+     t.stack_hi = mi.addr + mi.size;
+   }
+@@ -249,6 +252,8 @@
+     if (v >= g_base && v < g_text_end && !(v & 3) && v != w[k - 1]) w[k++] = v;
+   }
+   t.waits.add(w);
++  for (int i = 2; i < k; ++i) out[i - 2] = w[i];
++  return k - 2;
+ }
+ 
+ // Returns false when the kernel refuses (e.g. an emulator without the svc).
+@@ -261,7 +266,16 @@
+   Result rc2 = rc;
+   if (R_SUCCEEDED(rc)) {
+     rc2 = svcGetThreadContext3(&ctx, h);
+-    if (R_SUCCEEDED(rc2)) wait_stack(t, ctx);  // while the stack holds still
++    if (R_SUCCEEDED(rc2)) {
++      uint64_t hret[kWaitDepth];
++      const int nh = wait_stack(t, ctx, hret);  // while the stack holds still
++      if (g_tprof && t.slot == kThreadCpu) {
++        if (CPUContext *c = g_ctx_ptr)
++          tprof::sample(*c, ctx.pc.x, ctx.lr, (uint32_t)(armTicksToNs(t0 - g_tprof_t0) / 1000), hret, nh);
++      } else if (g_tprof) {
++        tprof::sample_host(t.slot, ctx.pc.x, ctx.lr, (uint32_t)(armTicksToNs(t0 - g_tprof_t0) / 1000), hret, nh);
++      }
++    }
+     svcSetThreadActivity(h, ThreadActivity_Runnable);
+   }
+   const u64 dt = armGetSystemTick() - t0;
+@@ -340,6 +354,7 @@
+       const double elapsed = armTicksToNs(now - start) / 1e9;
+       mkdir((std::string(root_dir()) + "/logs").c_str(), 0777);
+       for (Target &t : targets) write_target(t, elapsed);
++      if (g_tprof) tprof::flush();
+       const double tick_us = 1e6 / 19200000.0;
+       std::printf("[PROFILE] %.0f s: main %llu samples (%.2f %% paused), cpu %llu (%.2f %%) -> "
+                   "logs/profile_*.txt\n", elapsed,
+@@ -389,6 +404,11 @@
+   g_wait_fn[1] = (uint64_t)(uintptr_t)&svcWaitProcessWideKeyAtomic;
+   g_wait_fn[2] = (uint64_t)(uintptr_t)&svcSleepThread;
+   g_wait_fn[3] = (uint64_t)(uintptr_t)&svcWaitSynchronization;
++  g_wait_fn[4] = (uint64_t)(uintptr_t)&svcSendSyncRequest;
++  g_wait_fn[5] = (uint64_t)(uintptr_t)&svcWaitForAddress;
++  mkdir((std::string(root_dir()) + "/logs").c_str(), 0777);
++  g_tprof_t0 = armGetSystemTick();
++  g_tprof = tprof::init((std::string(root_dir()) + "/logs").c_str(), g_base, __DATE__ " " __TIME__);
+   // Core 3 if this process may use it (homebrew normally gets 0-2), else 2
+   // (the audio cores: AX mixer + audio output, a few % busy).
+   u64 allowed = 0;

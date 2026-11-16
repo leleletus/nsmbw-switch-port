@@ -1,0 +1,110 @@
+diff -ruN nWiiRuntime/src/hle/gx.cpp nWiiRuntime/src/hle/gx.cpp
+--- nWiiRuntime/src/hle/gx.cpp	2026-11-15 14:02:28.715970670 -0500
++++ nWiiRuntime/src/hle/gx.cpp	2026-11-15 13:02:13.190261380 -0500
+@@ -1281,6 +1281,17 @@
+ // commands become the dropped start of this frame). apply_now: the render
+ // thread is the caller (no worker): the parser state goes to g_state right
+ // after each parse, as the single-threaded drain always did.
++// r37v (frente V) NWII_V_DROPFAST=1: descarte barato en PrepFrame (ver abajo).
++static uint64_t s_v_dropfast_n = 0;
++static bool VDropFast() {
++    static const bool on = [] {
++        const char *e = std::getenv("NWII_V_DROPFAST");
++        const bool v = e && e[0] && e[0] != '0';
++        if (v) std::printf("[V] descarte barato en el trabajador: NWII_V_DROPFAST=1\n");
++        return v;
++    }();
++    return on;
++}
+ static FramePacket *PrepFrame(FramePacket *(*acquire)(bool &retracted), bool apply_now) {
+     if (PhOn()) s_ph_t = PhNow();
+     wprof::Stage st;  // R22 R7
+@@ -1502,6 +1513,59 @@
+         }
+         s_carry_draws.resize(w);
+         s_carry_ents.resize(w);
++    } else if (prev_frame_end >= 0 && !retr_slow && RPrefixOn() && VDropFast()) {
++        // r37v (frente V), NWII_V_DROPFAST=1: el lote trae dos o mas finales de fotograma (el trabajador va
++        // atrasado). Antes (camino de abajo) se movian una a una TODAS las ordenes del lote, incluido el
++        // fotograma bueno entero, y sus draws perdian las entradas del parser (todos se preparaban otra vez):
++        // split ~15 ms + decode ~8 ms por fotograma en agua/fiesta, y el siguiente lote volvia a traer dos
++        // finales (regimen lento estable). Ahora la parte descartada [0, prev_frame_end] (sin draws, sin las
++        // escrituras muertas de rcoal, copias EFB stale) va a pkt.pre como hace RetractToPrefix (se dibuja
++        // antes, mismo orden), y el fotograma bueno toma el camino rapido: conserva sus entradas.
++        const size_t D = (size_t)prev_frame_end + 1;
++        const bool coal = rcoal::On();
++        if (coal) {
++            rcoal::st_dead += rcoal::Mark(s_carry, 0, D);
++            ++rcoal::st_calls;
++            rcoal::st_in += D;
++            if (rcoal::CheckOn()) rcoal::Check(s_carry, 0, D, rcoal::s_dead);
++        }
++        for (size_t i = 0; i < D; ++i) {
++            auto &c = s_carry[i];
++            if (c.type == nwii::runtime::gx::GXCommandType::DrawPrimitive) {
++                if (coal) ++rcoal::st_draws;
++                continue;
++            }
++            if (coal && rcoal::s_dead[i]) continue;
++            if (c.type == nwii::runtime::gx::GXCommandType::BPRegister && c.reg == 0x52) {
++                c.stale_copy = true;
++                if (c.val & 0x4000) ++s_prep_pending.dropped;
++            }
++            pkt.pre.push_back(std::move(c));
++        }
++        auto &tail = s_tail;
++        tail.clear();
++        tail.insert(tail.end(),
++                    std::make_move_iterator(s_carry.begin() + last_frame_end + 1),
++                    std::make_move_iterator(s_carry.end()));
++        s_carry.erase(s_carry.begin() + last_frame_end + 1, s_carry.end());
++        frame.swap(s_carry);
++        frame.erase(frame.begin(), frame.begin() + (ptrdiff_t)D);  // los draws descartados mueren aqui
++        s_carry.swap(tail);
++        size_t k = 0;
++        s_draw_entries.clear();
++        while (k < s_carry_draws.size() && s_carry_draws[k] < D) ++k;
++        for (; k < s_carry_draws.size() && (int)s_carry_draws[k] <= last_frame_end; ++k) {
++            s_draws.push_back(&frame[s_carry_draws[k] - D]);
++            s_draw_entries.push_back(s_carry_ents[k]);
++        }
++        size_t w = 0;
++        for (; k < s_carry_draws.size(); ++k) {
++            s_carry_ents[w] = s_carry_ents[k];
++            s_carry_draws[w++] = s_carry_draws[k] - (uint32_t)(last_frame_end + 1);
++        }
++        s_carry_draws.resize(w);
++        s_carry_ents.resize(w);
++        ++s_v_dropfast_n;
+     } else {
+     frame.reserve(pkt.frame.size() + s_carry.size());
+     // R11: a retracted packet's commands (draws already dropped) come first.
+@@ -1891,6 +1955,12 @@
+                                (unsigned long long)rf, rf ? rns / 1000.0 / rf : 0.0);
+         }
+         std::cout << b;
++        if (VDropFast()) {  // r37v
++            static uint64_t d0 = 0;
++            const uint64_t d = s_v_dropfast_n;
++            std::printf("[V] descartes baratos %llu\n", (unsigned long long)(d - d0));
++            d0 = d;
++        }
+     }
+ }
+ 
+@@ -2020,8 +2090,15 @@
+         return s_rendering == &s_pkts[0] ? &s_pkts[1] : &s_pkts[0];
+     };
+     auto last_frame = clk::now();
++    // r37v, SOLO PRUEBAS EN PC: NWII_V_SLOWWORKER_US=<us>: el trabajador duerme tras cada fotograma preparado
++    // (simula el trabajador de la Switch, que se atrasa y recibe lotes con dos finales de fotograma).
++    static const long s_v_slowworker = [] {
++        const char *e = std::getenv("NWII_V_SLOWWORKER_US");
++        return e ? std::atol(e) : 0L;
++    }();
+     for (;;) {
+         if (FramePacket *fill = PrepFrame(acquire, false)) {
++            if (s_v_slowworker > 0) std::this_thread::sleep_for(std::chrono::microseconds(s_v_slowworker));
+             {
+                 const int64_t t = PipeNow();
+                 const int64_t x = s_pipe_xfb_last.load(std::memory_order_relaxed);

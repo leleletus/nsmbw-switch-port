@@ -1,0 +1,21 @@
+--- a/nWiiRuntime/src/hle/ax/ax_async.cpp
++++ b/nWiiRuntime/src/hle/ax/ax_async.cpp
+@@ -204,8 +204,16 @@
+         core = c;
+         break;
+       }
+-    std::printf("[NX] AX thread on core %d (allowed mask 0x%llx)\n", core,
+-                (unsigned long long)allowed);
++    // R14 R5: libnx starts pthreads at priority 0x3B (the lowest), below the
++    // render worker (0x2D) that shares core 2: every list the worker
++    // preempted made the CPU thread wait in finish() (console, castle
++    // cutscene: ~70 ms of waits per second, mixes up to 42 ms). One step above
++    // the worker, as the worker's own comment assumed. NWII_AX_PRIO overrides.
++    const char *pe = std::getenv("NWII_AX_PRIO");
++    const int prio = pe ? (int)std::strtol(pe, nullptr, 0) : 0x2C;
++    const Result prc = svcSetThreadPriority(CUR_THREAD_HANDLE, prio);
++    std::printf("[NX] AX thread on core %d, priority 0x%X%s (allowed mask 0x%llx)\n", core, prio,
++                R_SUCCEEDED(prc) ? "" : " (failed)", (unsigned long long)allowed);
+     nx::note_thread(nx::kThreadAx);
+ #endif
+     uint64_t seen = 0;

@@ -1,0 +1,51 @@
+diff --color -ruN nWiiRuntime_m6h/src/core/main.cpp nWiiRuntime_m6i/src/core/main.cpp
+--- nWiiRuntime_m6h/src/core/main.cpp	2026-11-15 19:05:07.868667246 -0500
++++ nWiiRuntime_m6i/src/core/main.cpp	2026-11-15 20:35:19.729051847 -0500
+@@ -214,7 +214,7 @@
+       {"NWII_D_PARSESTOP", "1", "NWII_D_OFF"},  {"NWII_D_LIGHTPARSE", "1", "NWII_D_OFF"},
+       {"NWII_D_FASTDECODE", "1", "NWII_D_OFF"}, {"NWII_D_FASTPREP", "1", "NWII_D_OFF"},
+       {"NWII_D_RENDERPREP", "1", "NWII_D_OFF", false},  // preparado: hasta ver D11/D12
+-      {"NWII_D_MERGE", "1", "NWII_D_OFF", false},       // m6h: preparado (D: FC 5/5, MERGE_CHECK 0 px)
++      {"NWII_D_MERGE", "1", "NWII_D_OFF"},             // m6i: encendido (M23/M25: agua 52 -> 56)
+       {"NWII_R2_LATEFREE", "1", "NWII_R2_OFF"}, {"NWII_R2_CLEARTEX", "1", "NWII_R2_OFF"},
+       {"NWII_R2_COPYFBO", "1", "NWII_R2_OFF"},  {"NWII_R2_LAZYNAT", "1", "NWII_R2_OFF"},
+       {"NWII_R2_COPYUNI", "1", "NWII_R2_OFF"},  {"NWII_R2_COPYST", "1", "NWII_R2_OFF"},
+@@ -223,13 +223,14 @@
+       {"NWII_R_CULL", "2", "NWII_R_OFF"},
+       // m6g: frente K (sondeo lento cada 128; consola K02: -0,4 a -0,9 ms juego, FC 5/5 en PC). Encendido.
+       {"NWII_POLL_EVERY", "128", "NWII_K_OFF"},
+-      // m6h: preparados (apagados) hasta medirlos en consola
+-      {"NWII_W_AGUA", "1", "NWII_W_OFF", false},        // frente W: renderizador del agua nativo
+-      {"NWII_W_WGP", "1", "NWII_W_OFF", false},         // frente W: escritura al pipe ligera
+-      {"NWII_A_MIX", "1", "NWII_A_OFF", false},         // frente A: mezclador AX nativo
+-      {"NWII_A_NOSPIN", "1", "NWII_A_OFF", false},      // frente A: esperas cortas duermen
+-      {"NWII_A_REQSPIN", "200", "NWII_A_OFF", false},   // frente A: giro de peticiones
+-      {"NWII_M_LOGBG", "1", "NWII_M_OFF", false},       // frente M: registro en hilo de fondo
++      // m6i: encendidos tras M22-M28 en consola (frentes W, A, M)
++      {"NWII_W_AGUA", "1", "NWII_W_OFF"},               // frente W: renderizador de líquidos nativo (w3, 5 rutas)
++      {"NWII_W_WGP", "1", "NWII_W_OFF"},                // frente W: escritura al pipe ligera
++      {"NWII_A_MIX", "2", "NWII_A_OFF"},                // frente A: mezclador AX nativo + ADPCM en lote
++      {"NWII_A_NOSPIN", "1", "NWII_A_OFF"},             // frente A: esperas cortas duermen
++      {"NWII_A_REQSPIN", "200", "NWII_A_OFF"},          // frente A: giro de peticiones
++      {"NWII_AXFX_KERNEL", "4", "NWII_A_OFF", false},    // frente A: reverb vectorizada (objeto output_24 de A), preparado
++      {"NWII_M_LOGBG", "1", "NWII_M_OFF"},              // frente M: registro en hilo de fondo (lo lee ANTES logbg_start, misma regla)
+   };
+   if (std::getenv("NWII_M6_OFF")) {
+     std::printf("[M6] NWII_M6_OFF: sin valores por defecto de m6\n");
+diff --color -ruN nWiiRuntime_m6h/src/platform/switch/switch_platform.cpp nWiiRuntime_m6i/src/platform/switch/switch_platform.cpp
+--- nWiiRuntime_m6h/src/platform/switch/switch_platform.cpp	2026-11-15 19:05:07.837329335 -0500
++++ nWiiRuntime_m6i/src/platform/switch/switch_platform.cpp	2026-11-15 20:35:19.730111226 -0500
+@@ -252,8 +252,12 @@
+   }
+ }
+ void logbg_start() {
++  // m6i: ENCENDIDO por defecto. Se lee aquí (setup_logging, dentro de early_init: ANTES de m6_defaults() de main.cpp),
++  // con la misma regla que m6_defaults: un valor explícito manda; NWII_M_LOGBG_OFF / NWII_M_OFF / NWII_M6_OFF lo apagan.
+   const char *e = std::getenv("NWII_M_LOGBG");
+-  if (!e || !*e || e[0] == '0') return;
++  const bool on = e ? (*e && e[0] != '0')
++                    : !(std::getenv("NWII_M_LOGBG_OFF") || std::getenv("NWII_M_OFF") || std::getenv("NWII_M6_OFF"));
++  if (!on) return;
+   {
+     std::lock_guard<std::mutex> lk(g_out_sink.m);
+     g_out_sink.bg = true;  // antes de la primera escritura de stdout (setup_logging)

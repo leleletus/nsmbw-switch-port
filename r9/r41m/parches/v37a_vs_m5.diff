@@ -1,0 +1,446 @@
+diff --color -ruN r35m4/nWiiRuntime_m5/src/core/main.cpp r40d/base_v37a/nWiiRuntime/src/core/main.cpp
+--- r35m4/nWiiRuntime_m5/src/core/main.cpp	2026-11-14 21:32:24.165940940 -0500
++++ r40d/base_v37a/nWiiRuntime/src/core/main.cpp	2026-11-15 11:36:43.830434259 -0500
+@@ -41,6 +41,8 @@
+ #include <ctime>
+ #endif
+ 
++void vtl_note(uint32_t kind, uint32_t arg);  // r37v (gx.cpp): NWII_V_TL
++void vtl_init();
+ namespace nwii::runtime {
+     namespace hw { extern uint32_t g_vi_top_field_base; }
+     // CPU-thread sleeps in the guest OS idle loop (os_hle_stubs.cpp idle_wait).
+@@ -693,6 +695,7 @@
+           std::chrono::duration<double>(1.0 / fps));
+   }
+ 
++  ::vtl_init();  // r37v: NWII_V_TL=<ruta>
+   nwii::runtime::s2::init(ctx.get());  // r34s2 (NWII_S2=1): CPU de sonido
+ #ifdef __SWITCH__
+   // Every guest call is a native call, so the host stack grows as deep as the
+@@ -1282,6 +1285,8 @@
+           extern void GX_PipeNoteSwap(int64_t);
+           const auto ts0 = std::chrono::steady_clock::now();
+           HostSwap(window);  // r15dk: SDL_GL_SwapWindow o dkgl::SwapBuffers
++          ::vtl_note(9, (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(
++                          std::chrono::steady_clock::now() - ts0).count());
+           GX_PipeNoteSwap(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - ts0).count());
+         }
+diff --color -ruN r35m4/nWiiRuntime_m5/src/core/os_hle_stubs.cpp r40d/base_v37a/nWiiRuntime/src/core/os_hle_stubs.cpp
+--- r35m4/nWiiRuntime_m5/src/core/os_hle_stubs.cpp	2026-11-14 21:30:42.182784612 -0500
++++ r40d/base_v37a/nWiiRuntime/src/core/os_hle_stubs.cpp	2026-11-15 11:56:02.111524626 -0500
+@@ -1,5 +1,8 @@
+ #include "s2.h"  // r34s2
+ #include "runtime/nwii_env.h"
++#include <cstdint>
++void vtl_note(uint32_t kind, uint32_t arg);  // r37v (gx.cpp): NWII_V_TL
++void vtl_idle_turn(bool at_end);             // r37v (gx.cpp)
+ #include "runtime/config.h"
+ #include "runtime/cpu_context.h"
+ #include "runtime/hw/hw.h"
+@@ -240,6 +243,7 @@
+ NativeStackGuard g_native_stack = {0, 0};  // R9 guestloop (cpu_context.h)
+ 
+ extern int g_ipc_interrupt_delay;
++extern std::atomic<uint32_t> g_v_dispatch_seq;  // r37v (ios.cpp)
+ 
+ // Time the CPU thread spent asleep in idle_wait (NWII_FPS=1 reports it).
+ std::atomic<uint64_t> g_idle_sleeps{0}, g_idle_sleep_us{0};
+@@ -472,7 +476,31 @@
+   }
+ }
+ 
++extern int64_t g_v_idle_ns;  // r37v (ios.cpp): NWII_V_LATE
++extern bool g_v_vi_held;
++void v_deliver_held(CPUContext &c, int why);
++static inline int64_t v_now_ns() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++struct VtlIdle {  // r37v: NWII_V_TL (tramos ociosos) y NWII_V_LATE (hora de la ultima vuelta ociosa)
++  bool on;
++  static bool late_on() {
++    static const bool v = [] { const char *e = std::getenv("NWII_V_LATE"); return e && e[0] && e[0] != '0'; }();
++    return v;
++  }
++  explicit VtlIdle(CPUContext &c) : on(&c == g_ctx_ptr) {
++    if (on) { ::vtl_idle_turn(false); if (late_on()) g_v_idle_ns = v_now_ns(); }
++  }
++  ~VtlIdle() { if (on) { ::vtl_idle_turn(true); if (late_on()) g_v_idle_ns = v_now_ns(); } }
++};
+ void idle_wait(CPUContext &ctx) {
++  VtlIdle vtl_idle_(ctx);
++  // r37v NWII_V_LATE: el juego ya espera (bucle ocioso): lanzar ahora el retrazo retenido.
++  if (__builtin_expect(g_v_vi_held, 0) && &ctx == g_ctx_ptr) {
++    v_deliver_held(ctx, 1);
++    return;
++  }
+   // R8 threads: hand the guest's gathered GX FIFO bytes to the host before
+   // the guest idles (see the write-gather buffer in gx.cpp).
+   GX_WGPIPE_Flush();
+@@ -487,6 +515,22 @@
+       g_ipc_interrupt_delay > 0 || hw::g_di_interrupt_delay > 0 ||
+       ctx.pending_cb_count.load(std::memory_order_relaxed) != 0)
+     return;
++  // r37v (frente V), NWII_V_WAKE=1: si desde la vuelta anterior del bucle ocioso se le entrego al invitado
++  // una interrupcion / DEC / callback (que puede haber despertado un hilo: el retrazo VI despierta al hilo
++  // principal), no dormir: el bucle ocioso vuelve a mirar su cola de hilos listos en la vuelta siguiente.
++  // Sin esto el hilo despertado esperaba lo que durase el sueno (hasta 2 ms) antes de correr: medido en PC,
++  // retrazo -> copia XFB 2,07 ms (con NWII_NO_IDLE_SLEEP 0,02 ms), que se comia el presupuesto del fotograma.
++  {
++    static const bool v_wake = [] {
++      const char *e = std::getenv("NWII_V_WAKE");
++      return e && e[0] && e[0] != '0';
++    }();
++    static uint32_t seen = 0;
++    if (v_wake && &ctx == g_ctx_ptr && g_v_dispatch_seq.load(std::memory_order_relaxed) != seen) {
++      seen = g_v_dispatch_seq.load(std::memory_order_relaxed);
++      return;
++    }
++  }
+   uint64_t due = EventScheduler::get().next_due();
+   if (ctx.dec_irq_pending && ctx.dec_value != 0xFFFFFFFF)
+     due = std::min<uint64_t>(due, ctx.dec_written_tb + ctx.dec_value);
+diff --color -ruN r35m4/nWiiRuntime_m5/src/hle/gx.cpp r40d/base_v37a/nWiiRuntime/src/hle/gx.cpp
+--- r35m4/nWiiRuntime_m5/src/hle/gx.cpp	2026-11-15 06:18:14.229822228 -0500
++++ r40d/base_v37a/nWiiRuntime/src/hle/gx.cpp	2026-11-15 13:06:19.210287726 -0500
+@@ -103,11 +103,97 @@
+     return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+ }
++// ---- r37v (frente V): NWII_V_TL=<ruta> linea de tiempo de la tuberia ----------
++// Anillo de sucesos con hora (PipeNow, ns) de todos los hilos: retrazo VI (disparo y si se
++// lanzo la interrupcion), interrupciones entregadas al invitado, tramos ociosos del hilo del
++// juego, copia XFB, trabajador listo, render toma/acaba, swap. El hilo de render vuelca los
++// nuevos cada ~2 s (PrintProf) a <ruta> en binario: registros de 16 bytes <q t, I kind, I arg>.
++// Solo diagnostico: apagado no cuesta mas que una carga y un salto por suceso.
++namespace vtl {
++struct Ev { int64_t t; uint32_t kind; uint32_t arg; };
++static constexpr uint64_t kN = 1u << 16;
++static Ev s_ring[kN];
++static std::atomic<uint64_t> s_head{0};
++static uint64_t s_tail = 0;   // hilo de render
++static FILE *s_f = nullptr;
++static const char *s_path = nullptr;
++static const char *Path() { return s_path; }
++bool g_on = false;
++static inline void NoteAt(int64_t t, uint32_t kind, uint32_t arg) {
++    const uint64_t i = s_head.fetch_add(1, std::memory_order_relaxed);
++    Ev &e = s_ring[i & (kN - 1)];
++    e.t = t; e.kind = kind; e.arg = arg;
++}
++static void Dump() {  // hilo de render
++    if (!g_on) return;
++    if (!s_f) {
++        s_f = std::fopen(Path(), "wb");
++        if (!s_f) { g_on = false; return; }
++        std::printf("[VTL] linea de tiempo -> %s\n", Path());
++    }
++    const uint64_t h = s_head.load(std::memory_order_acquire);
++    const uint64_t end = h > 64 ? h - 64 : 0;  // los ultimos pueden estar a medio escribir
++    if (end <= s_tail) return;
++    uint64_t from = s_tail;
++    if (end - from > kN - 256) from = end - (kN - 256);  // desbordado: se pierden los viejos
++    for (uint64_t i = from; i < end; ++i) std::fwrite(&s_ring[i & (kN - 1)], sizeof(Ev), 1, s_f);
++    std::fflush(s_f);
++    s_tail = end;
++}
++}  // namespace vtl
++namespace nwii::runtime {
++extern bool g_vtl_on_ios;
++extern uint64_t g_v_held_n, g_v_held_idle_n, g_v_held_to_n, g_v_held_drop_n, g_v_held_us;  // ios.cpp
++}
++// main.cpp, con el entorno ya aplicado (en la Switch, debug.toml), antes del hilo de la CPU.
++void vtl_init() {
++    const char *e = std::getenv("NWII_V_TL");
++    if (!(e && e[0] && e[0] != '0')) return;
++    vtl::s_path = e;
++    vtl::g_on = true;
++    nwii::runtime::g_vtl_on_ios = true;
++}
++// Usado desde ios.cpp / os_hle_stubs.cpp / main.cpp (declaracion extern alli).
++void vtl_note(uint32_t kind, uint32_t arg) {
++    if (__builtin_expect(vtl::g_on, 0)) vtl::NoteAt(PipeNow(), kind, arg);
++}
++// Hilo del juego, en cada vuelta de idle_wait: tramos ociosos (fin = ultima vuelta antes de
++// un hueco de mas de 300 us sin idle_wait).
++void vtl_idle_turn(bool at_end) {
++    if (__builtin_expect(!vtl::g_on, 1)) return;
++    static int64_t last = 0;
++    const int64_t t = PipeNow();
++    if (!at_end && t - last > 300000) {
++        if (last) vtl::NoteAt(last, 4, 0);  // fin de tramo ocioso
++        vtl::NoteAt(t, 3, 0);               // empieza tramo ocioso
++    }
++    last = t;
++}
+ static std::atomic<int64_t> s_pipe_xfb_last{0};
+ static std::atomic<uint64_t> s_pipe_xfb_n{0}, s_pipe_xfb_sum{0}, s_pipe_xfb_max{0};
+ static std::atomic<uint32_t> s_pipe_xfb_h[5];  // interval <=18, <=22, <=30, <=36, >36 ms
++// r37v (frente V), SOLO PRUEBAS EN PC: NWII_V_SLOWTEST=<base_us>,<azar_us>: tras cada copia XFB el hilo del
++// juego gira base + azar(0..azar) us (simula un juego lento como el de la Switch en un PC rapido).
++static bool s_v_slow_due = false;
++static NWII_NOINLINE void VSlowTest() {
++    static long base = -1, jit = 0;
++    static uint32_t rnd = 12345;
++    if (base < 0) {
++        const char *e = std::getenv("NWII_V_SLOWTEST");
++        base = 0;
++        if (e) std::sscanf(e, "%ld,%ld", &base, &jit);
++    }
++    if (base <= 0 && jit <= 0) return;
++    rnd = rnd * 1103515245u + 12345u;
++    const long us = base + (jit > 0 ? (long)((rnd >> 8) % (uint32_t)jit) : 0);
++    const auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
++    while (std::chrono::steady_clock::now() < end) {}
++}
+ static inline void PipeNoteXfb() {  // guest thread, g_fifo_mutex held
+     const int64_t t = PipeNow();
++    static uint32_t s_vtl_xfb = 0;
++    s_v_slow_due = true;  // r37v NWII_V_SLOWTEST
++    if (__builtin_expect(vtl::g_on, 0)) vtl::NoteAt(t, 5, ++s_vtl_xfb);
+     const int64_t l = s_pipe_xfb_last.exchange(t, std::memory_order_relaxed);
+     if (!l) return;
+     const uint64_t d = (uint64_t)(t - l);
+@@ -158,6 +244,7 @@
+                             std::chrono::steady_clock::now() - t0).count();
+     s_fifo_waits.fetch_add(1, std::memory_order_relaxed);
+     s_fifo_wait_us.fetch_add(us, std::memory_order_relaxed);
++    vtl_note(10, (uint32_t)us);
+     if (wall) {
+         // Guest time stands still while it waits: the governor's clock
+         // mapping (guest = wall - slip) absorbs the wait, and the wait counts
+@@ -1737,6 +1824,20 @@
+                       (unsigned long long)s_pipe_r_n, ms(s_pipe_s_sum, s_pipe_s_n), s_pipe_s_max / 1e6,
+                       ms(s_pipe_l_sum, s_pipe_l_n), s_pipe_l_max / 1e6, (unsigned long long)s_pipe_l_n);
+         std::cout << b;
++        vtl::Dump();
++        {
++            // r37v NWII_V_LATE: retrazos retenidos en estos ~2 s (contadores del hilo del juego, ios.cpp)
++            static uint64_t n0 = 0, i0 = 0, t0 = 0, d0 = 0, u0 = 0;
++            const uint64_t n = nwii::runtime::g_v_held_n, i = nwii::runtime::g_v_held_idle_n,
++                           t = nwii::runtime::g_v_held_to_n, d = nwii::runtime::g_v_held_drop_n,
++                           u = nwii::runtime::g_v_held_us;
++            if (n != n0)
++                std::printf("[V] retrazos retenidos %llu (lanzados al esperar %llu, por plazo %llu, perdidos %llu),"
++                            " retencion media %.2f ms\n",
++                            (unsigned long long)(n - n0), (unsigned long long)(i - i0), (unsigned long long)(t - t0),
++                            (unsigned long long)(d - d0), (i + t > i0 + t0) ? (u - u0) / 1000.0 / (double)(i + t - i0 - t0) : 0.0);
++            n0 = n; i0 = i; t0 = t; d0 = d; u0 = u;
++        }
+         s_pipe_r_n = s_pipe_r_wait = s_pipe_r_wait_max = s_pipe_r_draw = s_pipe_r_draw_max = 0;
+         s_pipe_s_n = s_pipe_s_sum = s_pipe_s_max = s_pipe_l_n = s_pipe_l_sum = s_pipe_l_max = 0;
+     }
+@@ -1933,6 +2034,8 @@
+                 }
+                 fill->t_ready = t;
+                 std::lock_guard<std::mutex> lk(s_pm);
++                if (__builtin_expect(vtl::g_on, 0))
++                    vtl::NoteAt(t, 6, (uint32_t)fill->seq | (s_ready ? 0x80000000u : 0u));
+                 s_ready = fill;
+             }
+             s_cv_main.notify_one();
+@@ -2072,7 +2175,9 @@
+         if (noskip) s_cv_worker.notify_one();  // the worker may wait for this
+         const uint64_t c0 = thread_cpu_us();
+         const int64_t t0 = PipeNow();
++        if (__builtin_expect(vtl::g_on, 0)) vtl::NoteAt(t0, 7, (uint32_t)p->seq);
+         RenderPacket(*p, true);
++        if (__builtin_expect(vtl::g_on, 0)) vtl::NoteAt(PipeNow(), 8, (uint32_t)p->seq);
+         g_prof_drain_cpu_us += thread_cpu_us() - c0;
+         {
+             // R22 R7: free the frame's commands here instead of on the worker
+@@ -2677,6 +2782,13 @@
+         }
+     }
+     if (__builtin_expect(full, 0)) FifoWaitForHost();
++    if (__builtin_expect(s_v_slow_due, 0)) {
++        s_v_slow_due = false;
++        static const bool on = std::getenv("NWII_V_SLOWTEST") != nullptr;
++        if (on) VSlowTest();
++    }
++    if (bp && __builtin_expect(vtl::g_on, 0) && (reg == 0x45 || reg == 0x47 || reg == 0x48))
++        vtl_note(12, (uint32_t)reg << 24 | (val & 0xFFFF));
+     if (bp && g_early_gx_sync) {
+         if (reg == 0x45 && (val & 0xF) == 2)
+             nwii::runtime::hw::pe_signal_finish();
+diff --color -ruN r35m4/nWiiRuntime_m5/src/hle/ios.cpp r40d/base_v37a/nWiiRuntime/src/hle/ios.cpp
+--- r35m4/nWiiRuntime_m5/src/hle/ios.cpp	2026-11-15 00:31:52.262762646 -0500
++++ r40d/base_v37a/nWiiRuntime/src/hle/ios.cpp	2026-11-15 11:57:12.183839462 -0500
+@@ -17,6 +17,9 @@
+ #define NWII_LONGJMP(b) longjmp(b, 1)
+ #endif
+ #include "runtime/nwii_env.h"
++
++void vtl_note(uint32_t kind, uint32_t arg);  // r37v (gx.cpp): NWII_V_TL
++void vtl_idle_turn(bool at_end);             // r37v (gx.cpp)
+ #include "runtime/platform/platform.h"
+ #include "runtime/config.h"
+ #include "runtime/cpu_context.h"
+@@ -31,6 +34,7 @@
+ #include <string>
+ #include <vector>
+ #include <thread>
++#include <chrono>
+ #include "runtime/hw/hw.h"
+ #include "runtime/event_scheduler.h"
+ #include "runtime/os_thread.h"
+@@ -891,6 +895,56 @@
+ // The fast path performs exactly the side effects the full body would (DI
+ // tick, timebase read + scheduler advance, decrementer check) and enters
+ // ppc_tail at the same point, so behaviour is unchanged.
++bool g_vtl_on_ios = false;  // r37v: NWII_V_TL (vtl_init, gx.cpp)
++// r37v (NWII_V_WAKE): cuenta de entregas al invitado (interrupcion externa, DEC, callback); idle_wait
++// no duerme en la vuelta en la que ha habido una (ver os_hle_stubs.cpp).
++std::atomic<uint32_t> g_v_dispatch_seq{0};
++// r37v (frente V), NWII_V_LATE=<ms> (1..12): retrazo VI elastico. Si el retrazo llega con el hilo del juego
++// ocupado (no ha pasado por el bucle ocioso en los ultimos 300 us: aun no ha terminado su fotograma), la
++// interrupcion VI se retiene hasta que el juego entra en el bucle ocioso (idle_wait: ya espera al retrazo) o
++// hasta <ms> despues, lo que llegue antes; los retrazos siguientes siguen en su sitio (60 por segundo, el
++// reloj invitado y el audio no cambian). Un fotograma que acaba un poco tarde ya no espera al retrazo
++// siguiente entero (16,7 ms): el juego encadena y recupera en los fotogramas siguientes.
++extern CPUContext *g_ctx_ptr;  // main.cpp
++int64_t g_v_idle_ns = 0;     // ultima entrada/salida de idle_wait del hilo del juego (ns, steady_clock)
++bool g_v_vi_held = false;    // hay un retrazo retenido
++static int64_t s_v_held_ns = 0;
++uint64_t g_v_held_n = 0, g_v_held_idle_n = 0, g_v_held_to_n = 0, g_v_held_drop_n = 0, g_v_held_us = 0;
++static inline int64_t v_now_ns() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++static uint64_t v_late_ticks(const CPUContext &c) {
++  static const uint64_t t = [&c] {
++    const char *e = std::getenv("NWII_V_LATE");
++    if (!(e && e[0] && e[0] != '0')) return (uint64_t)0;
++    double ms = std::atof(e);
++    if (ms < 0.5) ms = 0.5;
++    if (ms > 12) ms = 12;
++    std::printf("[V] retrazo elastico: NWII_V_LATE=%.1f ms\n", ms);
++    return (uint64_t)(c.tb_freq * ms / 1000.0);
++  }();
++  return t;
++}
++static inline bool v_vi_ok(CPUContext &c) {
++  return (nwii::runtime::hw::pi_intmr & 0x100) && !c.in_callback && !(nwii::runtime::hw::pi_intsr & 0x100) &&
++         (c.dispatch_saved_ctx == 0 || c.mmu.read32(0x800000E4) == 0);
++}
++// why: 1 = el juego entra en el bucle ocioso, 2 = se acabo el plazo
++void v_deliver_held(CPUContext &c, int why) {
++  if (!g_v_vi_held) return;
++  g_v_vi_held = false;
++  const int64_t us = (v_now_ns() - s_v_held_ns) / 1000;
++  g_v_held_us += (uint64_t)us;
++  (why == 1 ? g_v_held_idle_n : g_v_held_to_n)++;
++  if (v_vi_ok(c)) {
++    nwii::runtime::hw::vi_trigger_interrupt();
++  } else {
++    ++g_v_held_drop_n;  // como sin retencion: un retrazo que no se puede lanzar se pierde
++  }
++  if (__builtin_expect(g_vtl_on_ios, 0)) ::vtl_note(15, (uint32_t)us | (uint32_t)why << 28);
++}
++
+ static bool g_vi_registered = false;
+ // r21s: core/force_demo.cpp (aquí ya estamos dentro de nwii::runtime)
+ extern bool g_force_demo_on;
+@@ -1170,10 +1224,33 @@
+ 
+                   
+                   
+-                  if ((nwii::runtime::hw::pi_intmr & 0x100) && !c.in_callback &&
++                  const bool vi_ok = (nwii::runtime::hw::pi_intmr & 0x100) && !c.in_callback &&
+                       !(nwii::runtime::hw::pi_intsr & 0x100) &&
+-                      (c.dispatch_saved_ctx == 0 || c.mmu.read32(0x800000E4) == 0)) {
+-                      nwii::runtime::hw::vi_trigger_interrupt();
++                      (c.dispatch_saved_ctx == 0 || c.mmu.read32(0x800000E4) == 0);
++                  if (vi_ok) {
++                      // r37v NWII_V_LATE: retener si el juego aun no ha acabado su fotograma
++                      const uint64_t late = v_late_ticks(c);
++                      if (late && &c == nwii::runtime::g_ctx_ptr && !g_v_vi_held &&
++                          v_now_ns() - g_v_idle_ns > 300000) {
++                          g_v_vi_held = true;
++                          s_v_held_ns = v_now_ns();
++                          ++g_v_held_n;
++                          nwii::runtime::EventScheduler::get().schedule_after(
++                              late, [](CPUContext &c2, uint64_t) { v_deliver_held(c2, 2); });
++                      } else {
++                          nwii::runtime::hw::vi_trigger_interrupt();
++                      }
++                  }
++                  {
++                      extern bool g_vtl_on_ios;  // r37v: NWII_V_TL (ios.cpp)
++                      if (__builtin_expect(g_vtl_on_ios, 0)) {
++                          ::vtl_note(1, (vi_ok ? 1u : 0u) | ((nwii::runtime::hw::pi_intmr & 0x100) ? 0u : 2u) |
++                                          (c.in_callback ? 4u : 0u) |
++                                          ((nwii::runtime::hw::pi_intsr & 0x100) ? 8u : 0u) |
++                                          (c.dispatch_saved_ctx != 0 ? 16u : 0u) |
++                                          (&c == nwii::runtime::s2::snd_ctx() ? 32u : 0u) |
++                                          (g_v_vi_held ? 64u : 0u));
++                      }
+                   }
+               });
+       }
+@@ -1247,7 +1324,7 @@
+           
+           ctx.lr = 0xFFFFFFFC;
+           ctx.pc = dec_handler;
+-          { if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
++          { g_v_dispatch_seq.fetch_add(1, std::memory_order_relaxed); if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
+       }
+   }
+ 
+@@ -1366,7 +1443,7 @@
+                                 << std::dec << "\n";
+               }
+ 
+-              { if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
++              { g_v_dispatch_seq.fetch_add(1, std::memory_order_relaxed); if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
+ 
+           } else {
+ 
+@@ -1388,6 +1465,9 @@
+ 
+               if (os_intr != -1) {
+                   uint32_t handler = ctx.mmu.read32(0x80003040 + os_intr * 4);
++                  if (__builtin_expect(g_vtl_on_ios, 0)) {  // r37v
++                      ::vtl_note(2, (uint32_t)os_intr | (&ctx == nwii::runtime::s2::snd_ctx() ? 0x100u : 0u));
++                  }
+ 
+                   if (handler != 0 && handler != 0xFFFFFFFF) {
+                       if (g_env_sample && os_intr == 24) {
+@@ -1448,7 +1528,7 @@
+                           ctx.pc = handler;
+                           ctx.ext_resched_pending = true;
+                           hle_lock_scheduler_for_dispatch(ctx);
+-                          { if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
++                          { g_v_dispatch_seq.fetch_add(1, std::memory_order_relaxed); if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
+                       }
+ 
+                       ctx.msr &= ~0x8000u;
+@@ -1478,7 +1558,7 @@
+                       ctx.gpr[4] = 0;
+                       ctx.lr = 0xFFFFFFFC;
+                       ctx.pc = handler;
+-                      { if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
++                      { g_v_dispatch_seq.fetch_add(1, std::memory_order_relaxed); if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
+                   } else {
+                       
+                       static uint32_t last_null_pc = 0;
+@@ -1549,7 +1629,7 @@
+ 
+     ctx.lr = 0xFFFFFFFC;
+     ctx.pc = cb.cb_addr;
+-    { if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
++    { g_v_dispatch_seq.fetch_add(1, std::memory_order_relaxed); if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
+   }
+ 
+   CPUContext::BackupState bk;
+@@ -1583,7 +1663,7 @@
+ 
+   ctx.lr = 0xFFFFFFFC;
+   ctx.pc = cb.cb_addr;
+-  { if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
++  { g_v_dispatch_seq.fetch_add(1, std::memory_order_relaxed); if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
+ }
+ 
+ // ---- R9 guestloop: the per-back-edge poll ---------------------------------

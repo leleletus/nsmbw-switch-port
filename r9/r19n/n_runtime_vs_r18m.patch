@@ -1,0 +1,2236 @@
+diff --color -ruN r18m/nWiiRuntime/CMakeLists.txt r19n/nWiiRuntime/CMakeLists.txt
+--- r18m/nWiiRuntime/CMakeLists.txt	2026-11-08 19:18:39.623522908 -0500
++++ r19n/nWiiRuntime/CMakeLists.txt	2026-11-09 04:31:52.426901337 -0500
+@@ -27,12 +27,15 @@
+     src/core/config.cpp
+     src/core/os_hle_stubs.cpp
+     src/core/event_scheduler.cpp
++    src/core/force_demo.cpp
+     src/input/input_manager.cpp
+     src/input/wii_remotes.cpp
+     src/input/sources/mouse_keyboard_source.cpp
+     src/input/sources/gamepad_source.cpp
+     src/input/sources/phone_source.cpp
+     src/hle/memory.cpp
++    src/hle/native_n1.cpp
++    src/hle/native_n2.cpp
+     src/hle/gx.cpp
+     src/hle/pad.cpp
+     src/hle/wpad_hle.cpp
+diff --color -ruN r18m/nWiiRuntime/include/runtime/native_n1_fp.h r19n/nWiiRuntime/include/runtime/native_n1_fp.h
+--- r18m/nWiiRuntime/include/runtime/native_n1_fp.h	1969-12-31 19:00:00.000000000 -0500
++++ r19n/nWiiRuntime/include/runtime/native_n1_fp.h	2026-11-08 23:41:13.048362102 -0500
+@@ -0,0 +1,142 @@
++// r19n (front N): the floating-point instruction helpers of CPUContext (cpu_context.h, "Gekko/Broadway
++// floating point" and "Paired singles"), as macros over named locals: register N is the pair (fN, pN)
++// = (ctx.fpr[N], ctx.ps1[N]). Each macro is the body of the CPUContext member of the same name, with
++// fpr[X] -> fX and ps1[X] -> pX and nothing else changed (same helper calls, same operand order, same
++// evaluation of all inputs before the destination is written). tools/apply_n1.py rewrites the body of a
++// generated leaf function onto them ("ctx.ps_madds0(12, 10, 1, 12);" -> "N1_ps_madds0(12, 10, 1, 12);"),
++// so the FPRs stay in host registers instead of ctx, and the paired-single helpers are inlined.
++// Keep in sync with cpu_context.h (a change there must be copied here; the comparators would see it).
++#pragma once
++#include "runtime/cpu_context.h"
++
++#define N1_SETPS(D, X0, X1) do { const double n1a_ = (X0), n1b_ = (X1); f##D = n1a_; p##D = n1b_; } while (0)
++#define N1_fill(D, V) do { const double n1v_ = (V); f##D = n1v_; p##D = n1v_; } while (0)
++#define N1_set_bits(D, V) do { const uint64_t n1u_ = (V); std::memcpy(&f##D, &n1u_, 8); } while (0)
++// scalar single: both halves
++#define N1_fadds(D, A, B) N1_fill(D, ppc_single(f##A + f##B))
++#define N1_fsubs(D, A, B) N1_fill(D, ppc_single(f##A - f##B))
++#define N1_fmuls(D, A, C) N1_fill(D, ppc_single(f##A * ppc_force25(f##C)))
++#define N1_fdivs(D, A, B) N1_fill(D, ppc_single(f##A / f##B))
++#define N1_fres(D, B) N1_fill(D, ppc_fres(f##B))
++#define N1_fmadds(D, A, C, B) N1_fill(D, ppc_single(ppc_madd_s(f##A, f##C, f##B)))
++#define N1_fmsubs(D, A, C, B) N1_fill(D, ppc_single(ppc_madd_s(f##A, f##C, -f##B)))
++#define N1_fnmadds(D, A, C, B) N1_fill(D, ppc_neg_keep_nan(ppc_single(ppc_madd_s(f##A, f##C, f##B))))
++#define N1_fnmsubs(D, A, C, B) N1_fill(D, ppc_neg_keep_nan(ppc_single(ppc_madd_s(f##A, f##C, -f##B))))
++#define N1_frsp(D, B) N1_fill(D, ppc_single(f##B))
++// double and moves: ps0 only
++#define N1_fmadd(D, A, C, B) (f##D = std::fma(f##A, f##C, f##B))
++#define N1_fmsub(D, A, C, B) (f##D = std::fma(f##A, f##C, -f##B))
++#define N1_fnmadd(D, A, C, B) (f##D = ppc_neg_keep_nan(std::fma(f##A, f##C, f##B)))
++#define N1_fnmsub(D, A, C, B) (f##D = ppc_neg_keep_nan(std::fma(f##A, f##C, -f##B)))
++#define N1_frsqrte(D, B) (f##D = ppc_frsqrte(f##B))
++#define N1_fctiw(D, B) N1_set_bits(D, ppc_fctiw_image(ppc_fctiw_rn(f##B, ctx.fpscr), f##B))
++#define N1_fctiwz(D, B) N1_set_bits(D, ppc_fctiw_image(ppc_fctiwz(f##B), f##B))
++// paired singles
++#define N1_ps_add(D, A, B) N1_SETPS(D, ppc_single(f##A + f##B), ppc_single(p##A + p##B))
++#define N1_ps_sub(D, A, B) N1_SETPS(D, ppc_single(f##A - f##B), ppc_single(p##A - p##B))
++#define N1_ps_mul(D, A, C) N1_SETPS(D, ppc_single(f##A * ppc_force25(f##C)), ppc_single(p##A * ppc_force25(p##C)))
++#define N1_ps_div(D, A, B) N1_SETPS(D, ppc_single(f##A / f##B), ppc_single(p##A / p##B))
++#define N1_ps_madd(D, A, C, B) \
++  N1_SETPS(D, ppc_single(ppc_madd_s(f##A, f##C, f##B)), ppc_single(ppc_madd_s(p##A, p##C, p##B)))
++#define N1_ps_msub(D, A, C, B) \
++  N1_SETPS(D, ppc_single(ppc_madd_s(f##A, f##C, -f##B)), ppc_single(ppc_madd_s(p##A, p##C, -p##B)))
++#define N1_ps_nmadd(D, A, C, B) \
++  N1_SETPS(D, ppc_neg_keep_nan(ppc_single(ppc_madd_s(f##A, f##C, f##B))), ppc_neg_keep_nan(ppc_single(ppc_madd_s(p##A, p##C, p##B))))
++#define N1_ps_nmsub(D, A, C, B) \
++  N1_SETPS(D, ppc_neg_keep_nan(ppc_single(ppc_madd_s(f##A, f##C, -f##B))), ppc_neg_keep_nan(ppc_single(ppc_madd_s(p##A, p##C, -p##B))))
++#define N1_ps_sum0(D, A, C, B) N1_SETPS(D, ppc_single(f##A + p##B), ppc_single(p##C))
++#define N1_ps_sum1(D, A, C, B) N1_SETPS(D, ppc_single(f##C), ppc_single(f##A + p##B))
++#define N1_ps_muls0(D, A, C) do { const double n1c_ = ppc_force25(f##C); N1_SETPS(D, ppc_single(f##A * n1c_), ppc_single(p##A * n1c_)); } while (0)
++#define N1_ps_muls1(D, A, C) do { const double n1c_ = ppc_force25(p##C); N1_SETPS(D, ppc_single(f##A * n1c_), ppc_single(p##A * n1c_)); } while (0)
++#define N1_ps_madds0(D, A, C, B) do { const double n1c_ = f##C; \
++  N1_SETPS(D, ppc_single(ppc_madd_s(f##A, n1c_, f##B)), ppc_single(ppc_madd_s(p##A, n1c_, p##B))); } while (0)
++#define N1_ps_madds1(D, A, C, B) do { const double n1c_ = p##C; \
++  N1_SETPS(D, ppc_single(ppc_madd_s(f##A, n1c_, f##B)), ppc_single(ppc_madd_s(p##A, n1c_, p##B))); } while (0)
++#define N1_ps_res(D, B) N1_SETPS(D, ppc_fres(f##B), ppc_fres(p##B))
++#define N1_ps_rsqrte(D, B) N1_SETPS(D, ppc_single(ppc_frsqrte(f##B)), ppc_single(ppc_frsqrte(p##B)))
++#define N1_ps_sel(D, A, C, B) N1_SETPS(D, (f##A >= -0.0) ? f##C : f##B, (p##A >= -0.0) ? p##C : p##B)
++#define N1_ps_mr(D, B) do { f##D = f##B; p##D = p##B; } while (0)
++#define N1_ps_neg(D, B) do { f##D = -f##B; p##D = -p##B; } while (0)
++#define N1_ps_abs(D, B) do { f##D = std::abs(f##B); p##D = std::abs(p##B); } while (0)
++#define N1_ps_nabs(D, B) do { f##D = -std::abs(f##B); p##D = -std::abs(p##B); } while (0)
++#define N1_ps_merge00(D, A, B) do { const double n1a_ = f##A, n1b_ = f##B; f##D = n1a_; p##D = n1b_; } while (0)
++#define N1_ps_merge01(D, A, B) do { const double n1a_ = f##A, n1b_ = p##B; f##D = n1a_; p##D = n1b_; } while (0)
++#define N1_ps_merge10(D, A, B) do { const double n1a_ = p##A, n1b_ = f##B; f##D = n1a_; p##D = n1b_; } while (0)
++#define N1_ps_merge11(D, A, B) do { const double n1a_ = p##A, n1b_ = p##B; f##D = n1a_; p##D = n1b_; } while (0)
++
++namespace nwii {
++namespace runtime {
++
++// psq_l / psq_st on a register pair held in locals: psq_l_fast / psq_st_fast (cpu_context.h, the float
++// GQR type through the same MemView accessors) and, for the other GQR types, the body of
++// CPUContext::psq_load / psq_store (same MMU accessors, same conversions) instead of the out-of-line call.
++template <uint32_t ID>
++NWII_FORCEINLINE void n1_psq_l(CPUContext &ctx, MemView &mv, double &fd, double &pd, uint32_t ea, uint32_t W, uint32_t I) {
++  const uint32_t gqr_val = ctx.gqr[I];
++  if (NWII_LIKELY((gqr_val & 0x70000u) == 0)) {
++    const double p0 = mv.read_f32<ID>(ea);
++    const double p1 = W == 0 ? (double)mv.read_f32<ID>(ea + 4) : 1.0;
++    fd = p0;
++    pd = p1;
++    return;
++  }
++  const uint32_t ld_type = (gqr_val >> 16) & 0x7;
++  const float scale = (float)gqr_pow2(-gqr_scale(gqr_val >> 24));
++  MMU &mmu = ctx.mmu;
++  auto load_element = [&](uint32_t a) -> double {
++    switch (ld_type) {
++    case 0: return mmu.read_f32(a);
++    case 4: return (float)mmu.read8(a) * scale;
++    case 5: return (float)mmu.read16(a) * scale;
++    case 6: return (float)(int8_t)mmu.read8(a) * scale;
++    case 7: return (float)(int16_t)mmu.read16(a) * scale;
++    default: return 0.0;
++    }
++  };
++  const uint32_t elem_size = (ld_type == 0) ? 4 : ((ld_type == 4 || ld_type == 6) ? 1 : 2);
++  const double p0 = load_element(ea);
++  const double p1 = (W == 0) ? load_element(ea + elem_size) : 1.0;
++  fd = p0;
++  pd = p1;
++}
++
++NWII_FORCEINLINE void n1_psq_store_q(CPUContext &ctx, double p0, double p1, uint32_t addr, uint32_t W, uint32_t I) {
++  const uint32_t gqr_val = ctx.gqr[I];
++  const uint32_t st_type = gqr_val & 0x7;
++  const double scale = gqr_pow2(gqr_scale(gqr_val >> 8));
++  MMU &mmu = ctx.mmu;
++  auto store_element = [&](uint32_t a, double val) {
++    switch (st_type) {
++    case 0: mmu.write_f32(a, f32_from(ppc_single_bits_ftz(val))); break;
++    case 4: mmu.write8(a, (uint8_t)ppc_quantize(val, scale, 0, 255)); break;
++    case 5: mmu.write16(a, (uint16_t)ppc_quantize(val, scale, 0, 65535)); break;
++    case 6: mmu.write8(a, (uint8_t)(int8_t)ppc_quantize(val, scale, -128, 127)); break;
++    case 7: mmu.write16(a, (uint16_t)(int16_t)ppc_quantize(val, scale, -32768, 32767)); break;
++    }
++  };
++  const uint32_t elem_size = (st_type == 0) ? 4 : ((st_type == 4 || st_type == 6) ? 1 : 2);
++  store_element(addr, p0);
++  if (W == 0) store_element(addr + elem_size, p1);
++}
++
++template <uint32_t ID>
++NWII_FORCEINLINE void n1_psq_st(CPUContext &ctx, MemView &mv, double p0, double p1, uint32_t ea, uint32_t W, uint32_t I) {
++  if (NWII_LIKELY((ctx.gqr[I] & 0x7u) == 0)) {
++    mv.write_f32<ID>(ea, f32_from(ppc_single_bits_ftz(p0)));
++    if (W == 0) mv.write_f32<ID>(ea + 4, f32_from(ppc_single_bits_ftz(p1)));
++    return;
++  }
++  n1_psq_store_q(ctx, p0, p1, ea, W, I);
++}
++
++// psq_st_io / psq_l_io (listed MMIO sites: the gather pipe): CPUContext::psq_store / psq_load
++NWII_FORCEINLINE void n1_psq_st_io(CPUContext &ctx, double p0, double p1, uint32_t ea, uint32_t W, uint32_t I) {
++  n1_psq_store_q(ctx, p0, p1, ea, W, I);
++}
++
++}  // namespace runtime
++}  // namespace nwii
++
++#define N1_PSQ_L(ID, D, EA, W, I) nwii::runtime::n1_psq_l<ID>(ctx, mv_, f##D, p##D, (EA), (W), (I))
++#define N1_PSQ_ST(ID, S, EA, W, I) nwii::runtime::n1_psq_st<ID>(ctx, mv_, f##S, p##S, (EA), (W), (I))
++#define N1_PSQ_ST_IO(S, EA, W, I) nwii::runtime::n1_psq_st_io(ctx, f##S, p##S, (EA), (W), (I))
+diff --color -ruN r18m/nWiiRuntime/include/runtime/native_n1.h r19n/nWiiRuntime/include/runtime/native_n1.h
+--- r18m/nWiiRuntime/include/runtime/native_n1.h	1969-12-31 19:00:00.000000000 -0500
++++ r19n/nWiiRuntime/include/runtime/native_n1.h	2026-11-09 04:33:07.666289030 -0500
+@@ -0,0 +1,93 @@
++// r19n (front N): exact 1:1 native AArch64/x86 bodies for hot SDK leaf functions of the game thread.
++//
++// tools/apply_n1_hooks.py puts one line at the very top of each listed generated function:
++//     if (ctx.pc == 0xENTRY && nwii::runtime::n1_ENTRY(ctx, &<that function>)) return;  // [n1]
++// n1_ENTRY() returns true when the native body ran: ctx and guest memory are then exactly what the
++// generated code leaves at its blr (every GPR/FPR/PS1/CR/XER/CTR it writes, the volatile ones too,
++// inst_count with the same per-path sum, ctx.pc = ctx.lr, the same bytes stored in the same order, the
++// same interrupt polls). It returns false without touching anything when a precondition does not hold
++// (switch off, memory that is not plain MEM1/MEM2/locked-cache RAM, NWII_WATCH set, a GQR that is not
++// float, a poll that would have to take the slow path...): the generated code then runs as before.
++//
++// Switches (environment / debug.toml):
++//   NWII_NATIVE=0             all native bodies off
++//   NWII_NATIVE_<NAME>=0      one of them off (names: TABLE of tools/apply_n1.py, e.g. NWII_NATIVE_PSMTXCONCAT=0)
++//   NWII_NATIVE_VERIFY=n      the 1st, 2nd, 4th, 8th... and every n-th call of each function: snapshot of the
++//                             registers and of all guest RAM (MEM1/MEM2/LC), native body, its registers and the
++//                             32-byte RAM blocks it changed kept, those blocks put back, generated code, then
++//                             registers and changed blocks compared ("[N1] <name> verify MISMATCH ... first at
++//                             <addresses>"; the generated result is the one kept). Other threads (AX, render) keep
++//                             writing guest RAM meanwhile: a block only one side "changed" far from the function's
++//                             operands is such a writer. Functions that write MMIO / the GX pipe are not verified this
++//                             way (difftest only). PC only: ~88 MB copy + two scans per check.
++//   NWII_NATIVE_STATS=1       counters per function ("[N1] <name> stats" every 2^18 calls, "final" at exit)
++#pragma once
++#include "runtime/cpu_context.h"
++
++namespace nwii {
++namespace runtime {
++
++// One per replaced function (defined in the generated file next to the function, see apply_n1.py).
++struct N1Slot {
++  uint32_t entry;
++  const char *name;                 // NWII_NATIVE_<name>=0 turns it off
++  bool (*nat)(CPUContext &);        // native body: true = ran (ctx/memory = the generated result)
++  void (*gen)(CPUContext &);        // the generated function (for the verify mode)
++  uint32_t flags = 0;               // 1: writes MMIO / the GX gather pipe (cannot be undone: never verified)
++  int32_t mode = 0;                 // 0: not set up yet, 1: native, 2: off, 3: native + counters/verify,
++                                    // 4: off + call counter (NWII_NATIVE_STATS with the function off)
++  uint64_t calls = 0, native = 0, declined = 0, vok = 0, vbad = 0, vskip = 0;
++  N1Slot *next = nullptr;
++};
++bool n1_hook_slow(N1Slot &s, CPUContext &ctx);
++NWII_FORCEINLINE bool n1_hook(N1Slot &s, CPUContext &ctx) {
++  if (NWII_LIKELY(s.mode == 1)) return s.nat(ctx);
++  return n1_hook_slow(s, ctx);
++}
++// Slow interrupt polls taken inside native bodies (the verify mode compares only calls without one).
++extern uint64_t g_n1_slow;
++
++// An interrupt poll of the generated code (poll_due + slow path) whose outcome would only be "nothing":
++// MSR[EE] clear or none of the inline flags set (the slow path is due anyway when poll_left runs out).
++NWII_FORCEINLINE bool n1_no_flags(const CPUContext &c) {
++  return !(c.msr & 0x8000) ||
++         !(c.poll_dec_due | ((hw::pi_intsr.load(std::memory_order_relaxed) & hw::pi_intmr.load(std::memory_order_relaxed)) != 0) |
++           (c.pending_cb_count.load(std::memory_order_relaxed) != 0));
++}
++
++// Interrupt polls of a native loop, one at a time: a poll that the inline part of the generated poll
++// (poll_due) would find quiet (poll_left > 1 and MSR[EE] clear or no flag set) only decrements a local copy
++// of poll_left; the others are done for real (flush(), the state of that poll into ctx, poll_due + slow path).
++// The flags are read again after every real poll (as at most every 16 polls with the wall clock).
++struct N1Poll {
++  CPUContext &c;
++  int32_t start, left;
++  bool quiet;
++  explicit N1Poll(CPUContext &cc) : c(cc), start(cc.poll_left.load(std::memory_order_relaxed)), left(start), quiet(n1_no_flags(cc)) {}
++  NWII_FORCEINLINE bool fast() {
++    if (left > 1 && quiet) { --left; return true; }
++    return false;
++  }
++  // the local count back to ctx, unless another thread kicked poll_left meanwhile (the kick stays). Plain
++  // load + store, no CAS: the same window for a lost kick as the generated poll's load/decrement/store.
++  NWII_FORCEINLINE void flush() {
++    if (left != start) {
++      const int32_t now = c.poll_left.load(std::memory_order_relaxed);
++      if (now == start) c.poll_left.store(left, std::memory_order_relaxed);
++      start = left = (now == start) ? left : now;
++    }
++  }
++  NWII_FORCEINLINE void reload() {
++    start = left = c.poll_left.load(std::memory_order_relaxed);
++    quiet = n1_no_flags(c);
++  }
++};
++
++// Hand-written native bodies (native_n1.cpp).
++bool n1h_801AC440(CPUContext &ctx);  // DCInvalidateRange
++bool n1h_801AC470(CPUContext &ctx);  // DCFlushRange
++bool n1h_80162C30(CPUContext &ctx);  // fLiMgBa_c::searchNodeByID
++// Rounds N2+ (native_n2.cpp, n2h_<addr>): declared by apply_n1.py in the generated file of each function.
++
++}  // namespace runtime
++}  // namespace nwii
+diff --color -ruN r18m/nWiiRuntime/src/core/force_demo.cpp r19n/nWiiRuntime/src/core/force_demo.cpp
+--- r18m/nWiiRuntime/src/core/force_demo.cpp	1969-12-31 19:00:00.000000000 -0500
++++ r19n/nWiiRuntime/src/core/force_demo.cpp	2026-11-09 04:31:52.427259504 -0500
+@@ -0,0 +1,289 @@
++// force_demo.cpp (r21s, frente S): escenas repetibles para medir.
++//
++// Solo depuración, apagado por defecto (sin variables no hace nada: ios.cpp solo mira un bool).
++//   NWII_FORCE_DEMO        = lista ordenada de demos del título, separadas por comas: nombre corto,
++//                            índice (0-14), mundo-nivel ("2-1") o "castillo" (la cinemática del
++//                            título). Una sola = siempre esa. Al acabar la lista vuelve a empezar.
++//   NWII_FORCE_DEMO_REPEAT = N: cada elemento N veces seguidas (1 por defecto).
++//   NWII_FORCE_DEMO_LOOP   = 1: sin los 15 s de la pantalla de título entre una demo y la siguiente.
++//   NWII_DEMO_LOG          = 1: solo las líneas [DEMO] start/end (sin forzar nada); 2: además el
++//                            estado crudo (depuración de esto mismo).
++//   NWII_FORCE_LEVEL       = "1-1", "3-T", "6-C", "5-G": arranca directo en ese nivel (modo normal,
++//                            jugador 1 = Mario) en vez de la pantalla de título. Lleva NWII_NO_SAVE.
++//   NWII_NO_SAVE           = 1: (en hle/devices/fs_device.cpp) la NAND se copia a <nand>_prueba al
++//                            arrancar y el juego escribe ahí; la partida real no se toca.
++// Líneas para cortar estadísticas por escena: "[DEMO] start <id> at <s>" / "[DEMO] end <id> at <s>
++// (<duración> s)", segundos desde el arranque del runtime.
++//
++// Cómo elige el juego (decomp: dScRestartCrsin_c::startTitle, d_s_restart_crsin_static.cpp):
++//   demo = c_stage[m_titleRandomTable[m_titleCount]], tabla de 15 barajada una vez al arrancar
++//   (dScStage_c::setTitleReplayRandomTable desde dScBoot_c::create). En la pantalla de título
++//   (dScStage, modo TITLE) tras 900 frames: si (contador % 4) != 0 -> demo, si no -> MOVIE.
++// Lo único que se cambia es el resultado de esa elección: la entrada de la tabla que se va a
++// leer (y, para la cinemática, el contador que decide demo/MOVIE). El RNG del juego no se toca.
++// Se ejecuta en el hilo de la CPU, en el evento de VI (60/s de tiempo del juego), ver ios.cpp.
++#include "runtime/cpu_context.h"
++#include "runtime/nwii_env.h"
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <strings.h>
++#include <string>
++#include <vector>
++
++namespace nwii::runtime {
++
++bool g_force_demo_on = false;
++
++namespace {
++
++// Direcciones (USA, SMNE01). r13 = 0x8042F680.
++constexpr uint32_t kScene = 0x80428732;       // u16: perfil de la escena actual (5 STAGE, 8 MOVIE...)
++constexpr uint32_t kTable = 0x803741BC;       // u8[15] dScStage_c::m_titleRandomTable
++constexpr uint32_t kTitleCount = 0x8042A1F8;  // int dScStage_c::m_titleCount (r13-21640)
++constexpr uint32_t kMovieCount = 0x8042A1F4;  // int: % 4 == 0 -> MOVIE en vez de demo
++constexpr uint32_t kExeFrame = 0x8042A200;    // u32 frames de la escena STAGE
++constexpr uint32_t kGameMode = 0x8042A204;    // dScStage_c::m_gameMode (2 TITLE, 3 TITLE_REPLAY)
++constexpr uint32_t kSgi = 0x80373D60;         // dScRestartCrsin_c::m_startGameInfo
++constexpr uint32_t kStageAddr = 0x802F49D0;   // c_stage[15][2] (solo informativo)
++constexpr int kMovie = 15;                    // "castillo": la cinemática del título (escena MOVIE)
++constexpr int kSceneStage = 5, kSceneMovie = 8;
++
++struct Demo { const char *id; uint8_t world, stage; const char *what; };
++// Índice = valor de m_titleRandomTable. world/stage en base 0 (como c_stage).
++const Demo kDemos[16] = {
++    {"agua_pinguino", 0, 3, "1-4"},        // submarina, traje de pingüino (bolas de hielo)
++    {"pradera", 0, 5, "1-6"},              // colinas verdes
++    {"desierto4j", 1, 0, "2-1"},           // desierto con pirámide y géiser de arena
++    {"desierto_helices", 1, 3, "2-4"},     // desierto con bloques y trajes hélice
++    {"nieve", 2, 0, "3-1"},                // bosque nevado
++    {"nubes_plataformas", 2, 4, "3-5"},    // cielo de nubes grises, setas rosas que giran
++    {"torre3", 2, 21, "3-T"},              // torre del mundo 3 (piedra)
++    {"playa_hielo", 3, 0, "4-1"},          // playa medio sumergida, enemigos en bloques de hielo
++    {"playa_yoshi", 3, 4, "4-5"},          // playa con Yoshi, Lakitu y setas rosas
++    {"jungla", 4, 3, "5-4"},               // jungla con pantano morado
++    {"cielo_hoja", 4, 4, "5-5"},           // cielo con hoja voladora
++    {"casa_oscura", 4, 20, "5-G"},         // casa fantasma del mundo 5
++    {"castillo6", 5, 23, "6-C"},           // castillo del mundo 6 (lava)
++    {"cielo_paratroopas", 6, 5, "7-6"},    // cielo con Para-Beetles rojos (caparazones voladores)
++    {"lava", 7, 6, "8-7"},                 // cueva de lava
++    {"castillo", 0, 0, "MOVIE"},           // cinemática del título (castillo de Peach, la tarta)
++};
++
++std::vector<int> g_list;  // lista expandida (REPEAT)
++size_t g_pos = 0;
++bool g_force = false, g_loop = false;
++int g_log = 0;
++bool g_table_ready = false;
++int g_active = -1;  // lo que se está viendo ahora (-1 nada)
++double g_active_t = 0;
++uint32_t g_ticks = 0;
++int g_lvl_w = -1, g_lvl_s = -1;  // NWII_FORCE_LEVEL (base 0)
++bool g_lvl_done = false;
++
++double secs() {
++  using clk = std::chrono::steady_clock;
++  static const clk::time_point t0 = clk::now();
++  return std::chrono::duration<double>(clk::now() - t0).count();
++}
++
++const char *name_of(int i) { return (i >= 0 && i <= kMovie) ? kDemos[i].id : "?"; }
++
++int lookup_stage(uint8_t w, uint8_t s) {
++  for (int i = 0; i < kMovie; ++i)
++    if (kDemos[i].world == w && kDemos[i].stage == s) return i;
++  return -1;
++}
++
++int parse_one(std::string t) {
++  while (!t.empty() && (t.front() == ' ' || t.front() == '"')) t.erase(t.begin());
++  while (!t.empty() && (t.back() == ' ' || t.back() == '"')) t.pop_back();
++  if (t.empty()) return -2;
++  for (int i = 0; i <= kMovie; ++i)
++    if (t == kDemos[i].id) return i;
++  if (t == "movie" || t == "pelicula" || t == "cinematica") return kMovie;
++  char *e = nullptr;
++  long v = std::strtol(t.c_str(), &e, 10);
++  if (e && *e == 0 && v >= 0 && v <= kMovie) return (int)v;
++  for (int i = 0; i < kMovie; ++i)  // "2-1", "3-T", "5-G"...
++    if (strcasecmp(kDemos[i].what, t.c_str()) == 0) return i;
++  return -1;
++}
++
++}  // namespace
++
++void force_demo_init() {
++  const char *fd = std::getenv("NWII_FORCE_DEMO");
++  const char *lg = std::getenv("NWII_DEMO_LOG");
++  g_log = lg ? std::atoi(lg) : 0;
++  if (fd && *fd) {
++    int rep = 1;
++    if (const char *r = std::getenv("NWII_FORCE_DEMO_REPEAT")) rep = std::max(1, std::atoi(r));
++    std::string s = fd, tok;
++    std::vector<int> base;
++    for (size_t i = 0; i <= s.size(); ++i) {
++      if (i == s.size() || s[i] == ',') {
++        int v = parse_one(tok);
++        if (v >= 0) base.push_back(v);
++        else if (v == -1) std::printf("[DEMO] NWII_FORCE_DEMO: '%s' no existe (se ignora)\n", tok.c_str());
++        tok.clear();
++      } else {
++        tok += s[i];
++      }
++    }
++    for (int v : base)
++      for (int k = 0; k < rep; ++k) g_list.push_back(v);
++    g_force = !g_list.empty();
++    const char *lp = std::getenv("NWII_FORCE_DEMO_LOOP");
++    g_loop = g_force && lp && lp[0] == '1';
++  }
++  if (const char *lv = std::getenv("NWII_FORCE_LEVEL")) {
++    // "1-1", "8-7", "3-T" (torre), "3-C" (castillo), "5-G" (casa fantasma)
++    int w = 0, n = 0; char k = 0;
++    if (std::sscanf(lv, "%d-%d", &w, &n) == 2 && w >= 1 && w <= 9 && n >= 1 && n <= 19) {
++      g_lvl_w = w - 1; g_lvl_s = n - 1;
++    } else if (std::sscanf(lv, "%d-%c", &w, &k) == 2 && w >= 1 && w <= 9) {
++      k = (char)(k | 0x20);
++      const int st = k == 't' ? 21 : k == 'c' ? 23 : k == 'g' ? 20 : -1;
++      if (st >= 0) { g_lvl_w = w - 1; g_lvl_s = st; }
++    }
++    if (g_lvl_w < 0) std::printf("[DEMO] NWII_FORCE_LEVEL='%s' no se entiende (formato 1-1, 3-T, 3-C, 5-G)\n", lv);
++  }
++  if ((g_force || g_lvl_w >= 0) && g_log == 0) g_log = 1;
++  g_force_demo_on = g_force || g_log > 0 || g_lvl_w >= 0;
++  if (!g_force_demo_on) return;
++  secs();
++  std::string l;
++  for (int v : g_list) { if (!l.empty()) l += ","; l += name_of(v); }
++  if (g_lvl_w >= 0)
++    std::printf("[DEMO] NWII_FORCE_LEVEL: arranque directo al nivel %d-%d (mundo/nivel base 0: %d/%d); "
++                "NAND en copia de prueba (no se escribe la partida)\n", g_lvl_w + 1, g_lvl_s + 1, g_lvl_w, g_lvl_s);
++  std::printf("[DEMO] forzar: %s | lista (%zu): %s | sin título entre demos: %s\n",
++              g_force ? "sí" : "no (solo registro)", g_list.size(), l.empty() ? "-" : l.c_str(),
++              g_loop ? "sí" : "no");
++}
++
++void force_demo_tick(CPUContext &c) {
++  ++g_ticks;
++  MMU &m = c.mmu;
++  const int scene = (int)m.read16(kScene);
++  const uint32_t gmode = m.read32(kGameMode);
++  const uint32_t exef = m.read32(kExeFrame);
++
++  if (g_log >= 2) {
++    static int ls = -9; static uint32_t lgm = 99, lmc = 99, ltc = 99, lsm = 99; static uint8_t lw = 99, ll = 99;
++    const uint32_t mc = m.read32(kMovieCount), tc = m.read32(kTitleCount), sm = m.read32(kSgi + 8);
++    const uint8_t w = m.read8(kSgi + 12), lv = m.read8(kSgi + 13);
++    if (scene != ls || gmode != lgm || mc != lmc || tc != ltc || sm != lsm || w != lw || lv != ll) {
++      char tb[64]; int n = 0;
++      for (int i = 0; i < 15; ++i) n += std::snprintf(tb + n, sizeof tb - n, "%x", m.read8(kTable + i));
++      std::printf("[DEMO] raw t=%.2f tick=%u scene=%d gmode=%u exef=%u moviecnt=%d titlecnt=%d table=%s "
++                  "sgi mode=%u w=%u l=%u replay=%u\n", secs(), g_ticks, scene, gmode, exef, (int)mc,
++                  (int)tc, tb, sm, w, lv, m.read8(kSgi + 7));
++      ls = scene; lgm = gmode; lmc = mc; ltc = tc; lsm = sm; lw = w; ll = lv;
++    }
++  }
++
++  // 1) Qué se ve ahora: demo (STAGE en modo TITLE_REPLAY) o la cinemática (MOVIE).
++  int running = -1;
++  if (scene == kSceneStage && gmode == 3) {
++    // el nivel se lee al empezar y se mantiene (con LOOP la estructura ya apunta a la siguiente)
++    if (g_active >= 0 && g_active != kMovie) running = g_active;
++    else running = lookup_stage(m.read8(kSgi + 12), m.read8(kSgi + 13));
++    if (running < 0) running = 99;
++  } else if (scene == kSceneMovie) {
++    running = kMovie;
++  }
++  if (running != g_active) {
++    const double t = secs();
++    if (g_active >= 0)
++      std::printf("[DEMO] end %s at %.1f (%.1f s)\n", name_of(g_active), t, t - g_active_t);
++    if (running >= 0) {
++      std::printf("[DEMO] start %s at %.1f\n", name_of(running), t);
++      if (g_force) {
++        if (running == g_list[g_pos]) {
++          if (++g_pos == g_list.size()) {
++            g_pos = 0;
++            std::printf("[DEMO] lista completa; vuelve a empezar\n");
++          }
++        } else {
++          std::printf("[DEMO] aviso: se esperaba %s\n", name_of(g_list[g_pos]));
++        }
++      }
++    }
++    std::fflush(stdout);
++    g_active = running;
++    g_active_t = t;
++  }
++  // NWII_FORCE_LEVEL: la primera vez que el arranque pide la pantalla de título (startTitle(0):
++  // mundo 1, STAGE_TITLE=39, modo TITLE) se cambia por un nivel en modo normal, como haría
++  // reStartPeachCastle con otro nivel. Solo una vez; luego el juego sigue su curso normal.
++  if (g_lvl_w >= 0 && !g_lvl_done && m.read32(kSgi + 8) == 2 && m.read8(kSgi + 13) == 39) {
++    m.write8(kSgi + 7, 0);
++    m.write32(kSgi + 8, 0);
++    m.write8(kSgi + 12, (uint8_t)g_lvl_w);
++    m.write8(kSgi + 13, (uint8_t)g_lvl_s);
++    m.write8(kSgi + 14, (uint8_t)g_lvl_w);
++    m.write8(kSgi + 15, (uint8_t)g_lvl_s);
++    g_lvl_done = true;
++    // Jugador 1 = Mario, como deja la selección de archivo para 1 jugador (sin esto el nivel
++    // arranca sin nadie). daPyMng_c: mPlayerEntry[4] 0x80354E50, mPlayerType[4] 0x80354E60,
++    // mRest[4] (por tipo) 0x80354E90.
++    std::printf("[DEMO] antes: entry %u %u %u %u type %u %u %u %u rest %d %d %d %d\n",
++                m.read32(0x80354E50), m.read32(0x80354E54), m.read32(0x80354E58), m.read32(0x80354E5C),
++                m.read32(0x80354E60), m.read32(0x80354E64), m.read32(0x80354E68), m.read32(0x80354E6C),
++                (int)m.read32(0x80354E90), (int)m.read32(0x80354E94), (int)m.read32(0x80354E98),
++                (int)m.read32(0x80354E9C));
++    m.write32(0x80354E50, 1);
++    m.write32(0x80354E60, 0);
++    if ((int32_t)m.read32(0x80354E90) <= 0) m.write32(0x80354E90, 5);
++    std::printf("[DEMO] arranque directo: título -> nivel %d-%d (tick %u, escena %d)\n", g_lvl_w + 1,
++                g_lvl_s + 1, g_ticks, scene);
++  }
++  if (!g_force) return;
++
++  // 2) Forzar la siguiente elección.
++  if (!g_table_ready) {  // no tocar nada hasta que el juego haya barajado la tabla (dScBoot)
++    unsigned seen = 0;
++    for (int i = 0; i < 15; ++i) { uint8_t v = m.read8(kTable + i); if (v < 15) seen |= 1u << v; }
++    if (seen != 0x7FFF) return;
++    g_table_ready = true;
++    if (g_log >= 2) std::printf("[DEMO] tabla barajada vista (tick %u)\n", g_ticks);
++  }
++  const int next = g_list[g_pos];
++  if (next < kMovie) {
++    const uint32_t tc = m.read32(kTitleCount);
++    if (tc < 15 && m.read8(kTable + tc) != next) m.write8(kTable + tc, (uint8_t)next);
++  }
++  // Demo o cinemática: la pantalla de título decide con (contador % 4); se ajusta solo mientras
++  // se está en ella (modo TITLE), antes de los 900 frames.
++  if (scene == kSceneStage && gmode == 2) {
++    const int32_t mc = (int32_t)m.read32(kMovieCount);
++    const bool movie = (mc % 4) == 0;
++    if (movie != (next == kMovie)) {
++      const int32_t nv = (next == kMovie) ? (mc - (mc % 4)) : (mc - (mc % 4) + 1);
++      m.write32(kMovieCount, (uint32_t)nv);
++      if (g_log >= 2) std::printf("[DEMO] contador demo/MOVIE %d -> %d\n", mc, nv);
++    }
++  }
++  // 3) LOOP: al acabar una demo por tiempo (modo TITLE_REPLAY, más de 2400 frames) el juego llama a
++  // startTitle(0) -> pantalla de título. Se cambia lo que esa llamada escribió por lo que habría
++  // escrito startTitle(1) con la siguiente demo (las dos ramas solo difieren en estos campos; el
++  // fundido y el cambio de escena son los mismos). Salir de la demo con un botón no se toca.
++  if (g_loop && next < kMovie && scene == kSceneStage && gmode == 3 && exef > 2400 &&
++      m.read32(kSgi + 8) == 2) {
++    m.write8(kSgi + 7, 1);
++    m.write32(kSgi + 8, 3);
++    m.write8(kSgi + 12, kDemos[next].world);
++    m.write8(kSgi + 13, kDemos[next].stage);
++    m.write8(kSgi + 14, kDemos[next].world);
++    m.write8(kSgi + 15, kDemos[next].stage);
++    static uint32_t n = 0;
++    if (g_log >= 2 || n++ < 1) std::printf("[DEMO] sin título: fin de demo -> %s (tick %u)\n", name_of(next), g_ticks);
++  }
++  (void)kStageAddr;
++}
++
++}  // namespace nwii::runtime
+diff --color -ruN r18m/nWiiRuntime/src/hle/devices/fs_device.cpp r19n/nWiiRuntime/src/hle/devices/fs_device.cpp
+--- r18m/nWiiRuntime/src/hle/devices/fs_device.cpp	2026-10-31 06:08:13.576820553 -0500
++++ r19n/nWiiRuntime/src/hle/devices/fs_device.cpp	2026-11-09 04:31:52.427408066 -0500
+@@ -2,6 +2,7 @@
+ // Dolphin's IOS::HLE::FS semantics: the NAND tree lives at <nand_dir>/<path>,
+ // files persist across runs, /tmp is wiped at boot, and every FS ioctl the
+ // SDK's ISFS/NAND libraries use is served (unknown ones are logged).
++#include <cstdlib>
+ #include "runtime/devices.h"
+ #include "runtime/config.h"
+ #include <algorithm>
+@@ -399,6 +400,50 @@
+         const Config& cfg = Config::get();
+         m_root = cfg.nand_dir;
+         std::error_code ec;
++        // r21s: NWII_NO_SAVE=1 (y siempre con NWII_FORCE_LEVEL): ninguna escritura llega a la partida
++        // de verdad. Al arrancar, la NAND real (save/) se copia a <nand_dir>_prueba (rehecha en cada
++        // arranque) y el juego lee y escribe ahí: cree que guardó bien, y la real no se toca.
++        {
++            const char* ns = std::getenv("NWII_NO_SAVE");
++            const char* fl = std::getenv("NWII_FORCE_LEVEL");
++            if ((ns && ns[0] && ns[0] != '0') || (fl && fl[0])) {
++                fs::path real = m_root, copy = m_root;
++                while (!copy.empty() && !copy.has_filename()) copy = copy.parent_path();
++                copy += "_prueba";
++                fs::remove_all(copy, ec);
++                ec.clear();
++                fs::create_directories(copy, ec);
++                // copia a mano (directorios + archivos por flujo): sirve igual en la SD de la Switch
++                size_t nfiles = 0, nerr = 0;
++                if (fs::is_directory(real, ec)) {
++                    std::string base = real.string();
++                    while (base.size() > 1 && base.back() == '/') base.pop_back();
++                    for (fs::recursive_directory_iterator it(real, ec), end; !ec && it != end; it.increment(ec)) {
++                        // ruta relativa por prefijo (sin fs::relative: en la SD de la Switch no hay realpath)
++                        std::string ps = it->path().string();
++                        if (ps.compare(0, base.size(), base) != 0) { ++nerr; continue; }
++                        ps.erase(0, base.size());
++                        while (!ps.empty() && ps.front() == '/') ps.erase(ps.begin());
++                        if (ps.empty()) continue;
++                        const fs::path rel = ps;
++                        std::error_code e2;
++                        if (it->is_directory(e2)) {
++                            fs::create_directories(copy / rel, e2);
++                        } else {
++                            std::ifstream in(it->path(), std::ios::binary);
++                            std::ofstream out(copy / rel, std::ios::binary | std::ios::trunc);
++                            if (fs::file_size(it->path(), e2) > 0) out << in.rdbuf();
++                            if (in.bad() || !out) ++nerr; else ++nfiles;
++                        }
++                    }
++                }
++                std::cout << "[FS] NWII_NO_SAVE: la partida no se escribe; NAND de prueba " << copy.string()
++                          << " (copia de " << real.string() << ": " << nfiles << " archivos, " << nerr
++                          << " errores)\n";
++                m_root = copy;
++                ec.clear();
++            }
++        }
+         fs::create_directories(m_root, ec);
+ 
+         // IOS wipes /tmp at boot.
+diff --color -ruN r18m/nWiiRuntime/src/hle/ios.cpp r19n/nWiiRuntime/src/hle/ios.cpp
+--- r18m/nWiiRuntime/src/hle/ios.cpp	2026-11-08 22:15:27.087921256 -0500
++++ r19n/nWiiRuntime/src/hle/ios.cpp	2026-11-09 04:31:52.427931630 -0500
+@@ -872,6 +872,10 @@
+ // tick, timebase read + scheduler advance, decrementer check) and enters
+ // ppc_tail at the same point, so behaviour is unchanged.
+ static bool g_vi_registered = false;
++// r21s: core/force_demo.cpp (aquí ya estamos dentro de nwii::runtime)
++extern bool g_force_demo_on;
++void force_demo_init();
++void force_demo_tick(CPUContext &c);
+ static bool g_hb_due = false;  // R9 guestloop: ppc_full prints the [Heartbeat] block
+ namespace hw { extern int g_di_interrupt_delay; }
+ static bool ppc_tail(CPUContext &ctx, bool dec_exp);
+@@ -1134,12 +1138,14 @@
+   {
+       if (!g_vi_registered) {
+           g_vi_registered = true;
++          nwii::runtime::force_demo_init();  // r21s: NWII_FORCE_DEMO (solo si está puesto)
+ 
+           
+           uint64_t vi_period = ctx.tb_freq / 60;
+           if (vi_period == 0) vi_period = 500000;
+           nwii::runtime::EventScheduler::get().schedule_recurring(
+               vi_period, [](CPUContext& c, uint64_t) {
++                  if (__builtin_expect(nwii::runtime::g_force_demo_on, 0)) nwii::runtime::force_demo_tick(c);
+ 
+                   
+                   
+diff --color -ruN r18m/nWiiRuntime/src/hle/native_n1.cpp r19n/nWiiRuntime/src/hle/native_n1.cpp
+--- r18m/nWiiRuntime/src/hle/native_n1.cpp	1969-12-31 19:00:00.000000000 -0500
++++ r19n/nWiiRuntime/src/hle/native_n1.cpp	2026-11-09 05:00:14.705466962 -0500
+@@ -0,0 +1,487 @@
++// r19n (front N): runtime side of the native SDK leaf bodies (include/runtime/native_n1.h).
++//  - n1_hook_slow(): first call of each slot (reads the switches), the counters and the verify mode.
++//  - hand-written bodies: DCInvalidateRange / DCFlushRange (closed form + batched interrupt polls).
++#include "runtime/native_n1.h"
++
++#include <algorithm>
++#include <bit>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++#include <unordered_map>
++#include <chrono>
++#ifdef __SWITCH__
++#include <switch.h>
++#endif
++
++namespace nwii {
++namespace runtime {
++
++uint64_t g_n1_slow = 0;
++
++void n1_report_all();  // counters of every slot set up so far (also called by difftest)
++
++namespace {
++
++struct N1Cfg {
++  bool all_on = true;
++  unsigned long verify_every = 0;
++  bool stats = false;
++  bool timing = false;  // NWII_NATIVE_TIME=1: time every call (native, or the generated code when off)
++};
++const N1Cfg &n1_cfg() {
++  static const N1Cfg c = [] {
++    N1Cfg r;
++    const char *e = NWII_ENV("NWII_NATIVE");
++    r.all_on = !(e && e[0] == '0');
++    e = NWII_ENV("NWII_NATIVE_VERIFY");
++    r.verify_every = e ? std::strtoul(e, nullptr, 10) : 0;
++    e = NWII_ENV("NWII_NATIVE_STATS");
++    r.stats = (e && e[0] == '1') || r.verify_every != 0;
++    e = NWII_ENV("NWII_NATIVE_TIME");
++    r.timing = e && e[0] == '1';
++    if (r.timing) r.stats = true;
++    if (r.stats) std::atexit(n1_report_all);
++    std::printf("[N1] native SDK leaf bodies %s%s (r9/r19n)\n", r.all_on ? "on" : "OFF (NWII_NATIVE=0)",
++                r.verify_every ? ", verify mode" : "");
++    std::fflush(stdout);
++    return r;
++  }();
++  return c;
++}
++
++N1Slot *g_slots = nullptr;
++// verify / timing: the next hook of this slot (the generated function about to be called from here) must let
++// the generated code run. One-shot and per slot: the generated code may never come back here (an interrupt
++// delivered inside it can switch guest threads), and a sticky global flag would then disable every hook.
++const N1Slot *g_bypass_slot = nullptr;
++
++// NWII_NATIVE_TIME: time per slot (host ticks; Switch: the 19.2 MHz system counter, PC: steady_clock ns)
++struct N1Time { uint64_t ticks = 0, n = 0; };
++std::unordered_map<const N1Slot *, N1Time> g_ticks;
++NWII_FORCEINLINE uint64_t now_ticks() {
++#ifdef __SWITCH__
++  return armGetSystemTick();
++#else
++  return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++#endif
++}
++NWII_FORCEINLINE double ticks_to_ns(uint64_t t) {
++#ifdef __SWITCH__
++  return (double)t * 1e9 / 19200000.0;
++#else
++  return (double)t;
++#endif
++}
++
++void report(const N1Slot &s, const char *why) {
++  auto it = g_ticks.find(&s);
++  if (it != g_ticks.end()) {
++    const uint64_t n = it->second.n;
++    std::printf("[N1] %s time %s: %llu calls, %.1f ns/call (%s)\n", s.name, why, (unsigned long long)n,
++                n ? ticks_to_ns(it->second.ticks) / (double)n : 0.0, s.mode == 4 ? "generated code" : "native");
++  }
++  std::printf("[N1] %s %s: calls=%llu native=%llu declined=%llu verify ok=%llu bad=%llu skip=%llu\n", s.name, why,
++              (unsigned long long)s.calls, (unsigned long long)s.native, (unsigned long long)s.declined,
++              (unsigned long long)s.vok, (unsigned long long)s.vbad, (unsigned long long)s.vskip);
++  std::fflush(stdout);
++}
++
++// ---- verify mode ----------------------------------------------------------------------------------
++struct N1Regs {
++  uint32_t gpr[32];
++  uint64_t fpr[32], ps1[32];
++  uint8_t cr[8][4];
++  uint32_t pc, lr, ctr, xer, msr, fpscr, srr0, srr1, gqr[8], sprg[4], hid2, dma_u, dma_l, resv;
++  uint64_t inst_count;
++  int32_t poll_left;
++  uint8_t poll_dec_due;
++};
++N1Regs take_regs(const CPUContext &c) {
++  N1Regs r;
++  std::memset(&r, 0, sizeof r);
++  for (int i = 0; i < 32; ++i) {
++    r.gpr[i] = c.gpr[i];
++    std::memcpy(&r.fpr[i], &c.fpr[i], 8);
++    std::memcpy(&r.ps1[i], &c.ps1[i], 8);
++  }
++  for (int i = 0; i < 8; ++i) {
++    r.cr[i][0] = c.cr[i].lt; r.cr[i][1] = c.cr[i].gt; r.cr[i][2] = c.cr[i].eq; r.cr[i][3] = c.cr[i].so;
++    r.gqr[i] = c.gqr[i];
++  }
++  for (int i = 0; i < 4; ++i) r.sprg[i] = c.sprg[i];
++  r.pc = c.pc; r.lr = c.lr; r.ctr = c.ctr; r.xer = c.xer; r.msr = c.msr; r.fpscr = c.fpscr;
++  r.srr0 = c.srr0; r.srr1 = c.srr1; r.hid2 = c.hid2; r.dma_u = c.dma_u; r.dma_l = c.dma_l;
++  r.resv = c.reservation_addr;
++  r.inst_count = c.inst_count;
++  r.poll_left = c.poll_left.load(std::memory_order_relaxed);
++  r.poll_dec_due = c.poll_dec_due;
++  return r;
++}
++void put_regs(CPUContext &c, const N1Regs &r) {
++  for (int i = 0; i < 32; ++i) {
++    c.gpr[i] = r.gpr[i];
++    std::memcpy(&c.fpr[i], &r.fpr[i], 8);
++    std::memcpy(&c.ps1[i], &r.ps1[i], 8);
++  }
++  for (int i = 0; i < 8; ++i) {
++    c.cr[i].lt = r.cr[i][0]; c.cr[i].gt = r.cr[i][1]; c.cr[i].eq = r.cr[i][2]; c.cr[i].so = r.cr[i][3];
++    c.gqr[i] = r.gqr[i];
++  }
++  for (int i = 0; i < 4; ++i) c.sprg[i] = r.sprg[i];
++  c.pc = r.pc; c.lr = r.lr; c.ctr = r.ctr; c.xer = r.xer; c.msr = r.msr; c.fpscr = r.fpscr;
++  c.srr0 = r.srr0; c.srr1 = r.srr1; c.hid2 = r.hid2; c.dma_u = r.dma_u; c.dma_l = r.dma_l;
++  c.reservation_addr = r.resv;
++  c.inst_count = r.inst_count;
++  c.poll_left.store(r.poll_left, std::memory_order_relaxed);
++  c.poll_dec_due = r.poll_dec_due;
++}
++
++[[maybe_unused]] uint64_t hash_block(const MemBlock &m) {
++  const uint8_t *p = m.data();
++  const size_t n = m.size() & ~(size_t)15;
++  uint64_t h = 0xCBF29CE484222325ull, h2 = 0x84222325CBF29CE4ull;
++  for (size_t i = 0; i < n; i += 16) {
++    uint64_t a, b;
++    std::memcpy(&a, p + i, 8);
++    std::memcpy(&b, p + i + 8, 8);
++    h = (h ^ a) * 0x100000001B3ull;
++    h2 = (h2 ^ b) * 0xFF51AFD7ED558CCDull;
++  }
++  return h ^ (h2 * 31);
++}
++
++struct N1Snap {
++  std::vector<uint8_t> m1, m2, lc;
++  void save(MMU &m) {
++    m1.assign(m.mem1.data(), m.mem1.data() + m.mem1.size());
++    m2.assign(m.mem2.data(), m.mem2.data() + m.mem2.size());
++    lc.assign(m.lc.data(), m.lc.data() + m.lc.size());
++  }
++  void restore(MMU &m) const {
++    std::memcpy(m.mem1.data(), m1.data(), m1.size());
++    std::memcpy(m.mem2.data(), m2.data(), m2.size());
++    std::memcpy(m.lc.data(), lc.data(), lc.size());
++  }
++};
++
++void diff_regs(const N1Slot &s, const N1Regs &g, const N1Regs &n) {
++  for (int i = 0; i < 32; ++i)
++    if (g.gpr[i] != n.gpr[i]) std::printf("[N1] %s verify r%d gen=0x%08x native=0x%08x\n", s.name, i, g.gpr[i], n.gpr[i]);
++  for (int i = 0; i < 32; ++i) {
++    if (g.fpr[i] != n.fpr[i])
++      std::printf("[N1] %s verify f%d gen=0x%016llx native=0x%016llx\n", s.name, i, (unsigned long long)g.fpr[i], (unsigned long long)n.fpr[i]);
++    if (g.ps1[i] != n.ps1[i])
++      std::printf("[N1] %s verify ps1_%d gen=0x%016llx native=0x%016llx\n", s.name, i, (unsigned long long)g.ps1[i], (unsigned long long)n.ps1[i]);
++  }
++  if (std::memcmp(g.cr, n.cr, sizeof g.cr)) std::printf("[N1] %s verify CR differs\n", s.name);
++  if (g.pc != n.pc || g.lr != n.lr || g.ctr != n.ctr || g.xer != n.xer || g.inst_count != n.inst_count ||
++      g.poll_left != n.poll_left)
++    std::printf("[N1] %s verify pc/lr/ctr/xer/inst/poll_left gen=%x/%x/%x/%x/%llu/%d native=%x/%x/%x/%x/%llu/%d\n", s.name,
++                g.pc, g.lr, g.ctr, g.xer, (unsigned long long)g.inst_count, g.poll_left, n.pc, n.lr, n.ctr, n.xer,
++                (unsigned long long)n.inst_count, n.poll_left);
++}
++
++// 32-byte blocks of guest RAM that differ from the snapshot: (block index over MEM1|MEM2|LC, contents).
++struct N1Blk { uint32_t idx; uint8_t b[32]; };
++void changed_blocks(MMU &m, const N1Snap &sn, std::vector<N1Blk> &out) {
++  out.clear();
++  uint32_t base = 0;
++  auto scan = [&](const MemBlock &mb, const std::vector<uint8_t> &sv) {
++    const size_t n = mb.size() & ~(size_t)31;
++    for (size_t o = 0; o < n; o += 4096) {
++      const size_t len = std::min<size_t>(4096, n - o);
++      if (std::memcmp(mb.data() + o, sv.data() + o, len) == 0) continue;
++      for (size_t k = o; k < o + len; k += 32)
++        if (std::memcmp(mb.data() + k, sv.data() + k, 32) != 0) {
++          N1Blk x;
++          x.idx = base + (uint32_t)(k / 32);
++          std::memcpy(x.b, mb.data() + k, 32);
++          out.push_back(x);
++        }
++    }
++    base += (uint32_t)((mb.size() + 31) / 32);
++  };
++  scan(m.mem1, sn.m1);
++  scan(m.mem2, sn.m2);
++  scan(m.lc, sn.lc);
++}
++uint8_t *block_ptr(MMU &m, const N1Snap &sn, uint32_t idx, const uint8_t **snapp, uint32_t *ea) {
++  const uint32_t n1 = (uint32_t)((m.mem1.size() + 31) / 32), n2 = (uint32_t)((m.mem2.size() + 31) / 32);
++  if (idx < n1) { *snapp = sn.m1.data() + idx * 32; *ea = 0x80000000u + idx * 32; return m.mem1.data() + idx * 32; }
++  idx -= n1;
++  if (idx < n2) { *snapp = sn.m2.data() + idx * 32; *ea = 0x90000000u + idx * 32; return m.mem2.data() + idx * 32; }
++  idx -= n2;
++  *snapp = sn.lc.data() + idx * 32; *ea = MMU::kLCBase + idx * 32;
++  return m.lc.data() + idx * 32;
++}
++
++// Native body on the current state, then the same state again through the generated code; the
++// generated result is kept. Only calls whose native run took no slow interrupt poll are compared
++// (a slow poll may run scheduler events, which cannot be undone): the others keep the native result.
++// Memory: the 32-byte blocks the native run changed (against a snapshot taken just before) are put back
++// from the snapshot (only those: other threads -- AX, render -- keep writing guest RAM meanwhile), the
++// generated code runs, and then every block that differs from the snapshot is compared: a block written
++// by both must hold the same bytes; a block written by only one side is a mismatch unless it is outside
++// what the function could write (reported with its address, so concurrent writers are recognisable).
++bool verify(N1Slot &s, CPUContext &ctx) {
++  static N1Snap snap;
++  static std::vector<N1Blk> bn, bg;
++  MMU &m = ctx.mmu;
++  const N1Regs r0 = take_regs(ctx);
++  snap.save(m);
++  const uint64_t slow0 = g_n1_slow;
++  if (!s.nat(ctx)) {
++    ++s.declined;
++    return false;  // untouched: the generated code runs
++  }
++  if (g_n1_slow != slow0) {
++    ++s.vskip;
++    return true;
++  }
++  const N1Regs rn = take_regs(ctx);
++  changed_blocks(m, snap, bn);
++  for (const N1Blk &x : bn) {
++    const uint8_t *sp = nullptr;
++    uint32_t ea = 0;
++    uint8_t *dst = block_ptr(m, snap, x.idx, &sp, &ea);  // first: it sets sp
++    std::memcpy(dst, sp, 32);
++  }
++  put_regs(ctx, r0);
++  g_bypass_slot = &s;
++  ctx.pc = s.entry;
++  s.gen(ctx);
++  g_bypass_slot = nullptr;
++  const N1Regs rg = take_regs(ctx);
++  changed_blocks(m, snap, bg);
++  const bool regs_ok = std::memcmp(&rg, &rn, sizeof rg) == 0;
++  // merge the two sorted lists
++  uint32_t bad_blocks = 0, only_n = 0, only_g = 0;
++  uint32_t first_ea[4] = {0, 0, 0, 0};
++  int nfirst = 0;
++  size_t i = 0, j = 0;
++  while (i < bn.size() || j < bg.size()) {
++    uint32_t idx;
++    bool differ;
++    if (j >= bg.size() || (i < bn.size() && bn[i].idx < bg[j].idx)) { idx = bn[i].idx; differ = true; ++only_n; ++i; }
++    else if (i >= bn.size() || bg[j].idx < bn[i].idx) { idx = bg[j].idx; differ = true; ++only_g; ++j; }
++    else { idx = bn[i].idx; differ = std::memcmp(bn[i].b, bg[j].b, 32) != 0; ++i; ++j; }
++    if (differ) {
++      ++bad_blocks;
++      const uint8_t *sp; uint32_t ea;
++      block_ptr(m, snap, idx, &sp, &ea);
++      if (nfirst < 4) first_ea[nfirst++] = ea;
++    }
++  }
++  if (regs_ok && bad_blocks == 0) {
++    ++s.vok;
++  } else {
++    ++s.vbad;
++    if (s.vbad <= 20) {
++      std::printf("[N1] %s verify MISMATCH (call %llu, r1=%08x r3=%08x r4=%08x r5=%08x): regs %s, %u RAM blocks differ "
++                  "(native-only %u, generated-only %u; native wrote %zu, generated %zu) first at %08x %08x %08x %08x\n",
++                  s.name, (unsigned long long)s.calls, r0.gpr[1], r0.gpr[3], r0.gpr[4], r0.gpr[5], regs_ok ? "same" : "DIFFER",
++                  bad_blocks, only_n, only_g, bn.size(), bg.size(), first_ea[0], first_ea[1], first_ea[2], first_ea[3]);
++      diff_regs(s, rg, rn);
++    }
++  }
++  const uint64_t n = s.vok + s.vbad;
++  if (n == 1 || (n & (n - 1)) == 0 || !(regs_ok && bad_blocks == 0)) report(s, "verify");
++  return true;
++}
++
++}  // namespace
++
++void n1_report_all() {
++  uint64_t ok = 0, bad = 0;
++  for (N1Slot *s = g_slots; s; s = s->next) {
++    if (s->mode == 3 || s->mode == 4) report(*s, s->mode == 4 ? "final (off)" : "final");
++    ok += s->vok;
++    bad += s->vbad;
++  }
++  std::printf("[N1] verify total ok=%llu bad=%llu\n", (unsigned long long)ok, (unsigned long long)bad);
++  std::fflush(stdout);
++}
++
++NWII_NOINLINE bool n1_hook_slow(N1Slot &s, CPUContext &ctx) {
++  if (s.mode == 0) {
++    const N1Cfg &c = n1_cfg();
++    char key[96];
++    std::snprintf(key, sizeof key, "NWII_NATIVE_%s", s.name);
++    const char *e = std::getenv(key);
++    const bool on = c.all_on && !(e && e[0] == '0') && !g_trace_calls;
++    s.mode = !on ? (c.stats ? 4 : 2) : (c.stats || c.verify_every) ? 3 : 1;
++    s.next = g_slots;
++    g_slots = &s;
++    std::printf("[N1] %s (0x%08X): %s\n", s.name, s.entry,
++                s.mode == 2 ? "off (generated code)" : s.mode == 4 ? "off (generated code), counted" :
++                s.mode == 3 ? "native, counters/verify" : "native");
++    std::fflush(stdout);
++  }
++  if (s.mode == 1) return s.nat(ctx);
++  if (g_bypass_slot == &s) { g_bypass_slot = nullptr; return false; }
++  if (s.mode == 2) return false;
++  ++s.calls;
++  const N1Cfg &c = n1_cfg();
++  if (s.mode == 4) {
++    if ((s.calls & 0x3FFFF) == 0) report(s, "stats (off)");
++    if (!c.timing) return false;
++    // time the generated code: run it here (its own hook is bypassed) instead of in the caller; same code,
++    // same state, one call level deeper
++    const uint64_t t0 = now_ticks();
++    g_bypass_slot = &s;
++    s.gen(ctx);
++    g_bypass_slot = nullptr;
++    N1Time &t = g_ticks[&s];
++    t.ticks += now_ticks() - t0;
++    ++t.n;
++    return true;
++  }
++  // verify the 1st, 2nd, 4th, 8th... call of each function (rare ones too) and then every n-th
++  if (c.verify_every && !(s.flags & 1) && ((s.calls & (s.calls - 1)) == 0 || s.calls % c.verify_every == 0))
++    return verify(s, ctx);
++  bool r;
++  if (c.timing) {
++    const uint64_t t0 = now_ticks();
++    r = s.nat(ctx);
++    if (r) { N1Time &t = g_ticks[&s]; t.ticks += now_ticks() - t0; ++t.n; }
++  } else {
++    r = s.nat(ctx);
++  }
++  if (r) ++s.native; else ++s.declined;
++  if ((s.calls & 0x3FFFF) == 0) report(s, "stats");
++  return r;
++}
++
++// ---- hand-written bodies -------------------------------------------------------------------------
++namespace {
++// Runs the interrupt polls 1..total of a loop exactly as the generated code would: a poll whose inline
++// part (poll_due) says "nothing to do" only decrements poll_left, so runs of them are done at once; a poll
++// that would take the slow path is done for real, with ctx in the state of that poll (set(j)). Returns
++// true when a poll delivered an interrupt (ctx is then at that poll; the generated code resumes there).
++template <class Set>
++NWII_FORCEINLINE bool n1_polls(CPUContext &c, uint64_t total, Set &&set) {
++  uint64_t j = 0;
++  while (j < total) {
++    const int32_t left = c.poll_left.load(std::memory_order_relaxed);
++    if (left > 1 && n1_no_flags(c)) {
++      const uint64_t k = std::min<uint64_t>(total - j, (uint64_t)(left - 1));
++      c.poll_left.store(left - (int32_t)k, std::memory_order_relaxed);
++      j += k;
++      continue;
++    }
++    ++j;
++    set(j);
++    if (poll_due(c)) {
++      ++g_n1_slow;
++      if (process_pending_callbacks_slow(c)) return true;
++    }
++  }
++  return false;
++}
++
++// DCInvalidateRange / DCFlushRange / (the other DC* have the same shape): r3 = address, r4 = length.
++//   cmplwi r4,0 ; blelr ; rlwinm r5,r3,0,27,31 ; add r4,r4,r5 ; addi r4,r4,31 ; rlwinm r4,r4,27,5,31 ;
++//   mtctr r4 ; loop: dcbX 0,r3 ; addi r3,r3,32 ; bdnz loop (poll at POLL) ; [sc (poll)] ; blr
++// The cache operation is a no-op here (no data cache model), so the whole function is its registers.
++template <uint32_t POLL, uint32_t SC>
++NWII_FORCEINLINE bool n1_dc_range(CPUContext &c) {
++  const uint32_t len = c.gpr[4], r3 = c.gpr[3], r5 = r3 & 0x1F;
++  const uint32_t n = std::rotl(len + r5 + 31u, 27) & 0x7FFFFFFu;
++  // n == 0 with len != 0 would loop 2^32 times (ctr wraps): left to the generated code (nothing touched).
++  if (len != 0 && n == 0) return false;
++  c.inst_count += 2;
++  c.cr[0].lt = false;
++  c.cr[0].gt = len > 0;
++  c.cr[0].eq = len == 0;
++  c.cr[0].so = (c.xer >> 31) & 1;
++  if (len == 0) {
++    c.pc = c.lr;
++    return true;
++  }
++  c.inst_count += 5;
++  c.gpr[5] = r5;
++  c.gpr[4] = n;
++  const uint64_t ic0 = c.inst_count;
++  // poll j (1..n): r3 = r3 + 32 j, inst_count = ic0 + 3 j, ctr = n - j + 1 (decremented after the poll)
++  const bool irq = n1_polls(c, n, [&](uint64_t j) {
++    c.gpr[3] = r3 + 32u * (uint32_t)j;
++    c.inst_count = ic0 + 3 * j;
++    c.ctr = n - (uint32_t)j + 1;
++    c.pc = POLL;
++  });
++  if (irq) return true;
++  c.gpr[3] = r3 + 32u * n;
++  c.ctr = 0;
++  c.inst_count = ic0 + 3ull * n;
++  if (SC) {  // sc: one more poll at SC, then blr
++    c.inst_count += 1;
++    c.pc = SC;
++    if (poll_due(c)) {
++      ++g_n1_slow;
++      if (process_pending_callbacks_slow(c)) return true;
++    }
++  }
++  c.inst_count += 1;
++  c.pc = c.lr;
++  return true;
++}
++}  // namespace
++
++// fLiMgBa_c::searchNodeByID (f_line.cpp, 80162C30): r3 = list, r4 = id; walks node = list->first,
++// node = node->next until node->obj->id == id (returns node) or node == 0 (returns 0).
++//   lwz r3,0(r3) ; b test ; loop: lwz r5,8(r3) ; lwz r0,0(r5) ; cmpw r0,r4 ; beqlr ; lwz r3,4(r3) ;
++//   test: cmpwi r3,0 ; bne loop (poll 0x80162C50) ; li r3,0 ; blr
++// Guest memory through the same MemView accessors as the generated code.
++bool n1h_80162C30(CPUContext &c) {
++  MemView mv(c.mmu);
++  uint32_t r0 = c.gpr[0], r3 = c.gpr[3], r4 = c.gpr[4], r5 = c.gpr[5], xer = c.xer;
++  bool lt = c.cr[0].lt, gt = c.cr[0].gt, eq = c.cr[0].eq, so = c.cr[0].so;
++  uint64_t ic = c.inst_count;
++  N1Poll P(c);
++  ic += 2;
++  r3 = mv.read32<0>(r3 + 0);
++  for (;;) {
++    ic += 2;
++    lt = (int32_t)r3 < 0; gt = (int32_t)r3 > 0; eq = r3 == 0; so = (xer >> 31) & 1;
++    if (!P.fast()) {
++      P.flush();
++      c.pc = 0x80162C50u;
++      if (poll_due(c)) {
++        c.cr[0].eq = eq; c.cr[0].gt = gt; c.cr[0].lt = lt; c.cr[0].so = so;
++        c.gpr[0] = r0; c.gpr[3] = r3; c.gpr[5] = r5; c.inst_count = ic;
++        ++g_n1_slow;
++        if (process_pending_callbacks_slow(c)) return true;
++        eq = c.cr[0].eq; gt = c.cr[0].gt; lt = c.cr[0].lt; so = c.cr[0].so;
++        r0 = c.gpr[0]; r3 = c.gpr[3]; r4 = c.gpr[4]; r5 = c.gpr[5]; ic = c.inst_count; xer = c.xer;
++      }
++      P.reload();
++    }
++    if (eq) break;
++    ic += 4;
++    r5 = mv.read32<0>(r3 + 8);
++    r0 = mv.read32<0>(r5 + 0);
++    lt = (int32_t)r0 < (int32_t)r4; gt = (int32_t)r0 > (int32_t)r4; eq = r0 == r4; so = (xer >> 31) & 1;
++    if (eq) {
++      P.flush();
++      c.cr[0].eq = eq; c.cr[0].gt = gt; c.cr[0].lt = lt; c.cr[0].so = so;
++      c.gpr[0] = r0; c.gpr[3] = r3; c.gpr[5] = r5; c.inst_count = ic; c.pc = c.lr;
++      return true;
++    }
++    ic += 1;
++    r3 = mv.read32<0>(r3 + 4);
++  }
++  P.flush();
++  ic += 2;
++  r3 = 0;
++  c.cr[0].eq = eq; c.cr[0].gt = gt; c.cr[0].lt = lt; c.cr[0].so = so;
++  c.gpr[0] = r0; c.gpr[3] = r3; c.gpr[5] = r5; c.inst_count = ic; c.pc = c.lr;
++  return true;
++}
++
++bool n1h_801AC440(CPUContext &ctx) { return n1_dc_range<0x801AC464u, 0>(ctx); }
++bool n1h_801AC470(CPUContext &ctx) { return n1_dc_range<0x801AC494u, 0x801AC49Cu>(ctx); }
++
++}  // namespace runtime
++}  // namespace nwii
+diff --color -ruN r18m/nWiiRuntime/src/hle/native_n2.cpp r19n/nWiiRuntime/src/hle/native_n2.cpp
+--- r18m/nWiiRuntime/src/hle/native_n2.cpp	1969-12-31 19:00:00.000000000 -0500
++++ r19n/nWiiRuntime/src/hle/native_n2.cpp	2026-11-09 03:27:16.170444770 -0500
+@@ -0,0 +1,1095 @@
++// r19n round N2: hand-written native bodies that do the work in single precision on host pointers
++// instead of emulating every paired-single instruction in double through ctx.
++//
++// Why it is exact (same bits as the generated code, cpu_context.h semantics):
++//  * every operand of these functions is a single: loaded by psq_l (float GQR type: float -> double is exact)
++//    or the result of a single-precision op (ppc_single). For singles, ppc_force25(c) == c (the low 29 mantissa
++//    bits are already 0), the product a*c is exact in double, so ppc_single(a * force25(c)) == a * c in float;
++//  * ppc_single(ppc_madd_s(a, c, b)) is Dolphin's "round once" fused multiply-add: the double FMA plus the
++//    exact-tie correction gives round-to-single of the exact a*c+b for every result in the normal single
++//    range; a single-precision std::fma (one rounding) gives the same. They can differ only when the result
++//    is a single subnormal (double rounding at the subnormal position), so every computed value with
++//    0 < |r| < 2^-125 makes the body give up before writing anything (the generated code runs);
++//  * psq_st of a float stores the single's bits (ConvertToSingleFTZ: only subnormals change, and those are
++//    excluded above); NaN inputs are left to the generated code wherever a value is stored or copied without
++//    arithmetic (the double path quiets signalling NaNs); results of arithmetic on NaNs are the same NaN in both
++//    (which operand's NaN when two are NaN depends on operand order, as everywhere: "NANSIGN", r9 convention);
++//  * memory: host pointers only when every range is plain RAM (MEM1 0x10..24 MiB, MEM2, locked cache), no
++//    NWII_WATCH, and the stack frame does not overlap the matrices (so the access order cannot matter).
++//  * registers: every FPR (ps0 and ps1), GPR, inst_count the generated code leaves, including the ps1 halves
++//    of the callee-saved FPRs it restores with lfd (lfd writes ps0 only), and the stack bytes it writes.
++#include "runtime/native_n1.h"
++#include "runtime/native_n1_fp.h"
++
++#include <cmath>
++#include <bit>
++#include <cstring>
++
++namespace nwii {
++namespace runtime {
++namespace {
++
++// host pointer of [ea, ea+n) when all of it is plain guest RAM, else nullptr
++NWII_FORCEINLINE uint8_t *n2_ram(MMU &m, uint32_t ea, uint32_t n) {
++  const uint32_t p = ea & 0x3FFFFFFF;
++  if (p >= 0x10u && p + n <= MMU::kMem1Size && p + n > p) return m.mem1.data() + p;
++  if (p - 0x10000000u <= MMU::kMem2Size - n) return m.mem2.data() + (p - 0x10000000u);
++  if (ea - MMU::kLCBase <= MMU::kLCSize - n) return m.lc.data() + (ea - MMU::kLCBase);
++  return nullptr;
++}
++NWII_FORCEINLINE bool n2_disjoint(const uint8_t *a, uint32_t na, const uint8_t *b, uint32_t nb) {
++  return a + na <= b || b + nb <= a;
++}
++NWII_FORCEINLINE uint32_t ld32(const uint8_t *p) { uint32_t v; std::memcpy(&v, p, 4); return __builtin_bswap32(v); }
++NWII_FORCEINLINE void st32(uint8_t *p, uint32_t v) { v = __builtin_bswap32(v); std::memcpy(p, &v, 4); }
++NWII_FORCEINLINE void st64(uint8_t *p, uint64_t v) { v = __builtin_bswap64(v); std::memcpy(p, &v, 8); }
++NWII_FORCEINLINE float f32b(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
++NWII_FORCEINLINE uint32_t b32f(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
++NWII_FORCEINLINE uint64_t b64d(double d) { uint64_t u; std::memcpy(&u, &d, 8); return u; }
++// a single that the generated code would not reproduce by plain copy: NaN (quieted by float->double) or
++// subnormal (flushed by psq_st)
++NWII_FORCEINLINE bool odd_bits(uint32_t u) {
++  const uint32_t e = u & 0x7F800000u, f = u & 0x007FFFFFu;
++  return f != 0 && (e == 0 || e == 0x7F800000u);
++}
++// computed single that the double emulation could round differently (single subnormal range)
++NWII_FORCEINLINE bool tiny(float r) {
++  const float a = std::fabs(r);
++  return a < 0x1p-125f && a != 0.0f;
++}
++// NaN inputs: which NaN comes out of an operation with two NaN operands depends on the instruction and its
++// operand order (double vs single FMA, x86 libm fma vs fmaf...): the float bodies leave all of them to the
++// generated code (a NaN made inside the body, e.g. inf*0, is the default NaN on both paths).
++NWII_FORCEINLINE bool any_nan_f(const float *v, int n) {
++  bool r = false;
++  for (int i = 0; i < n; ++i) r |= std::isnan(v[i]);
++  return r;
++}
++NWII_FORCEINLINE bool gqr0_float(const CPUContext &c) { return (c.gqr[0] & 0x00070007u) == 0; }
++NWII_FORCEINLINE void setps(CPUContext &c, int r, float a, float b) { c.fpr[r] = a; c.ps1[r] = b; }
++
++}  // namespace
++
++// PSMTXIdentity (801C04D0): lfs f0,-20300(r2) ; lfs f1,-20304(r2) ; psq_st f0,8(r3) ; ps_merge10 f2,f1,f0 ;
++// ps_merge01 f1,f0,f1 ; psq_st f0,24(r3) ; psq_st f0,32(r3) ; psq_st f1,16(r3) ; psq_st f2,0(r3) ;
++// psq_st f2,40(r3) ; blr
++bool n2h_801C04D0(CPUContext &c) {
++  MMU &m = c.mmu;
++  if (g_watch_addr || !gqr0_float(c)) return false;
++  const uint8_t *k = n2_ram(m, c.gpr[2] - 20304, 8);
++  uint8_t *d = n2_ram(m, c.gpr[3], 48);
++  if (!k || !d || !n2_disjoint(k, 8, d, 48)) return false;
++  const uint32_t u1 = ld32(k), u0 = ld32(k + 4);  // f1 = [r2-20304], f0 = [r2-20300]
++  if (odd_bits(u0) || odd_bits(u1)) return false;
++  st32(d + 8, u0); st32(d + 12, u0);
++  st32(d + 24, u0); st32(d + 28, u0);
++  st32(d + 32, u0); st32(d + 36, u0);
++  st32(d + 16, u0); st32(d + 20, u1);
++  st32(d + 0, u1); st32(d + 4, u0);
++  st32(d + 40, u1); st32(d + 44, u0);
++  const float c0 = f32b(u0), c1 = f32b(u1);
++  setps(c, 0, c0, c0);
++  setps(c, 1, c0, c1);
++  setps(c, 2, c1, c0);
++  c.inst_count += 11;
++  c.pc = c.lr;
++  return true;
++}
++
++// PSMTXCopy (801C0500): six psq_l fN,8N(r3) / psq_st fN,8N(r4) pairs, f0-f5.
++bool n2h_801C0500(CPUContext &c) {
++  MMU &m = c.mmu;
++  if (g_watch_addr || !gqr0_float(c)) return false;
++  const uint8_t *s = n2_ram(m, c.gpr[3], 48);
++  uint8_t *d = n2_ram(m, c.gpr[4], 48);
++  if (!s || !d) return false;
++  uint32_t w[12];
++  for (int i = 0; i < 12; ++i) {
++    w[i] = ld32(s + 4 * i);
++    if (odd_bits(w[i])) return false;
++  }
++  if (s != d && !n2_disjoint(s, 48, d, 48)) return false;  // overlapping copy: the order matters, generated code
++  for (int i = 0; i < 12; ++i) st32(d + 4 * i, w[i]);
++  for (int i = 0; i < 6; ++i) setps(c, i, f32b(w[2 * i]), f32b(w[2 * i + 1]));
++  c.inst_count += 13;
++  c.pc = c.lr;
++  return true;
++}
++
++// PSMTXConcat (801C0540): AB = A x B (3x4), r3 = A, r4 = B, r5 = AB; stack frame of 64 bytes saving f14, f15,
++// f31 with stfd/lfd; r6 = 0x804295A0 ({0, 1}). See r9/r19n/LEEME.md for the instruction order.
++bool n2h_801C0540(CPUContext &c) {
++  MMU &m = c.mmu;
++  if (g_watch_addr || !gqr0_float(c)) return false;
++  const uint32_t r1 = c.gpr[1];
++  const uint8_t *pa = n2_ram(m, c.gpr[3], 48), *pb = n2_ram(m, c.gpr[4], 48), *pk = n2_ram(m, 0x804295A0u, 8);
++  uint8_t *pab = n2_ram(m, c.gpr[5], 48), *ps = n2_ram(m, r1 - 64, 64);
++  if (!pa || !pb || !pk || !pab || !ps) return false;
++  if (!n2_disjoint(pa, 48, ps, 64) || !n2_disjoint(pb, 48, ps, 64) || !n2_disjoint(pk, 8, ps, 64) ||
++      !n2_disjoint(pab, 48, ps, 64))
++    return false;
++  float A[12], B[12];
++  for (int i = 0; i < 12; ++i) { A[i] = f32b(ld32(pa + 4 * i)); B[i] = f32b(ld32(pb + 4 * i)); }
++  const float K0 = f32b(ld32(pk)), K1 = f32b(ld32(pk + 4));
++  if (any_nan_f(A, 12) || any_nan_f(B, 12) || std::isnan(K0) || std::isnan(K1)) return false;
++  bool bad = false;
++#define MUL(x, y) ([&] { const float r_ = (x) * (y); bad |= tiny(r_); return r_; }())
++#define MADD(x, y, z) ([&] { const float r_ = std::fma((x), (y), (z)); bad |= tiny(r_); return r_; }())
++  // f0=(A0,A1) f1=(A2,A3) f2=(A4,A5) f3=(A6,A7) f4=(A8,A9) f5=(A10,A11); f6..f11 = B pairs; f31 = (K0,K1)
++  float f12a = MUL(B[0], A[0]), f12b = MUL(B[1], A[0]);   // ps_muls0 f12,f6,f0
++  float f13a = MUL(B[2], A[0]), f13b = MUL(B[3], A[0]);   // ps_muls0 f13,f7,f0
++  float f14a = MUL(B[0], A[4]), f14b = MUL(B[1], A[4]);   // ps_muls0 f14,f6,f2
++  float f15a = MUL(B[2], A[4]), f15b = MUL(B[3], A[4]);   // ps_muls0 f15,f7,f2
++  f12a = MADD(B[4], A[1], f12a); f12b = MADD(B[5], A[1], f12b);  // ps_madds1 f12,f8,f0,f12
++  f14a = MADD(B[4], A[5], f14a); f14b = MADD(B[5], A[5], f14b);  // ps_madds1 f14,f8,f2,f14
++  f13a = MADD(B[6], A[1], f13a); f13b = MADD(B[7], A[1], f13b);  // ps_madds1 f13,f9,f0,f13
++  f15a = MADD(B[6], A[5], f15a); f15b = MADD(B[7], A[5], f15b);  // ps_madds1 f15,f9,f2,f15
++  f12a = MADD(B[8], A[2], f12a); f12b = MADD(B[9], A[2], f12b);  // ps_madds0 f12,f10,f1,f12
++  f13a = MADD(B[10], A[2], f13a); f13b = MADD(B[11], A[2], f13b);  // ps_madds0 f13,f11,f1,f13
++  f14a = MADD(B[8], A[6], f14a); f14b = MADD(B[9], A[6], f14b);  // ps_madds0 f14,f10,f3,f14
++  f15a = MADD(B[10], A[6], f15a); f15b = MADD(B[11], A[6], f15b);  // ps_madds0 f15,f11,f3,f15
++  float f2a = MUL(B[0], A[8]), f2b = MUL(B[1], A[8]);     // ps_muls0 f2,f6,f4
++  f13a = MADD(K0, A[3], f13a); f13b = MADD(K1, A[3], f13b);      // ps_madds1 f13,f31,f1,f13
++  float f0a = MUL(B[2], A[8]), f0b = MUL(B[3], A[8]);     // ps_muls0 f0,f7,f4
++  f15a = MADD(K0, A[7], f15a); f15b = MADD(K1, A[7], f15b);      // ps_madds1 f15,f31,f3,f15
++  f2a = MADD(B[4], A[9], f2a); f2b = MADD(B[5], A[9], f2b);      // ps_madds1 f2,f8,f4,f2
++  f0a = MADD(B[6], A[9], f0a); f0b = MADD(B[7], A[9], f0b);      // ps_madds1 f0,f9,f4,f0
++  f2a = MADD(B[8], A[10], f2a); f2b = MADD(B[9], A[10], f2b);    // ps_madds0 f2,f10,f5,f2
++  f0a = MADD(B[10], A[10], f0a); f0b = MADD(B[11], A[10], f0b);  // ps_madds0 f0,f11,f5,f0
++  f0a = MADD(K0, A[11], f0a); f0b = MADD(K1, A[11], f0b);        // ps_madds1 f0,f31,f5,f0
++#undef MUL
++#undef MADD
++  if (bad) return false;
++  // stack frame: stwu r1,-64(r1) ; stfd f14,8 ; stfd f15,16 ; stfd f31,40 (then lfd back: ps0 restored)
++  st32(ps + 0, r1);
++  st64(ps + 8, b64d(c.fpr[14]));
++  st64(ps + 16, b64d(c.fpr[15]));
++  st64(ps + 40, b64d(c.fpr[31]));
++  const float out[12] = {f12a, f12b, f13a, f13b, f14a, f14b, f15a, f15b, f2a, f2b, f0a, f0b};
++  for (int i = 0; i < 12; ++i) st32(pab + 4 * i, b32f(out[i]));
++  setps(c, 0, f0a, f0b);
++  setps(c, 1, A[2], A[3]);
++  setps(c, 2, f2a, f2b);
++  setps(c, 3, A[6], A[7]);
++  setps(c, 4, A[8], A[9]);
++  setps(c, 5, A[10], A[11]);
++  for (int i = 0; i < 6; ++i) setps(c, 6 + i, B[2 * i], B[2 * i + 1]);
++  setps(c, 12, f12a, f12b);
++  setps(c, 13, f13a, f13b);
++  c.ps1[14] = f14b;  // ps0 of f14/f15/f31: unchanged (stfd + lfd of the same bits)
++  c.ps1[15] = f15b;
++  c.ps1[31] = K1;
++  c.gpr[6] = 0x804295A0u;
++  c.inst_count += 51;
++  c.pc = c.lr;
++  return true;
++}
++
++
++namespace {
++// psq_st of a float pair to the gather pipe (CPUContext::psq_store, float type: MMU::write_f32 ->
++// write_f32_slow -> GX_WGPIPE_WriteF32 of the ConvertToSingleFTZ value): subnormals go as a signed zero.
++NWII_FORCEINLINE uint32_t ftz_bits(uint32_t u) { return (u & 0x7F800000u) ? u : (u & 0x80000000u); }
++NWII_FORCEINLINE void pipe_f32(uint32_t u) { GX_WGPIPE_WriteF32(f32b(ftz_bits(u))); }
++NWII_FORCEINLINE bool any_nan(const uint32_t *w, int n) {
++  for (int i = 0; i < n; ++i)
++    if ((w[i] & 0x7F800000u) == 0x7F800000u && (w[i] & 0x007FFFFFu)) return true;
++  return false;
++}
++}  // namespace
++
++// GXLoadPosMtxImm (801C9940): r3 = mtx (3x4), r4 = id. stb 0x10 / stw (id*4 | 0xB0000) / 12 floats to the pipe.
++bool n2h_801C9940(CPUContext &c) {
++  MMU &m = c.mmu;
++  if (g_watch_addr || !gqr0_float(c)) return false;
++  const uint8_t *s = n2_ram(m, c.gpr[3], 48);
++  if (!s) return false;
++  uint32_t w[12];
++  for (int i = 0; i < 12; ++i) w[i] = ld32(s + 4 * i);
++  if (any_nan(w, 12)) return false;
++  const uint32_t r0 = (std::rotl(c.gpr[4], 2) & 0xFFFFFFFCu) | 0xB0000u;
++  c.inst_count += 20;  // set before the first pipe write, as the generated code does
++  GX_WGPIPE_Write8(16);
++  GX_WGPIPE_Write32(r0);
++  for (int i = 0; i < 12; ++i) pipe_f32(w[i]);
++  for (int i = 0; i < 6; ++i) setps(c, 5 - i, f32b(w[2 * i]), f32b(w[2 * i + 1]));
++  c.gpr[0] = r0;
++  c.gpr[4] = 0xCC008000u;
++  c.gpr[5] = 0xCC010000u;
++  c.pc = c.lr;
++  return true;
++}
++
++// GXLoadTexMtxImm (801C9A80): r3 = mtx, r4 = id, r5 = type (0: 3x4, 1: 2x4).
++bool n2h_801C9A80(CPUContext &c) {
++  MMU &m = c.mmu;
++  if (g_watch_addr || !gqr0_float(c)) return false;
++  const uint32_t r3 = c.gpr[3], r5 = c.gpr[5];
++  uint32_t r0 = c.gpr[0], r4 = c.gpr[4], r7;
++  const int n = r5 == 0 ? 12 : 8;
++  const uint8_t *s = n2_ram(m, r3, 4 * n);
++  if (!s) return false;
++  uint32_t w[12];
++  for (int i = 0; i < n; ++i) w[i] = ld32(s + 4 * i);
++  if (any_nan(w, n)) return false;
++  uint64_t ic = c.inst_count + 6;
++  if (r4 < 64) {  // cmplwi r4,64 ; blt
++    ic += 1;
++    r7 = std::rotl(r4, 2) & 0xFFFFFFFCu;
++  } else {
++    r0 = r4 - 64;
++    r4 = std::rotl(r0, 2) & 0xFFFFFFFCu;
++    r7 = r4 + 1280;
++  }
++  ic += 4;  // cmpwi r5,1
++  uint32_t r6;
++  if (r5 == 1) r6 = 8; else { ic += 1; r6 = 12; }
++  ic += 23;
++  r6 -= 1;
++  c.inst_count = ic;
++  GX_WGPIPE_Write8(16);
++  r0 = (std::rotl(r6, 16) & 0xFFFF0000u) | r7;
++  GX_WGPIPE_Write32(r0);
++  const bool so = (c.xer >> 31) & 1;
++  c.cr[0].lt = (int32_t)r5 < 0; c.cr[0].gt = (int32_t)r5 > 0; c.cr[0].eq = r5 == 0; c.cr[0].so = so;
++  if (r5 == 0) {
++    for (int i = 0; i < 12; ++i) pipe_f32(w[i]);
++    for (int i = 0; i < 6; ++i) setps(c, 5 - i, f32b(w[2 * i]), f32b(w[2 * i + 1]));
++  } else {
++    ic += 10;
++    c.inst_count = ic;
++    for (int i = 0; i < 8; ++i) pipe_f32(w[i]);
++    for (int i = 0; i < 4; ++i) setps(c, 3 - i, f32b(w[2 * i]), f32b(w[2 * i + 1]));
++  }
++  c.gpr[0] = r0;
++  c.gpr[4] = 0xCC008000u;
++  c.gpr[6] = r6;
++  c.gpr[7] = r7;
++  c.pc = c.lr;
++  return true;
++}
++
++
++namespace {
++// The single interrupt poll of a function that runs no loop iteration: it can only be skipped when the inline
++// part of the generated poll would find nothing (poll_left > 1, and MSR[EE] clear or no flag): then it is
++// just the poll_left decrement. Otherwise the generated code runs (nothing touched yet).
++NWII_FORCEINLINE bool quiet_poll(CPUContext &c) {
++  const int32_t left = c.poll_left.load(std::memory_order_relaxed);
++  if (left <= 1 || !n1_no_flags(c)) return false;
++  c.poll_left.store(left - 1, std::memory_order_relaxed);
++  return true;
++}
++NWII_FORCEINLINE void fcmp0(CPUContext &c, double a, double b) {
++  const bool un = std::isnan(a) || std::isnan(b);
++  c.cr[0].lt = !un && a < b; c.cr[0].gt = !un && a > b; c.cr[0].eq = !un && a == b; c.cr[0].so = un;
++}
++NWII_FORCEINLINE void fillr(CPUContext &c, int r, double v) { c.fpr[r] = v; c.ps1[r] = v; }
++NWII_FORCEINLINE double ldf_d(const uint8_t *p) { return (double)f32b(ld32(p)); }
++NWII_FORCEINLINE void st16(uint8_t *p, uint16_t v) { v = __builtin_bswap16(v); std::memcpy(p, &v, 2); }
++// GQR3 as OSInitFastCast sets it: u16 load and store, scale 0
++NWII_FORCEINLINE bool gqr3_u16(const CPUContext &c) { return (c.gqr[3] & 0x3F073F07u) == 0x00050005u; }
++}  // namespace
++
++// nw4r::math::SinFIdx (80237BD0), the case without a reduction step (|x| <= 65536, the usual one):
++//   fabs f3,f1 ; stwu r1,-16(r1) ; lfs f0,-19424(r2) ; b test ; [fsubs f3,f3,f0] ; test: fcmpo f3,f0 ;
++//   bgt (poll 0x80237BE8) ; addi r3,r1,12 ; psq_st f3,0(r3),1,3 (u16) ; addi r3,r1,8 ; lhz r0,12(r1) ;
++//   sth r0,8(r1) ; psq_l f2,0(r3),1,3 ; lis/addi r4,table ; rlwinm r0,r0,4,20,27 ; lfs f0,-19420(r2) ;
++//   fsubs f4,f3,f2 ; add r3,r4,r0 ; fcmpo f1,f0 ; lfs f3,8(r3) ; lfsx f2,r4,r0 ; fmuls f0,f4,f3 ;
++//   fadds f1,f2,f0 ; bge +8 ; fneg f1,f1 ; addi r1,r1,16 ; blr
++// Same double-precision helpers as the generated code (the input may be any double), on host pointers.
++bool n2h_80237BD0(CPUContext &c) {
++  MMU &m = c.mmu;
++  if (g_watch_addr || !gqr3_u16(c)) return false;
++  const uint32_t r1 = c.gpr[1], r2 = c.gpr[2];
++  uint8_t *st = n2_ram(m, r1 - 16, 16);
++  const uint8_t *k = n2_ram(m, r2 - 19424, 8);
++  if (!st || !k) return false;
++  const double x = c.fpr[1], ax = std::fabs(x);
++  const double kbig = ldf_d(k);                // lfs f0,-19424(r2)
++  if (ax > kbig) return false;                 // a reduction step (loop): generated code
++  const uint32_t tab = 0x802F74A0u;
++  const uint16_t q = (uint16_t)ppc_quantize(ax, 1.0, 0, 65535);
++  const uint32_t r0 = (uint32_t)(q & 0xFF) << 4;
++  const uint8_t *te = n2_ram(m, tab + r0, 12);
++  if (!te || !n2_disjoint(te, 12, st, 16) || !n2_disjoint(k, 8, st, 16)) return false;
++  if (!quiet_poll(c)) return false;
++  st32(st + 0, r1);                            // stwu
++  st16(st + 12, q);                            // psq_st f3 (u16)
++  st16(st + 8, q);                             // lhz / sth
++  const double f2q = (double)((float)q * 1.0f);  // psq_l f2 (u16, scale 0)
++  const double kzero = ldf_d(k + 4);           // lfs f0,-19420(r2)
++  const double f4 = ppc_single(ax - f2q);
++  fcmp0(c, x, kzero);
++  const double t8 = ldf_d(te + 8), t0 = ldf_d(te);
++  const double f0 = ppc_single(f4 * ppc_force25(t8));
++  const double f1 = ppc_single(t0 + f0);
++  fillr(c, 0, f0);
++  fillr(c, 1, f1);
++  if (c.cr[0].lt) c.fpr[1] = -c.fpr[1];
++  fillr(c, 2, t0);
++  fillr(c, 3, t8);
++  fillr(c, 4, f4);
++  c.gpr[0] = r0;
++  c.gpr[3] = tab + r0;
++  c.gpr[4] = tab;
++  c.inst_count += 27;
++  c.pc = c.lr;
++  return true;
++}
++
++// nw4r::math::CosFIdx (80237C40), no reduction step:
++//   fabs f1,f1 ; stwu r1,-16(r1) ; lfs f0,-19424(r2) ; b test ; [fsubs f1,f1,f0] ; test: fcmpo f1,f0 ;
++//   bgt (poll 0x80237C58) ; addi r3,r1,12 ; psq_st f1,0(r3),1,3 ; addi r3,r1,8 ; lhz r0,12(r1) ;
++//   sth r0,8(r1) ; psq_l f0,0(r3),1,3 ; lis/addi r3,table ; rlwinm r0,r0,4,20,27 ; fsubs f2,f1,f0 ;
++//   add r3,r3,r0 ; lfs f1,12(r3) ; lfs f0,4(r3) ; fmuls f1,f2,f1 ; fadds f1,f0,f1 ; addi r1,r1,16 ; blr
++bool n2h_80237C40(CPUContext &c) {
++  MMU &m = c.mmu;
++  if (g_watch_addr || !gqr3_u16(c)) return false;
++  const uint32_t r1 = c.gpr[1], r2 = c.gpr[2];
++  uint8_t *st = n2_ram(m, r1 - 16, 16);
++  const uint8_t *k = n2_ram(m, r2 - 19424, 4);
++  if (!st || !k) return false;
++  const double ax = std::fabs(c.fpr[1]);
++  const double kbig = ldf_d(k);
++  if (ax > kbig) return false;
++  const uint32_t tab = 0x802F74A0u;
++  const uint16_t q = (uint16_t)ppc_quantize(ax, 1.0, 0, 65535);
++  const uint32_t r0 = (uint32_t)(q & 0xFF) << 4;
++  const uint8_t *te = n2_ram(m, tab + r0, 16);
++  if (!te || !n2_disjoint(te, 16, st, 16) || !n2_disjoint(k, 4, st, 16)) return false;
++  if (!quiet_poll(c)) return false;
++  fcmp0(c, ax, kbig);                          // the last fcmpo f1,f0 of the (empty) loop
++  st32(st + 0, r1);
++  st16(st + 12, q);
++  st16(st + 8, q);
++  const double f0q = (double)((float)q * 1.0f);
++  const double f2 = ppc_single(ax - f0q);
++  const double t12 = ldf_d(te + 12), t4 = ldf_d(te + 4);
++  const double f1m = ppc_single(f2 * ppc_force25(t12));
++  const double f1 = ppc_single(t4 + f1m);
++  fillr(c, 0, t4);
++  fillr(c, 1, f1);
++  fillr(c, 2, f2);
++  c.gpr[0] = r0;
++  c.gpr[3] = tab + r0;
++  c.inst_count += 23;
++  c.pc = c.lr;
++  return true;
++}
++
++
++// ---- round N3 -------------------------------------------------------------------------------------------
++
++// PSMTXMultVec (801C1160): r3 = m (3x4), r4 = src VEC3, r5 = dst VEC3.
++//   psq_l f0,0(r4),0 ; psq_l f2,0(r3),0 ; psq_l f1,8(r4),1 ; ps_mul f4,f2,f0 ; psq_l f3,8(r3),0 ;
++//   ps_madd f5,f3,f1,f4 ; psq_l f8,16(r3),0 ; ps_sum0 f6,f5,f6,f5 ; psq_l f9,24(r3),0 ; ps_mul f10,f8,f0 ;
++//   psq_st f6,0(r5),1 ; ps_madd f11,f9,f1,f10 ; psq_l f2,32(r3),0 ; ps_sum0 f12,f11,f12,f11 ; psq_l f3,40(r3),0 ;
++//   ps_mul f4,f2,f0 ; psq_st f12,4(r5),1 ; ps_madd f5,f3,f1,f4 ; ps_sum0 f6,f5,f6,f5 ; psq_st f6,8(r5),1 ; blr
++bool n2h_801C1160(CPUContext &c) {
++  MMU &m = c.mmu;
++  if (g_watch_addr || !gqr0_float(c)) return false;
++  const uint8_t *pm = n2_ram(m, c.gpr[3], 48), *pv = n2_ram(m, c.gpr[4], 12);
++  uint8_t *pd = n2_ram(m, c.gpr[5], 12);
++  // dst may be src (in place: all of src is read before the first store), not the matrix (m[8..11] is
++  // read after the first store)
++  if (!pm || !pv || !pd || !n2_disjoint(pd, 12, pm, 48) || (pd != pv && !n2_disjoint(pd, 12, pv, 12))) return false;
++  float M[12];
++  for (int i = 0; i < 12; ++i) M[i] = f32b(ld32(pm + 4 * i));
++  const float v0 = f32b(ld32(pv)), v1 = f32b(ld32(pv + 4)), v2 = f32b(ld32(pv + 8));
++  if (any_nan_f(M, 12) || std::isnan(v0) || std::isnan(v1) || std::isnan(v2)) return false;
++  bool bad = false;
++  auto mul = [&](float x, float y) { const float r = x * y; bad |= tiny(r); return r; };
++  auto madd = [&](float x, float y, float z) { const float r = std::fma(x, y, z); bad |= tiny(r); return r; };
++  auto add = [&](float x, float y) { const float r = x + y; bad |= tiny(r); return r; };
++  const float f4a = mul(M[0], v0), f4b = mul(M[1], v1);
++  const float f5a = madd(M[2], v2, f4a), f5b = madd(M[3], 1.0f, f4b);
++  const float f6a = add(f5a, f5b);
++  const float f10a = mul(M[4], v0), f10b = mul(M[5], v1);
++  const float f11a = madd(M[6], v2, f10a), f11b = madd(M[7], 1.0f, f10b);
++  const float f12a = add(f11a, f11b);
++  const float g4a = mul(M[8], v0), g4b = mul(M[9], v1);
++  const float g5a = madd(M[10], v2, g4a), g5b = madd(M[11], 1.0f, g4b);
++  const float g6a = add(g5a, g5b);
++  if (bad) return false;
++  const double f6b = ppc_single(c.ps1[6]), f12b = ppc_single(c.ps1[12]);  // ps_sum0: ps1 = single(C.ps1)
++  st32(pd + 0, b32f(f6a));
++  st32(pd + 4, b32f(f12a));
++  st32(pd + 8, b32f(g6a));
++  setps(c, 0, v0, v1);
++  c.fpr[1] = v2; c.ps1[1] = 1.0;
++  setps(c, 2, M[8], M[9]);
++  setps(c, 3, M[10], M[11]);
++  setps(c, 4, g4a, g4b);
++  setps(c, 5, g5a, g5b);
++  c.fpr[6] = g6a; c.ps1[6] = ppc_single(f6b);
++  setps(c, 8, M[4], M[5]);
++  setps(c, 9, M[6], M[7]);
++  setps(c, 10, f10a, f10b);
++  setps(c, 11, f11a, f11b);
++  c.fpr[12] = f12a; c.ps1[12] = f12b;
++  c.inst_count += 21;
++  c.pc = c.lr;
++  return true;
++}
++
++// PSMTXTrans (801C0BD0): r3 = m, f1/f2/f3 = x/y/z (any doubles: stfs selects the bits, ppc_single_bits).
++//   lfs f0,-20300(r2) ; lfs f4,-20304(r2) ; stfs f1,12(r3) ; stfs f2,28(r3) ; psq_st f0,4(r3),0 ;
++//   psq_st f0,32(r3),0 ; stfs f0,16(r3) ; stfs f4,20(r3) ; stfs f0,24(r3) ; stfs f4,40(r3) ; stfs f3,44(r3) ;
++//   stfs f4,0(r3) ; blr
++bool n2h_801C0BD0(CPUContext &c) {
++  MMU &m = c.mmu;
++  if (g_watch_addr || !gqr0_float(c)) return false;
++  const uint8_t *k = n2_ram(m, c.gpr[2] - 20304, 8);
++  uint8_t *d = n2_ram(m, c.gpr[3], 48);
++  if (!k || !d || !n2_disjoint(k, 8, d, 48)) return false;
++  const uint32_t u4 = ld32(k), u0 = ld32(k + 4);  // f4 = [r2-20304], f0 = [r2-20300]
++  if (odd_bits(u0) || odd_bits(u4)) return false;
++  st32(d + 12, ppc_single_bits(c.fpr[1]));
++  st32(d + 28, ppc_single_bits(c.fpr[2]));
++  st32(d + 4, u0); st32(d + 8, u0);
++  st32(d + 32, u0); st32(d + 36, u0);
++  st32(d + 16, u0);
++  st32(d + 20, u4);
++  st32(d + 24, u0);
++  st32(d + 40, u4);
++  st32(d + 44, ppc_single_bits(c.fpr[3]));
++  st32(d + 0, u4);
++  setps(c, 0, f32b(u0), f32b(u0));
++  setps(c, 4, f32b(u4), f32b(u4));
++  c.inst_count += 13;
++  c.pc = c.lr;
++  return true;
++}
++
++// __cvt_fp2unsigned (802DCC4C, CodeWarrior runtime): f1 (double) -> r3 (unsigned, saturating).
++bool n2h_802DCC4C(CPUContext &c) {
++  MMU &m = c.mmu;
++  if (g_watch_addr) return false;
++  const uint32_t r1 = c.gpr[1];
++  uint8_t *st = n2_ram(m, r1 - 16, 16);
++  const uint8_t *k = n2_ram(m, 0x802FD338u, 24);
++  if (!st || !k || !n2_disjoint(k, 24, st, 16)) return false;
++  auto ld64 = [](const uint8_t *p) { uint64_t v; std::memcpy(&v, p, 8); v = __builtin_bswap64(v); double d; std::memcpy(&d, &v, 8); return d; };
++  auto fcmp = [&](int crf, double a, double b) {
++    const bool un = std::isnan(a) || std::isnan(b);
++    c.cr[crf].lt = !un && a < b; c.cr[crf].gt = !un && a > b; c.cr[crf].eq = !un && a == b; c.cr[crf].so = un;
++  };
++  c.inst_count += 16;
++  st32(st + 0, r1);  // stwu r1,-16(r1)
++  const double f0 = ld64(k), f3 = ld64(k + 8), f4 = ld64(k + 16), f1 = c.fpr[1];
++  c.gpr[4] = 0x802FD338u;
++  c.fpr[0] = f0; c.fpr[3] = f3; c.fpr[4] = f4;  // lfd: ps0 only
++  fcmp(0, f1, f0);
++  fcmp(6, f1, f3);
++  uint32_t r3 = 0;
++  if (!c.cr[0].lt) {
++    r3 = 0xFFFFFFFFu;
++    if (c.cr[6].lt) {
++      fcmp(7, f1, f4);
++      double f2 = f1;  // fmr
++      if (!c.cr[7].lt) f2 = f1 - f4;  // fsub
++      c.inst_count += 5;
++      uint64_t img = ppc_fctiw_image(ppc_fctiwz(f2), f2);  // fctiwz f2,f2
++      std::memcpy(&c.fpr[2], &img, 8);
++      st64(st + 8, img);  // stfd f2,8(r1)
++      r3 = (uint32_t)img;  // lwz r3,12(r1): the low word
++      if (!c.cr[7].lt) r3 += 0x80000000u;
++    }
++  }
++  c.gpr[3] = r3;
++  c.inst_count += 2;
++  c.pc = c.lr;
++  return true;
++}
++
++
++// PSMTXInverse (801C07A0): r3 = src, r4 = inv (may be the same: every load of src comes before the first
++// store), r3 = 0 if the determinant is 0 (nothing stored), else 1. Paired-single sequence of the SDK (cofactors,
++// determinant, fres + one Newton step, scaled cofactors), each op on the two lanes as in cpu_context.h.
++bool n2h_801C07A0(CPUContext &c) {
++  MMU &m = c.mmu;
++  if (g_watch_addr || !gqr0_float(c)) return false;
++  const uint8_t *ps = n2_ram(m, c.gpr[3], 48);
++  uint8_t *pd = n2_ram(m, c.gpr[4], 48);
++  if (!ps || !pd) return false;
++  float M[12];
++  for (int i = 0; i < 12; ++i) M[i] = f32b(ld32(ps + 4 * i));
++  if (any_nan_f(M, 12)) return false;
++  bool bad = false;
++  struct P { float a, b; };
++  auto chk = [&](float r) { bad |= tiny(r); return r; };
++  auto mul = [&](P x, P y) { return P{chk(x.a * y.a), chk(x.b * y.b)}; };                 // ps_mul
++  auto muls0 = [&](P x, P y) { return P{chk(x.a * y.a), chk(x.b * y.a)}; };               // ps_muls0
++  auto madd = [&](P x, P y, P z) { return P{chk(std::fma(x.a, y.a, z.a)), chk(std::fma(x.b, y.b, z.b))}; };
++  auto msub = [&](P x, P y, P z) { return P{chk(std::fma(x.a, y.a, -z.a)), chk(std::fma(x.b, y.b, -z.b))}; };
++  auto nk = [](float r) { return std::isnan(r) ? r : -r; };
++  auto nmadd = [&](P x, P y, P z) { return P{nk(chk(std::fma(x.a, y.a, z.a))), nk(chk(std::fma(x.b, y.b, z.b)))}; };
++  auto nmsub = [&](P x, P y, P z) { return P{nk(chk(std::fma(x.a, y.a, -z.a))), nk(chk(std::fma(x.b, y.b, -z.b)))}; };
++  P f0{M[0], 1.0f}, f1{M[1], M[2]}, f2{M[4], 1.0f}, f3{M[5], M[6]}, f4{M[8], 1.0f}, f5{M[9], M[10]};
++  P f6{f1.b, f0.a};             // ps_merge10 f6,f1,f0
++  P f7{f3.b, f2.a};             // ps_merge10 f7,f3,f2
++  P f11 = mul(f3, f6);
++  P f8{f5.b, f4.a};             // ps_merge10 f8,f5,f4
++  P f13 = mul(f5, f7);
++  f11 = msub(f1, f7, f11);
++  P f12 = mul(f1, f8);
++  f13 = msub(f3, f8, f13);
++  P f10 = mul(f3, f4);
++  f12 = msub(f5, f6, f12);
++  f7 = mul(f0, f13);
++  P f9 = mul(f0, f5);
++  f8 = mul(f1, f2);
++  f7 = madd(f2, f12, f7);
++  f6 = P{chk(f6.a - f6.a), chk(f6.b - f6.b)};  // ps_sub f6,f6,f6
++  f10 = msub(f2, f5, f10);
++  f7 = madd(f4, f11, f7);
++  f9 = msub(f1, f4, f9);
++  f8 = msub(f0, f3, f8);
++  if (bad) return false;
++  const bool un = std::isnan(f7.a) || std::isnan(f6.a);
++  const bool lt = !un && f7.a < f6.a, gt = !un && f7.a > f6.a, eq = !un && f7.a == f6.a;
++  auto put = [&](int r, P v) { setps(c, r, v.a, v.b); };
++  if (eq) {  // determinant 0: li r3,0 ; blr
++    put(0, f0); put(1, f1); put(2, f2); put(3, f3); put(4, f4); put(5, f5); put(6, f6); put(7, f7);
++    put(8, f8); put(9, f9); put(10, f10); put(11, f11); put(12, f12); put(13, f13);
++    c.cr[0].lt = lt; c.cr[0].gt = gt; c.cr[0].eq = eq; c.cr[0].so = un;
++    c.gpr[3] = 0;
++    c.inst_count += 29;
++    c.pc = c.lr;
++    return true;
++  }
++  const double rd = ppc_fres((double)f7.a);  // fres f0,f7 (a single: low 29 mantissa bits are 0)
++  const float r = (float)rd;
++  if ((double)r != rd && !std::isnan(rd)) return false;  // defensive: not representable as a single
++  f0 = P{r, r};
++  f6 = P{chk(f0.a + f0.a), chk(f0.b + f0.b)};  // ps_add f6,f0,f0
++  f5 = mul(f7, f0);
++  f0 = nmsub(f0, f5, f6);
++  f1 = P{M[3], M[3]};          // lfs f1,12(r3)
++  f13 = muls0(f13, f0);
++  f2 = P{M[7], M[7]};          // lfs f2,28(r3)
++  f12 = muls0(f12, f0);
++  f3 = P{M[11], M[11]};        // lfs f3,44(r3)
++  f11 = muls0(f11, f0);
++  f5 = P{f13.a, f12.a};        // ps_merge00 f5,f13,f12
++  f4 = P{f13.b, f12.b};        // ps_merge11 f4,f13,f12
++  f6 = mul(f13, f1);
++  const P st0 = f5, st16 = f4;  // psq_st f5,0(r4) ; psq_st f4,16(r4)
++  f10 = muls0(f10, f0);
++  f9 = muls0(f9, f0);
++  f6 = madd(f12, f2, f6);
++  const float st32v = f10.a;    // psq_st f10,32(r4),1
++  f8 = muls0(f8, f0);
++  f6 = nmadd(f11, f3, f6);
++  const float st36v = f9.a;     // psq_st f9,36(r4),1
++  f7 = mul(f10, f1);
++  f5 = P{f11.a, f6.a};          // ps_merge00 f5,f11,f6
++  const float st40v = f8.a;     // psq_st f8,40(r4),1
++  f7 = madd(f9, f2, f7);
++  f4 = P{f11.b, f6.b};          // ps_merge11 f4,f11,f6
++  const P st8 = f5;             // psq_st f5,8(r4)
++  f7 = nmadd(f8, f3, f7);
++  const P st24 = f4;            // psq_st f4,24(r4)
++  const float st44v = f7.a;     // psq_st f7,44(r4),1
++  if (bad) return false;
++  // stored values must not be subnormal (psq_st would flush them): all computed ones were checked; the
++  // merged/moved ones are computed values too.
++  st32(pd + 0, b32f(st0.a)); st32(pd + 4, b32f(st0.b));
++  st32(pd + 16, b32f(st16.a)); st32(pd + 20, b32f(st16.b));
++  st32(pd + 32, b32f(st32v));
++  st32(pd + 36, b32f(st36v));
++  st32(pd + 40, b32f(st40v));
++  st32(pd + 8, b32f(st8.a)); st32(pd + 12, b32f(st8.b));
++  st32(pd + 24, b32f(st24.a)); st32(pd + 28, b32f(st24.b));
++  st32(pd + 44, b32f(st44v));
++  put(0, f0); put(1, f1); put(2, f2); put(3, f3); put(4, f4); put(5, f5); put(6, f6); put(7, f7);
++  put(8, f8); put(9, f9); put(10, f10); put(11, f11); put(12, f12); put(13, f13);
++  c.cr[0].lt = lt; c.cr[0].gt = gt; c.cr[0].eq = eq; c.cr[0].so = un;
++  c.gpr[3] = 1;
++  c.inst_count += 29 + 33;
++  c.pc = c.lr;
++  return true;
++}
++
++
++// ---- round N4 -------------------------------------------------------------------------------------------
++namespace {
++// psq_l / psq_st of ONE element (W=1) with a GQR, on a host pointer: the body of CPUContext::psq_load /
++// psq_store (cpu_context.h) for that element; the GQR is decoded once per call.
++struct N2Gq {
++  uint32_t lt, st;      // load / store type
++  float lscale;         // dequantize scale (float, as psq_load)
++  double sscale;        // quantize scale (double, as psq_store)
++  explicit N2Gq(uint32_t g)
++      : lt((g >> 16) & 7), st(g & 7), lscale((float)gqr_pow2(-gqr_scale(g >> 24))), sscale(gqr_pow2(gqr_scale(g >> 8))) {}
++  uint32_t lsize() const { return lt == 0 ? 4 : (lt == 4 || lt == 6) ? 1 : 2; }
++  double load(const uint8_t *p) const {
++    switch (lt) {
++    case 0: return (double)f32b(ld32(p));
++    case 4: return (float)p[0] * lscale;
++    case 5: return (float)(uint16_t)(p[0] << 8 | p[1]) * lscale;
++    case 6: return (float)(int8_t)p[0] * lscale;
++    case 7: return (float)(int16_t)(p[0] << 8 | p[1]) * lscale;
++    default: return 0.0;
++    }
++  }
++  void store(uint8_t *p, double v) const {
++    switch (st) {
++    case 0: st32(p, ppc_single_bits_ftz(v)); break;
++    case 4: p[0] = (uint8_t)ppc_quantize(v, sscale, 0, 255); break;
++    case 5: { const uint16_t q = (uint16_t)ppc_quantize(v, sscale, 0, 65535); p[0] = q >> 8; p[1] = q & 0xFF; break; }
++    case 6: p[0] = (uint8_t)(int8_t)ppc_quantize(v, sscale, -128, 127); break;
++    case 7: { const uint16_t q = (uint16_t)(int16_t)ppc_quantize(v, sscale, -32768, 32767); p[0] = q >> 8; p[1] = q & 0xFF; break; }
++    }
++  }
++};
++NWII_FORCEINLINE void w16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
++NWII_FORCEINLINE uint32_t r16(const uint8_t *p) { return (uint32_t)p[0] << 8 | p[1]; }
++}  // namespace
++
++// nw4r::g3d animation: value of a keyframe curve at frame f1 (802403C0). r3 = curve {u16 count; f32 s4, s8,
++// s12; keys[count] (u32: frame in the top 12 bits ...)}. First / last key clamps, exact key hit, else Hermite
++// between the two keys around the frame (found by a linear search from count*frame*s4, polls in both loops).
++// FPR arithmetic with the N1_* macros (= CPUContext's helpers, any doubles), quantized psq with the GQRs as
++// they are, the 32-byte stack frame in a local copy written back at the end; all guest reads before any write,
++// so every give-up (memory that is not RAM, a poll that would not be quiet, a search leaving the table) leaves
++// nothing behind and the generated code runs.
++bool n2h_802403C0(CPUContext &ctx) {
++  MMU &m = ctx.mmu;
++  if (g_watch_addr) return false;
++  const uint32_t r1 = ctx.gpr[1], r2 = ctx.gpr[2], r3 = ctx.gpr[3];
++  uint8_t *gst = n2_ram(m, r1 - 32, 32);
++  const uint8_t *hdr = n2_ram(m, r3, 16);
++  const uint8_t *k2 = n2_ram(m, r2 - 19172, 12);
++  if (!gst || !hdr || !k2) return false;
++  const uint32_t count = r16(hdr);
++  const uint8_t *tab = n2_ram(m, r3, 16 + 4 * count + 4);
++  if (!tab || count == 0 || !n2_disjoint(tab, 16 + 4 * count + 4, gst, 32) || !n2_disjoint(k2, 12, gst, 32)) return false;
++  const uint8_t *keys = tab + 16;
++  auto key = [&](uint32_t ea) -> const uint8_t * {  // host pointer of a key address inside the table (or null)
++    const uint32_t o = ea - (r3 + 16);  // (64-bit sum: o close to 2^32 must not wrap into range)
++    return (uint64_t)o + 8 <= (uint64_t)(4 * count + 4) ? keys + o : nullptr;
++  };
++  const N2Gq q2(ctx.gqr[2]), q3(ctx.gqr[3]), q6(ctx.gqr[6]);
++  uint8_t fr[32];
++  std::memcpy(fr, gst, 32);
++  st32(fr + 0, r1);  // stwu r1,-32(r1)
++  const uint32_t r1n = r1 - 32;
++  double f0 = ctx.fpr[0], p0 = ctx.ps1[0], f1 = ctx.fpr[1], p1 = ctx.ps1[1], f2 = ctx.fpr[2], p2 = ctx.ps1[2],
++         f3 = ctx.fpr[3], p3 = ctx.ps1[3], f4 = ctx.fpr[4], p4 = ctx.ps1[4], f5 = ctx.fpr[5], p5 = ctx.ps1[5],
++         f6 = ctx.fpr[6], p6 = ctx.ps1[6], f7 = ctx.fpr[7], p7 = ctx.ps1[7], f8 = ctx.fpr[8], p8 = ctx.ps1[8],
++         f9 = ctx.fpr[9], p9 = ctx.ps1[9], f10 = ctx.fpr[10], p10 = ctx.ps1[10], f11 = ctx.fpr[11], p11 = ctx.ps1[11];
++  uint32_t r0 = ctx.gpr[0], r4, r5, r6, r7 = ctx.gpr[7], r3o = r3, ca = (ctx.xer >> 29) & 1;
++  const bool so = (ctx.xer >> 31) & 1;
++  bool lt, gt, eq, un, sob = so;
++  uint64_t ic = ctx.inst_count;
++  uint64_t npolls = 0;
++  auto fcmp = [&](double a, double b) { un = std::isnan(a) || std::isnan(b); lt = !un && a < b; gt = !un && a > b; eq = !un && a == b; sob = un; };
++  auto ldq = [&](const N2Gq &q, const uint8_t *p, double &fd, double &pd) { fd = q.load(p); pd = 1.0; };
++  auto lfs = [&](const uint8_t *p) { return (double)f32b(ld32(p)); };
++  // the clamp/hit tail: rlwinm r0,key,20,20,31 ; sth r0,off(r1) ; psq_l f2,off(r1),1,3 ; lfs f1,8(r3) ; lfs f0,12(r3) ; fmadds f1,f1,f2,f0
++  auto tail = [&](uint32_t keyw, uint32_t off) {
++    r0 = std::rotl(keyw, 20) & 0xFFFu;
++    r4 = r1n + off;
++    w16(fr + off, r0);
++    ldq(q3, fr + off, f2, p2);
++    N1_fill(1, lfs(hdr + 8));
++    N1_fill(0, lfs(hdr + 12));
++    N1_fmadds(1, 1, 2, 0);
++  };
++  ic += 20;
++  r5 = r3 + 16;
++  r6 = count;
++  r0 = std::rotl(r6 - 1, 2) & 0xFFFFFFFCu;
++  r4 = r3 + r0 + 16;
++  ldq(q2, keys, f0, p0);
++  fcmp(f1, f0); eq = lt | eq;
++  if (eq) {  // frame <= first key
++    tail(ld32(keys), 22);
++  } else {
++    ic += 13;
++    const uint8_t *kl = key(r4);
++    if (!kl) return false;
++    ldq(q2, kl, f0, p0);
++    fcmp(f0, f1); eq = lt | eq;
++    if (eq) {  // last key <= frame
++      tail(ld32(kl), 20);
++    } else {
++      ic += 21;
++      ldq(q2, keys, f0, p0);
++      r4 = r1n + 18;
++      w16(fr + 18, r6);
++      N1_fsubs(3, 1, 0);
++      ldq(q3, fr + 18, f2, p2);
++      r4 = r1n + 28;
++      N1_fill(0, lfs(hdr + 4));
++      N1_fmuls(2, 3, 2);
++      N1_fmuls(0, 0, 2);
++      q3.store(fr + 28, f0);              // psq_st f0,0(r4),1,3
++      r5 = r1n + 24;
++      r0 = r16(fr + 28);
++      r0 = std::rotl(r0, 2) & 0xFFFFFFFCu;
++      r4 = r3 + r0;
++      r7 = r4 + 16;
++      q2.store(fr + 24, f1);              // psq_st f1,0(r5),1,2
++      r4 = fr[24];
++      const uint8_t *kp = key(r7);
++      if (!kp) return false;
++      r0 = kp[0];
++      lt = r4 < r0; gt = r4 > r0; eq = r4 == r0; sob = so;
++      if (lt) {  // backward: lbzu r0,-4(r7) ; cmplw r4,r0 ; blt (poll 0x802404A0)
++        do {
++          ic += 3;
++          r7 -= 4;
++          if (!(kp = key(r7))) return false;
++          r0 = kp[0];
++          lt = r4 < r0; gt = r4 > r0; eq = r4 == r0;
++          ++npolls;
++        } while (lt && npolls < 4096);
++        if (lt) return false;
++        ic += 1;
++      } else {   // forward: lbzu r0,4(r7) ; cmplw r0,r4 ; ble (poll 0x802404B0) ; addi r7,r7,-4
++        do {
++          ic += 3;
++          r7 += 4;
++          if (!(kp = key(r7))) return false;
++          r0 = kp[0];
++          lt = r0 < r4; gt = r0 > r4; eq = r0 == r4;
++          ++npolls;
++        } while (!gt && npolls < 4096);
++        if (!gt) return false;
++        ic += 1;
++        r7 -= 4;
++      }
++      // the polls of the two loops: only when all of them would be quiet (then just the countdown)
++      {
++        const int32_t left = ctx.poll_left.load(std::memory_order_relaxed);
++        if ((int64_t)left <= (int64_t)npolls || !n1_no_flags(ctx)) return false;
++      }
++      ic += 12;
++      const uint8_t *k7 = key(r7);
++      if (!k7) return false;
++      ldq(q2, k7, f0, p0);
++      fcmp(f1, f0);
++      if (eq) {  // exact key
++        tail(ld32(k7), 16);
++      } else {
++        ic += 47;
++        r4 = ld32(k7);
++        r6 = r1n + 14;
++        r5 = r7 + 4;
++        const uint8_t *k8 = key(r5);
++        if (!k8) return false;
++        r0 = std::rotl(r4, 20) & 0xFFFu;
++        w16(fr + 14, r0);
++        ldq(q3, fr + 14, f3, p3);
++        r0 = std::rotl(r4, 20) & 0xFFF00000u;
++        N1_fill(2, lfs(hdr + 8));
++        { const int32_t sv = (int32_t)r0; r0 = (uint32_t)(sv >> 20); ca = (sv < 0 && (sv & 1048575) != 0) ? 1 : 0; }
++        N1_fill(0, lfs(hdr + 12));
++        r3o = r1n + 12;
++        w16(fr + 12, r0);
++        N1_fmadds(5, 2, 3, 0);
++        ldq(q6, fr + 12, f6, p6);
++        r4 = r1n + 10;
++        r3o = ld32(k8);
++        r0 = std::rotl(r3o, 20) & 0xFFFu;
++        w16(fr + 10, r0);
++        ldq(q3, fr + 10, f3, p3);
++        r0 = std::rotl(r3o, 20) & 0xFFF00000u;
++        { const int32_t sv = (int32_t)r0; r0 = (uint32_t)(sv >> 20); ca = (sv < 0 && (sv & 1048575) != 0) ? 1 : 0; }
++        r3o = r1n + 8;
++        w16(fr + 8, r0);
++        N1_fmadds(0, 2, 3, 0);
++        ldq(q6, fr + 8, f7, p7);
++        ldq(q2, k7, f3, p3);
++        ldq(q2, k8, f4, p4);
++        N1_fsubs(0, 5, 0);
++        N1_fsubs(10, 1, 3);
++        N1_fill(2, lfs(k2 + 4));    // lfs f2,-19168(r2)
++        N1_fsubs(11, 4, 3);
++        N1_fill(1, lfs(k2 + 8));    // lfs f1,-19164(r2)
++        N1_fill(4, lfs(k2 + 0));    // lfs f4,-19172(r2)
++        N1_fres(9, 11);
++        N1_ps_add(8, 9, 9);
++        N1_ps_mul(3, 9, 9);
++        N1_ps_nmsub(9, 11, 3, 8);
++        N1_fmuls(3, 10, 9);
++        N1_fmsubs(8, 10, 9, 4);
++        N1_fmsubs(1, 2, 3, 1);
++        N1_fmuls(2, 3, 7);
++        N1_fmuls(4, 10, 8);
++        N1_fmuls(0, 1, 0);
++        N1_fmadds(1, 8, 6, 2);
++        N1_fmuls(0, 3, 0);
++        N1_fmadds(0, 3, 0, 5);
++        N1_fmadds(1, 4, 1, 0);
++      }
++      ctx.poll_left.store(ctx.poll_left.load(std::memory_order_relaxed) - (int32_t)npolls, std::memory_order_relaxed);
++    }
++  }
++  ic += 2;  // addi r1,r1,32 ; blr
++  std::memcpy(gst, fr, 32);
++  ctx.fpr[0] = f0; ctx.ps1[0] = p0; ctx.fpr[1] = f1; ctx.ps1[1] = p1; ctx.fpr[2] = f2; ctx.ps1[2] = p2;
++  ctx.fpr[3] = f3; ctx.ps1[3] = p3; ctx.fpr[4] = f4; ctx.ps1[4] = p4; ctx.fpr[5] = f5; ctx.ps1[5] = p5;
++  ctx.fpr[6] = f6; ctx.ps1[6] = p6; ctx.fpr[7] = f7; ctx.ps1[7] = p7; ctx.fpr[8] = f8; ctx.ps1[8] = p8;
++  ctx.fpr[9] = f9; ctx.ps1[9] = p9; ctx.fpr[10] = f10; ctx.ps1[10] = p10; ctx.fpr[11] = f11; ctx.ps1[11] = p11;
++  ctx.xer = (ctx.xer & ~(1u << 29)) | (ca << 29);
++  ctx.cr[0].lt = lt; ctx.cr[0].gt = gt; ctx.cr[0].eq = eq; ctx.cr[0].so = sob;  // the last compare: an fcmp
++  (void)un;
++  ctx.gpr[0] = r0; ctx.gpr[3] = r3o; ctx.gpr[4] = r4; ctx.gpr[5] = r5; ctx.gpr[6] = r6; ctx.gpr[7] = r7;
++  ctx.inst_count = ic;
++  ctx.pc = ctx.lr;
++  return true;
++}
++
++
++// ---- round N5 -------------------------------------------------------------------------------------------
++
++// nw4r::math 802382B0: 3x4 rotation matrix from three angle indices (f1, f2: X/Y as a pair, f3: Z) into r3,
++// with the SinCos table at 0x802F74A0 (u16 quantized indices through the stack, GQR3), three reduction loops
++// with polls (taken only if all of them would be quiet), the rest with the N1_* macros (= cpu_context.h).
++bool n2h_802382B0(CPUContext &ctx) {
++  MMU &m = ctx.mmu;
++  if (g_watch_addr) return false;
++  const uint32_t r1 = ctx.gpr[1], r2 = ctx.gpr[2], r3 = ctx.gpr[3];
++  uint8_t *gst = n2_ram(m, r1 - 16, 16);
++  const uint8_t *kp = n2_ram(m, r2 - 19368, 8);
++  const uint8_t *tab = n2_ram(m, 0x802F74A0u, 0x1000 + 16);
++  uint8_t *dst = n2_ram(m, r3, 48);
++  if (!gst || !kp || !tab || !dst || !n2_disjoint(dst, 48, gst, 16) || !n2_disjoint(dst, 48, tab, 0x1010) ||
++      !n2_disjoint(dst, 48, kp, 8) || !n2_disjoint(gst, 16, tab, 0x1010) || !n2_disjoint(gst, 16, kp, 8))
++    return false;
++  const N2Gq q0(ctx.gqr[0]), q3(ctx.gqr[3]);
++  if (q0.lt != 0 || q0.st != 0) return false;  // the table and the matrix are floats (GQR0 as the SDK sets it)
++  uint8_t fr[16];
++  std::memcpy(fr, gst, 16);
++  double f0 = ctx.fpr[0], p0 = ctx.ps1[0], f1 = ctx.fpr[1], p1 = ctx.ps1[1], f2 = ctx.fpr[2], p2 = ctx.ps1[2],
++         f3 = ctx.fpr[3], p3 = ctx.ps1[3], f4 = ctx.fpr[4], p4 = ctx.ps1[4], f5 = ctx.fpr[5], p5 = ctx.ps1[5],
++         f6 = ctx.fpr[6], p6 = ctx.ps1[6], f7 = ctx.fpr[7], p7 = ctx.ps1[7], f8 = ctx.fpr[8], p8 = ctx.ps1[8],
++         f9 = ctx.fpr[9], p9 = ctx.ps1[9];
++  bool lt, gt, eq, un;
++  auto fcmp = [&](double a, double b) { un = std::isnan(a) || std::isnan(b); lt = !un && a < b; gt = !un && a > b; eq = !un && a == b; };
++  auto ldpair = [&](const uint8_t *p, double &fd, double &pd) { fd = q0.load(p); pd = q0.load(p + 4); };
++  uint64_t ic = ctx.inst_count, npolls = 0;
++  const uint32_t r1n = r1 - 16, r4 = 0x802F74A0u, r7 = r1n + 8;
++  ic += 14;
++  N1_ps_merge00(6, 1, 2);
++  ldpair(kp, f0, p0);                      // psq_lx f0,0,r0 (r0 = r2-19368)
++  st32(fr + 0, r1);                        // stwu r1,-16(r1)
++  N1_ps_merge00(0, 0, 0);
++  N1_ps_abs(4, 6);
++  N1_ps_neg(1, 0);
++  fcmp(f4, f0);
++  N1_ps_sub(2, 0, 0);
++  if (gt) {
++    do { ic += 3; N1_ps_sum0(4, 4, 4, 1); fcmp(f4, f0); ++npolls; } while (gt && npolls < 4096);
++    if (gt) return false;
++  }
++  ic += 3;
++  fcmp(p4, p0);
++  if (gt) {
++    N1_ps_merge10(4, 4, 4);
++    const uint64_t n0 = npolls;
++    do { ic += 3; N1_ps_sum0(4, 4, 4, 1); fcmp(f4, f0); ++npolls; } while (gt && npolls - n0 < 4096);
++    if (gt) return false;
++    ic += 1;
++    N1_ps_merge10(4, 4, 4);
++  }
++  ic += 6;
++  q3.store(fr + 8, f4);                    // psq_st f4,0(r7),0,3
++  q3.store(fr + 8 + (q3.st == 0 ? 4 : (q3.st == 4 || q3.st == 6) ? 1 : 2), p4);
++  f7 = q3.load(fr + 8); p7 = q3.load(fr + 8 + q3.lsize());   // psq_l f7,0(r7),0,3
++  f5 = std::fabs(f3);
++  uint32_t r0 = ld32(fr + 8);
++  fcmp(f5, f0);
++  if (gt) {
++    const uint64_t n0 = npolls;
++    do { ic += 3; N1_fsubs(5, 5, 0); fcmp(f5, f0); ++npolls; } while (gt && npolls - n0 < 4096);
++    if (gt) return false;
++  }
++  {
++    const int32_t left = ctx.poll_left.load(std::memory_order_relaxed);
++    if (npolls && ((int64_t)left <= (int64_t)npolls || !n1_no_flags(ctx))) return false;
++  }
++  ic += 16;
++  q3.store(fr + 8, f5);                    // psq_st f5,0(r7),1,3
++  uint32_t r5 = r4 + (std::rotl(r0, 20) & 0xFF0u);
++  N1_ps_sub(7, 4, 7);
++  ldpair(tab + (r5 - r4), f4, p4);
++  uint32_t r6 = std::rotl(r0, 4) & 0xFF0u;
++  ldpair(tab + (r5 - r4) + 8, f8, p8);
++  fcmp(f6, f2);
++  r6 = r4 + r6;
++  N1_ps_madds0(0, 8, 7, 4);
++  ldpair(tab + (r6 - r4), f4, p4);
++  ldpair(tab + (r6 - r4) + 8, f8, p8);
++  r0 = r16(fr + 8);
++  if (lt) { N1_ps_neg(9, 0); N1_ps_merge01(0, 9, 0); }
++  ic += 11;
++  N1_ps_madds1(1, 8, 7, 4);
++  f7 = q3.load(fr + 8); p7 = 1.0;          // psq_l f7,0(r7),1,3
++  r0 = std::rotl(r0, 4) & 0xFF0u;
++  fcmp(p6, p2);
++  r5 = r4 + r0;
++  N1_fsubs(7, 5, 7);
++  ldpair(tab + r0, f4, p4);
++  ldpair(tab + r0 + 8, f8, p8);
++  if (lt) { N1_ps_neg(9, 1); N1_ps_merge01(1, 9, 1); }
++  ic += 5;
++  fcmp(f3, f2);
++  N1_ps_madds0(2, 8, 7, 4);
++  if (lt) { N1_ps_neg(9, 2); N1_ps_merge01(2, 9, 2); }
++  ic += 25;
++  N1_ps_neg(3, 0);
++  N1_ps_muls1(5, 2, 1);
++  N1_ps_sub(7, 0, 0);
++  N1_ps_merge10(3, 3, 0);
++  N1_ps_merge10(6, 5, 5);
++  q0.store(dst + 44, f7);                  // psq_st f7,44(r3),1,0
++  N1_ps_muls0(4, 0, 2);
++  q0.store(dst + 0, f6);                   // psq_st f6,0(r3),1,0
++  N1_ps_muls1(6, 0, 2);
++  N1_ps_muls0(8, 3, 2);
++  N1_ps_muls1(2, 3, 2);
++  N1_ps_madds0(6, 6, 1, 8);
++  N1_ps_neg(2, 2);
++  q0.store(dst + 4, f6); q0.store(dst + 8, p6);
++  N1_ps_merge00(6, 7, 5);
++  q0.store(dst + 12, f6); q0.store(dst + 16, p6);
++  N1_ps_madds0(6, 4, 1, 2);
++  q0.store(dst + 20, f6); q0.store(dst + 24, p6);
++  N1_ps_neg(6, 1);
++  N1_ps_merge00(6, 7, 6);
++  q0.store(dst + 28, f6); q0.store(dst + 32, p6);
++  N1_ps_muls1(6, 0, 1);
++  q0.store(dst + 36, f6); q0.store(dst + 40, p6);
++  // commit (dst was written above: everything that can make the body give up comes before the first store)
++  std::memcpy(gst, fr, 16);
++  if (npolls) ctx.poll_left.store(ctx.poll_left.load(std::memory_order_relaxed) - (int32_t)npolls, std::memory_order_relaxed);
++  ctx.fpr[0] = f0; ctx.ps1[0] = p0; ctx.fpr[1] = f1; ctx.ps1[1] = p1; ctx.fpr[2] = f2; ctx.ps1[2] = p2;
++  ctx.fpr[3] = f3; ctx.ps1[3] = p3; ctx.fpr[4] = f4; ctx.ps1[4] = p4; ctx.fpr[5] = f5; ctx.ps1[5] = p5;
++  ctx.fpr[6] = f6; ctx.ps1[6] = p6; ctx.fpr[7] = f7; ctx.ps1[7] = p7; ctx.fpr[8] = f8; ctx.ps1[8] = p8;
++  ctx.fpr[9] = f9; ctx.ps1[9] = p9;
++  ctx.cr[0].lt = lt; ctx.cr[0].gt = gt; ctx.cr[0].eq = eq; ctx.cr[0].so = un;
++  ctx.gpr[0] = r0; ctx.gpr[4] = r4; ctx.gpr[5] = r5; ctx.gpr[6] = r6; ctx.gpr[7] = r7;
++  ctx.inst_count = ic;
++  ctx.pc = ctx.lr;
++  return true;
++}
++
++
++// MSL strcmp (802E1AB4): byte compare until 4-byte alignment, then word compare with the
++// (w - 0x01010101) & ~w & 0x80808080 zero test, then the bytes of the last word. The three loops' polls only
++// when all of them would be quiet. No memory writes; reads through host pointers of plain RAM (else give up).
++bool n2h_802E1AB4(CPUContext &ctx) {
++  MMU &m = ctx.mmu;
++  uint32_t r0 = ctx.gpr[0], r3 = ctx.gpr[3], r4 = ctx.gpr[4], r5 = ctx.gpr[5], r6 = ctx.gpr[6], r7 = ctx.gpr[7],
++           r8 = ctx.gpr[8], ctr = ctx.ctr, ca = (ctx.xer >> 29) & 1;
++  const bool xso = (ctx.xer >> 31) & 1;
++  bool lt = ctx.cr[0].lt, gt = ctx.cr[0].gt, eq = ctx.cr[0].eq, so = ctx.cr[0].so;
++  uint64_t ic = ctx.inst_count, npolls = 0;
++  bool fail = false;
++  auto rd8 = [&](uint32_t ea) -> uint32_t { const uint8_t *p = n2_ram(m, ea, 1); if (!p) { fail = true; return 0; } return *p; };
++  auto rd32 = [&](uint32_t ea) -> uint32_t { const uint8_t *p = n2_ram(m, ea, 4); if (!p) { fail = true; return 0; } return ld32(p); };
++  auto rec = [&](uint32_t v) { lt = (int32_t)v < 0; gt = (int32_t)v > 0; eq = v == 0; };             // subf. / and. (no SO, as G5 emits)
++  auto cmpwi0 = [&](uint32_t v) { lt = (int32_t)v < 0; gt = (int32_t)v > 0; eq = v == 0; so = xso; };
++  auto cmplw = [&](uint32_t a, uint32_t b) { lt = a < b; gt = a > b; eq = a == b; so = xso; };
++  enum { WORD, BYTES, DONE } st;
++  ic += 6;
++  r5 = rd8(r3); r0 = rd8(r4); if (fail) return false;
++  r0 = r5 - r0; rec(r0);
++  if (!eq) { r3 = r0; st = DONE; goto out; }
++  ic += 10;
++  r0 = r4 & 3; r6 = r3 & 3;
++  cmplw(r0, r6);
++  if (!eq) { st = BYTES; goto bytes; }
++  cmpwi0(r6);
++  if (eq) { st = WORD; goto word; }
++  cmpwi0(r5);
++  if (eq) { r3 = 0; goto out; }
++  ic += 4;
++  { const uint64_t res = (uint64_t)(uint32_t)~r6 + 3u + 1u; r0 = (uint32_t)res; ca = (uint32_t)(res >> 32) & 1u; }  // subfic r0,r6,3
++  ctr = r0;
++  cmpwi0(r0);
++  if (!eq) {
++    for (;;) {
++      ic += 6;
++      r3 += 1; r5 = rd8(r3); r4 += 1; r0 = rd8(r4); if (fail) return false;
++      r0 = r5 - r0; rec(r0);
++      if (!eq) { r3 = r0; goto out; }
++      ic += 4;
++      cmpwi0(r5);
++      if (eq) { r3 = 0; goto out; }
++      ic += 1;
++      ++npolls;             // poll 0x802E1B2C (bdnz)
++      if (--ctr == 0) break;
++      if (npolls > 4096) return false;
++    }
++  }
++  ic += 2;
++  r3 += 1; r4 += 1;
++word:
++  ic += 10;
++  r7 = rd32(r3);
++  r5 = 0x80810000u;
++  r6 = 0x80808080u;
++  r8 = rd32(r4); if (fail) return false;
++  r5 = r7 + 0xFEFF0000u; r5 = r5 + 0xFFFFFEFFu;  // addis/addi: r7 - 0x01010101
++  r5 = r5 & ~r7;
++  r0 = r5 & r6; rec(r0);
++  if (eq) {
++    for (;;) {  // B78: cmplw r7,r8 ; beq B60 (poll 0x802E1B7C)
++      ic += 2;
++      cmplw(r7, r8);
++      ++npolls;
++      if (!eq) break;
++      if (npolls > 65536) return false;
++      ic += 6;  // B60
++      r3 += 4; r7 = rd32(r3); r4 += 4; r8 = rd32(r4); if (fail) return false;
++      r5 = r7 + 0xFEFF0000u;
++      r0 = r5 + 0xFFFFFEFFu;
++      r0 = r0 & r6; rec(r0);
++      if (!eq) break;
++    }
++  }
++  ic += 6;  // B80
++  r5 = rd8(r3); r0 = rd8(r4); if (fail) return false;
++  r0 = r5 - r0; rec(r0);
++  if (!eq) { r3 = r0; goto out; }
++bytes:
++  ic += 4;  // B98
++  cmpwi0(r5);
++  if (eq) { r3 = 0; goto out; }
++  for (;;) {
++    ic += 6;  // BA8
++    r3 += 1; r5 = rd8(r3); r4 += 1; r0 = rd8(r4); if (fail) return false;
++    r0 = r5 - r0; rec(r0);
++    if (!eq) { r3 = r0; goto out; }
++    ic += 2;
++    cmpwi0(r5);
++    ++npolls;  // poll 0x802E1BC4
++    if (eq) break;
++    if (npolls > 65536) return false;
++  }
++  ic += 2;
++  r3 = 0;
++out:
++  (void)st;
++  if (npolls) {
++    const int32_t left = ctx.poll_left.load(std::memory_order_relaxed);
++    if ((int64_t)left <= (int64_t)npolls || !n1_no_flags(ctx)) return false;
++    ctx.poll_left.store(left - (int32_t)npolls, std::memory_order_relaxed);
++  }
++  ctx.gpr[0] = r0; ctx.gpr[3] = r3; ctx.gpr[4] = r4; ctx.gpr[5] = r5; ctx.gpr[6] = r6; ctx.gpr[7] = r7; ctx.gpr[8] = r8;
++  ctx.ctr = ctr;
++  ctx.xer = (ctx.xer & ~(1u << 29)) | (ca << 29);
++  ctx.cr[0].lt = lt; ctx.cr[0].gt = gt; ctx.cr[0].eq = eq; ctx.cr[0].so = so;
++  ctx.inst_count = ic;
++  ctx.pc = ctx.lr;
++  return true;
++}
++
++}  // namespace runtime
++}  // namespace nwii

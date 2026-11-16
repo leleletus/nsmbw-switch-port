@@ -1,0 +1,1616 @@
+diff --color -ruN r35m4/nWiiRuntime_m5/src/core/main.cpp r41m/nWiiRuntime/src/core/main.cpp
+--- r35m4/nWiiRuntime_m5/src/core/main.cpp	2026-11-14 21:32:24.165940940 -0500
++++ r41m/nWiiRuntime/src/core/main.cpp	2026-11-15 14:01:44.214002388 -0500
+@@ -41,6 +41,8 @@
+ #include <ctime>
+ #endif
+ 
++void vtl_note(uint32_t kind, uint32_t arg);  // r37v (gx.cpp): NWII_V_TL
++void vtl_init();
+ namespace nwii::runtime {
+     namespace hw { extern uint32_t g_vi_top_field_base; }
+     // CPU-thread sleeps in the guest OS idle loop (os_hle_stubs.cpp idle_wait).
+@@ -75,6 +77,9 @@
+ uint64_t g_stat_presented = 0, g_stat_repeats = 0, g_stat_unshown = 0;
+ 
+ void cpu_thread_func(nwii::runtime::CPUContext *ctx) {
++#ifndef __SWITCH__
++  nwii::runtime::s2::pc_sched(1);  // r38c: NWII_C_PCSCHED (solo PC)
++#endif
+   nwii::runtime::g_ctx_ptr = ctx;
+   {
+     // Leave 1 MiB of headroom below the guest call chain (stack: 8 MiB for a
+@@ -693,7 +698,11 @@
+           std::chrono::duration<double>(1.0 / fps));
+   }
+ 
++  ::vtl_init();  // r37v: NWII_V_TL=<ruta>
+   nwii::runtime::s2::init(ctx.get());  // r34s2 (NWII_S2=1): CPU de sonido
++#ifndef __SWITCH__
++  nwii::runtime::s2::pc_sched(0);  // r38c: NWII_C_PCSCHED (solo PC): este hilo es el de render
++#endif
+ #ifdef __SWITCH__
+   // Every guest call is a native call, so the host stack grows as deep as the
+   // game's call chain; libnx gives std::thread no way to size it.
+@@ -954,7 +963,7 @@
+       std::printf(", idle sleeps %.0f/s (%.0f%% of the time)%s\n",
+                   (sleeps - sleeps0) / dt, (sleep_us - sleep_us0) / dt / 1e4, gov);
+       if (nwii::runtime::s2::g_enabled) {  // r34s2
+-        char s2l[768];
++        char s2l[1400];  // r38c: + linea [C38]
+         nwii::runtime::s2::stats_line(s2l, sizeof s2l, dt);
+         std::printf("%s\n", s2l);
+       }
+@@ -1282,6 +1291,8 @@
+           extern void GX_PipeNoteSwap(int64_t);
+           const auto ts0 = std::chrono::steady_clock::now();
+           HostSwap(window);  // r15dk: SDL_GL_SwapWindow o dkgl::SwapBuffers
++          ::vtl_note(9, (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(
++                          std::chrono::steady_clock::now() - ts0).count());
+           GX_PipeNoteSwap(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - ts0).count());
+         }
+diff --color -ruN r35m4/nWiiRuntime_m5/src/core/os_hle_stubs.cpp r41m/nWiiRuntime/src/core/os_hle_stubs.cpp
+--- r35m4/nWiiRuntime_m5/src/core/os_hle_stubs.cpp	2026-11-14 21:30:42.182784612 -0500
++++ r41m/nWiiRuntime/src/core/os_hle_stubs.cpp	2026-11-15 14:01:02.808421212 -0500
+@@ -1,5 +1,8 @@
+ #include "s2.h"  // r34s2
+ #include "runtime/nwii_env.h"
++#include <cstdint>
++void vtl_note(uint32_t kind, uint32_t arg);  // r37v (gx.cpp): NWII_V_TL
++void vtl_idle_turn(bool at_end);             // r37v (gx.cpp)
+ #include "runtime/config.h"
+ #include "runtime/cpu_context.h"
+ #include "runtime/hw/hw.h"
+@@ -240,6 +243,7 @@
+ NativeStackGuard g_native_stack = {0, 0};  // R9 guestloop (cpu_context.h)
+ 
+ extern int g_ipc_interrupt_delay;
++extern std::atomic<uint32_t> g_v_dispatch_seq;  // r37v (ios.cpp)
+ 
+ // Time the CPU thread spent asleep in idle_wait (NWII_FPS=1 reports it).
+ std::atomic<uint64_t> g_idle_sleeps{0}, g_idle_sleep_us{0};
+@@ -472,7 +476,31 @@
+   }
+ }
+ 
++extern int64_t g_v_idle_ns;  // r37v (ios.cpp): NWII_V_LATE
++extern bool g_v_vi_held;
++void v_deliver_held(CPUContext &c, int why);
++static inline int64_t v_now_ns() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++struct VtlIdle {  // r37v: NWII_V_TL (tramos ociosos) y NWII_V_LATE (hora de la ultima vuelta ociosa)
++  bool on;
++  static bool late_on() {
++    static const bool v = [] { const char *e = std::getenv("NWII_V_LATE"); return e && e[0] && e[0] != '0'; }();
++    return v;
++  }
++  explicit VtlIdle(CPUContext &c) : on(&c == g_ctx_ptr) {
++    if (on) { ::vtl_idle_turn(false); if (late_on()) g_v_idle_ns = v_now_ns(); }
++  }
++  ~VtlIdle() { if (on) { ::vtl_idle_turn(true); if (late_on()) g_v_idle_ns = v_now_ns(); } }
++};
+ void idle_wait(CPUContext &ctx) {
++  VtlIdle vtl_idle_(ctx);
++  // r37v NWII_V_LATE: el juego ya espera (bucle ocioso): lanzar ahora el retrazo retenido.
++  if (__builtin_expect(g_v_vi_held, 0) && &ctx == g_ctx_ptr) {
++    v_deliver_held(ctx, 1);
++    return;
++  }
+   // R8 threads: hand the guest's gathered GX FIFO bytes to the host before
+   // the guest idles (see the write-gather buffer in gx.cpp).
+   GX_WGPIPE_Flush();
+@@ -487,6 +515,22 @@
+       g_ipc_interrupt_delay > 0 || hw::g_di_interrupt_delay > 0 ||
+       ctx.pending_cb_count.load(std::memory_order_relaxed) != 0)
+     return;
++  // r37v (frente V), NWII_V_WAKE=1: si desde la vuelta anterior del bucle ocioso se le entrego al invitado
++  // una interrupcion / DEC / callback (que puede haber despertado un hilo: el retrazo VI despierta al hilo
++  // principal), no dormir: el bucle ocioso vuelve a mirar su cola de hilos listos en la vuelta siguiente.
++  // Sin esto el hilo despertado esperaba lo que durase el sueno (hasta 2 ms) antes de correr: medido en PC,
++  // retrazo -> copia XFB 2,07 ms (con NWII_NO_IDLE_SLEEP 0,02 ms), que se comia el presupuesto del fotograma.
++  {
++    static const bool v_wake = [] {
++      const char *e = std::getenv("NWII_V_WAKE");
++      return e && e[0] && e[0] != '0';
++    }();
++    static uint32_t seen = 0;
++    if (v_wake && &ctx == g_ctx_ptr && g_v_dispatch_seq.load(std::memory_order_relaxed) != seen) {
++      seen = g_v_dispatch_seq.load(std::memory_order_relaxed);
++      return;
++    }
++  }
+   uint64_t due = EventScheduler::get().next_due();
+   if (ctx.dec_irq_pending && ctx.dec_value != 0xFFFFFFFF)
+     due = std::min<uint64_t>(due, ctx.dec_written_tb + ctx.dec_value);
+diff --color -ruN r35m4/nWiiRuntime_m5/src/core/s2.cpp r41m/nWiiRuntime/src/core/s2.cpp
+--- r35m4/nWiiRuntime_m5/src/core/s2.cpp	2026-11-15 06:18:14.238883210 -0500
++++ r41m/nWiiRuntime/src/core/s2.cpp	2026-11-15 14:01:44.214152257 -0500
+@@ -117,6 +117,82 @@
+   if (n < 40) std::printf("[S2] ASSERT: %s (0x%08x, 0x%08x)%s\n", what, a, b, t_snd ? " [hilo de sonido]" : " [hilo del juego]");
+ }
+ 
++// ---- r38c (frente C): esperas activas que ceden de verdad ----------------------------------
++// En Horizon ceder (sched_yield = svcSleepThread(-1)) solo deja correr a hilos de la MISMA prioridad. Si la
++// CPU de sonido (0x2C, nucleo 2) gira esperando S mientras el juego, con S tomado, espera un candado que tiene
++// un hilo de menos prioridad de su nucleo (el trabajador de render, 0x2D, con g_fifo_mutex), nadie avanza:
++// cuelgue de Z22. Aqui, tras un giro corto, se DUERME (svcSleepThread > 0): el nucleo pasa a los de abajo.
++// NWII_C_SPIN_OFF=1: como m5 (yield).
++bool g_spin_old = false;
++std::atomic<uint32_t> g_snd_wait{0};      // 0 nada, 1 candado S, 2 peticion al juego, 3 candado DSP, 4 siesta corta
++std::atomic<uint64_t> g_snd_wait_t0{0};   // ns
++std::atomic<uint64_t> g_game_wait_t0{0};  // el juego espera S desde (ns; 0 = no espera)
++std::atomic<uint64_t> st_backoff_sleeps{0}, st_game_wait_max_us{0}, st_snd_wait_max_us{0};
++uint32_t gs_acq_lr = 0, gs_acq_site = 0;  // juego: de donde tomo S (informativo, vigia)
++inline void sleep_us(uint32_t us) {
++#ifdef __SWITCH__
++  svcSleepThread((int64_t)us * 1000);
++#else
++  std::this_thread::sleep_for(std::chrono::microseconds(us));
++#endif
++}
++inline void backoff(uint32_t &spins) {
++  ++spins;
++  if (g_spin_old) {
++    cpu_relax();
++    if (spins > 4000) std::this_thread::yield();
++    return;
++  }
++  if (spins < 2000) { cpu_relax(); return; }
++  sleep_us(spins < 2100 ? 20 : 200);
++  st_backoff_sleeps.fetch_add(1, std::memory_order_relaxed);
++}
++inline void note_max(std::atomic<uint64_t> &m, uint64_t v) {
++  if (v > m.load(std::memory_order_relaxed)) m.store(v, std::memory_order_relaxed);
++}
++
++// ---- r38c: prioridad dinamica de la CPU de sonido ------------------------------------------
++// Base NWII_S2_PRIO (p. ej. 0x2E, por debajo del trabajador de render 0x2D); sube a NWII_C_PRIO_HI (p. ej. 0x2C) solo
++// mientras haga falta: bit 1 = va tarde (un evento de su agenda vencido hace mas de NWII_C_LATE_US), bit 2 = el juego
++// espera S y lo tiene el sonido (herencia), bit 4 = un hilo del juego va a dormir en un mutex del sonido (herencia).
++// Sin NWII_C_PRIO_HI no cambia nada (como m5).
++int g_prio_lo = 0x2C, g_prio_hi = 0;
++uint64_t g_late_boost_us = 3000;
++std::atomic<uint32_t> g_boost{0};
++std::atomic<int> g_prio_now{0};
++std::atomic<uint64_t> st_boost_n[3] = {}, st_boost_ns{0};
++std::atomic<uint64_t> g_boost_t0{0};
++#ifndef __SWITCH__
++pthread_t g_snd_pthread{};
++#endif
++void set_snd_prio(int p) {
++  if (g_prio_now.load(std::memory_order_relaxed) == p) return;
++  g_prio_now.store(p, std::memory_order_relaxed);
++#ifdef __SWITCH__
++  if (const Handle h = nx::thread_handle(nx::kThreadS2)) svcSetThreadPriority(h, p);
++#else
++  if (std::getenv("NWII_C_PCSCHED")) {
++    sched_param sp{};
++    sp.sched_priority = std::max(1, 0x3C - p);
++    pthread_setschedparam(g_snd_pthread, SCHED_FIFO, &sp);
++  }
++#endif
++}
++inline void boost(uint32_t bit) {  // cualquier hilo
++  if (!g_prio_hi) return;
++  const uint32_t old = g_boost.fetch_or(bit, std::memory_order_acq_rel);
++  if (!(old & bit)) st_boost_n[bit == 1 ? 0 : bit == 2 ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
++  if (old == 0) { g_boost_t0.store(now_ns(), std::memory_order_relaxed); set_snd_prio(g_prio_hi); }
++}
++inline void unboost(uint32_t bits) {  // solo el hilo de sonido
++  if (!g_prio_hi || !(g_boost.load(std::memory_order_relaxed) & bits)) return;
++  if ((g_boost.fetch_and(~bits, std::memory_order_acq_rel) & ~bits) != 0) return;
++  const uint64_t t0 = g_boost_t0.load(std::memory_order_relaxed);
++  set_snd_prio(g_prio_lo);
++  if (g_boost.load(std::memory_order_acquire) != 0) set_snd_prio(g_prio_hi);  // alguien la pidio entretanto
++  else if (t0) st_boost_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
++}
++
+ // ---- candado S ----------------------------------------------------------------------------
+ std::atomic<uint32_t> s_lock{0};  // 0 libre, 1 juego, 2 sonido
+ enum : uint32_t { kHoldNone = 0, kHoldSection = 1, kHoldIrq = 2 };
+@@ -266,20 +342,27 @@
+   uint32_t exp = 0;
+   if (!s_lock.compare_exchange_strong(exp, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+     const uint64_t t0 = now_ns();
++    g_game_wait_t0.store(t0, std::memory_order_relaxed);
+     uint32_t spins = 0;
+     for (;;) {
+       exp = 0;
+       if (s_lock.compare_exchange_weak(exp, 1, std::memory_order_acquire, std::memory_order_relaxed)) break;
+       if (g_check && exp == 1) { check_fail("el juego ya tenia S"); }
++      if (exp == 2 && spins == 64) boost(2);  // r38c: herencia (la CPU de sonido tiene S y puede estar expulsada)
+       if (can_service && g_req.load(std::memory_order_relaxed) == 1) service(ctx);
+       cpu_relax();
+       if (++spins > 4000) { std::this_thread::yield(); }
+     }
+-    add(st.g_wait_ns, now_ns() - t0);
++    g_game_wait_t0.store(0, std::memory_order_relaxed);
++    const uint64_t w = now_ns() - t0;
++    note_max(st_game_wait_max_us, w / 1000);
++    add(st.g_wait_ns, w);
+     add(st.g_wait_n);
+   }
+   gs.holds = kind;
+   gs.owner = owner;
++  gs_acq_lr = ctx.lr;
++  gs_acq_site = ctx.pc;
+   g_game_work.store(g_game_work.load(std::memory_order_relaxed) | 2, std::memory_order_relaxed);
+   add(kind == kHoldIrq ? st.g_irq : st.g_sec);
+ }
+@@ -323,14 +406,18 @@
+     uint32_t exp = 0;
+     if (!s_lock.compare_exchange_strong(exp, 2, std::memory_order_acquire, std::memory_order_relaxed)) {
+       const uint64_t t0 = now_ns();
++      g_snd_wait_t0.store(t0, std::memory_order_relaxed);
++      g_snd_wait.store(1, std::memory_order_relaxed);
+       uint32_t spins = 0;
+       for (;;) {
+         exp = 0;
+         if (s_lock.compare_exchange_weak(exp, 2, std::memory_order_acquire, std::memory_order_relaxed)) break;
+-        cpu_relax();
+-        if (++spins > 4000) std::this_thread::yield();
++        backoff(spins);
+       }
+-      add(st.s_wait_ns, now_ns() - t0);
++      g_snd_wait.store(0, std::memory_order_relaxed);
++      const uint64_t w = now_ns() - t0;
++      note_max(st_snd_wait_max_us, w / 1000);
++      add(st.s_wait_ns, w);
+       add(st.s_wait_n);
+     }
+     snd_holds = true;
+@@ -338,6 +425,7 @@
+   } else if (ee && snd_holds) {
+     snd_holds = false;
+     s_lock.store(0, std::memory_order_release);
++    unboost(2);
+   }
+ }
+ 
+@@ -374,6 +462,7 @@
+     const uint64_t late = now - e.due;
+     const uint64_t late_us = late * 1000000 / ctx.tb_freq;
+     if (late_us > st.late_max_us.load(std::memory_order_relaxed)) st.late_max_us.store(late_us, std::memory_order_relaxed);
++    if (late_us > g_late_boost_us) boost(1);  // r38c
+     e.cb(ctx, late);
+   }
+   // interrupciones de sonido, solo con EE = 1 (como en la consola)
+@@ -493,6 +582,8 @@
+   rq.op = op; rq.arg = arg; rq.arg2 = arg2; rq.result = 0;
+   g_req.store(1, std::memory_order_release);
+   const uint64_t t0 = now_ns();
++  g_snd_wait_t0.store(t0, std::memory_order_relaxed);
++  g_snd_wait.store(2, std::memory_order_relaxed);
+   uint32_t spins = 0;
+   for (;;) {
+     if (g_req.load(std::memory_order_acquire) == 2) break;
+@@ -515,6 +606,7 @@
+     if (snd_state.load(std::memory_order_relaxed) == kQuit) break;
+   }
+   g_req.store(0, std::memory_order_release);
++  g_snd_wait.store(0, std::memory_order_relaxed);
+   add(st.req_wait_ns, now_ns() - t0);
+   if (!(msr0 & 0x8000)) { ctx.msr = msr0; snd_ee_sync(ctx); }
+   return rq.result;
+@@ -566,6 +658,7 @@
+   if (--*d > 0) return;
+   for (size_t i = 0; i < snd_mtx.size(); ++i)
+     if (snd_mtx[i].m == m) { snd_mtx.erase(snd_mtx.begin() + i); break; }
++  if (snd_mtx.empty()) unboost(4);
+   add(st.req_unlock);
+   request(ctx, kReqUnlock, m, snd_cur_thread());
+ }
+@@ -809,10 +902,16 @@
+     const char *pe = std::getenv("NWII_S2_PRIO");
+     const int prio = pe ? (int)std::strtol(pe, nullptr, 0) : 0x2C;
+     const Result prc = svcSetThreadPriority(CUR_THREAD_HANDLE, prio);
++    g_prio_now.store(prio);
+     std::printf("[NX] S2: CPU de sonido en el nucleo %d, prioridad 0x%X%s\n", core, prio, R_SUCCEEDED(prc) ? "" : " (fallo)");
+     nx::note_thread(nx::kThreadS2);
+   }
+ #endif
++#ifndef __SWITCH__
++  g_snd_pthread = pthread_self();
++  pc_sched(5);
++  g_prio_now.store(g_prio_lo);
++#endif
+   for (;;) {
+     {
+       std::unique_lock<std::mutex> lk(snd_mx);
+@@ -841,6 +940,7 @@
+       if (snd_state.load(std::memory_order_relaxed) == kQuit) { snd_quit_release(); return; }
+       if (hb_req.load(std::memory_order_relaxed) && snd_mtx.empty() && hw::s2_dsp_quiescent() && !hw::s2_dsp_irq()) break;
+       s.note_idle();
++      unboost(snd_holds ? 1u : snd_mtx.empty() ? 7u : 3u);  // r38c: al dia (y sin S / mutex): vuelve a la base
+       snd_sleep_until(s, next_due());
+     }
+     if (snd_holds) { snd_holds = false; s_lock.store(0, std::memory_order_release); }
+@@ -848,9 +948,182 @@
+   }
+ }
+ 
++
++// ==== r38c (frente C): vigilante de cuelgues ===============================================
++// Hilo anfitrion de prioridad normal (0x2C, nucleo 0; duerme 1 s). Si ni el render (g_stat_frames) ni el juego
++// (copias XFB) avanzan en ~5 s, escribe al registro normal unas pocas lineas [VIGIA] (~2-3 KB) y hace flush:
++// estado del candado S, de la CPU de sonido (que espera y desde cuando), del candado del FIFO de GX y del DSP,
++// % de CPU de cada hilo anfitrion en el intervalo, y los hilos invitados (estado, cola en que esperan, dueno del
++// mutex). Repite cada 5 s mientras dure, como mucho 4 veces por parada y 8 en total. NWII_C_VIGIA_OFF=1 lo apaga.
++}  // namespace (anonimo)
++namespace {
++CPUContext *g_wd_ctx = nullptr;
++}  // namespace
++#ifndef __SWITCH__
++void pc_unsched_all();
++#endif
++namespace {
++inline bool guest_ok(uint32_t a) { return (a >= 0x80000000u && a < 0x817FFFF0u) || (a >= 0x90000000u && a < 0x93FFFFF0u); }
++inline uint32_t wd_rd32(uint32_t a) { return guest_ok(a) ? g_wd_ctx->mmu.read32(a) : 0xFFFFFFFFu; }
++inline uint32_t wd_rd16(uint32_t a) { return guest_ok(a) ? g_wd_ctx->mmu.read16(a) : 0xFFFFu; }
++const char *wait_name(uint32_t w) {
++  switch (w) { case 0: return "nada"; case 1: return "candado S"; case 2: return "peticion al juego"; case 3: return "candado DSP"; default: return "?"; }
++}
++void vigia_dump(int nth, double stalled_s) {
++  const uint64_t now = now_ns();
++  std::printf("[VIGIA] #%d sin progreso %.1f s (render fot %llu, copias XFB %llu)\n", nth, stalled_s,
++              (unsigned long long)c38_frames_render(), (unsigned long long)c38_frames_game());
++#ifdef __SWITCH__
++  {  // % de CPU de cada hilo en el ultimo segundo
++    static const char *const nm[] = {"main", "cpu", "ax", "aud", "gxw", "snd"};
++    static uint64_t last[6] = {}, last_t = 0;
++    const uint64_t t = armGetSystemTick();
++    char b[200]; int k = 0;
++    for (int i = 0; i < 6; ++i) {
++      const Handle h = nx::thread_handle(i);
++      u64 ticks = 0;
++      if (!h || R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, h, (u64)-1))) continue;
++      if (last_t) k += std::snprintf(b + k, sizeof b - k, " %s %.0f%%", nm[i], 100.0 * (double)(ticks - last[i]) / (double)(t - last_t));
++      last[i] = ticks;
++    }
++    last_t = t;
++    std::printf("[VIGIA] cpu%%:%s\n", b);
++  }
++#endif
++  if (g_wd_ctx) {
++    CPUContext &c = *g_wd_ctx;
++    std::printf("[VIGIA] juego: pc 0x%08x lr 0x%08x msr 0x%x hilo 0x%08x en_callback %d (prof %d) | espera S desde %.1f ms\n", c.pc, c.lr,
++                c.msr, wd_rd32(kCurThread), (int)c.in_callback, c.callback_depth,
++                g_game_wait_t0.load() ? (now - g_game_wait_t0.load()) / 1e6 : 0.0);
++  }
++  if (g_enabled) {
++    const uint64_t sw = g_snd_wait_t0.load();
++    std::printf("[VIGIA] S2: activo %d estado %u | S=%u (1 juego, 2 sonido) juego %s dueno 0x%08x tomado en pc 0x%08x lr 0x%08x | sonido S %d irq %d "
++                "fibra %s | espera %s desde %.1f ms | peticion %u (op %u arg 0x%08x) park %u | max espera S: juego %llu us, sonido %llu us | siestas %llu\n",
++                (int)g_active.load(), snd_state.load(), s_lock.load(), gs.holds == kHoldIrq ? "irq" : gs.holds == kHoldSection ? "secc" : "-", gs.owner,
++                gs_acq_site, gs_acq_lr, (int)snd_holds, in_irq, cur_fiber ? cur_fiber->name : "-", wait_name(g_snd_wait.load()),
++                g_snd_wait.load() && sw ? (now - sw) / 1e6 : 0.0, g_req.load(), rq.op, rq.arg, g_park.load(),
++                (unsigned long long)st_game_wait_max_us.load(), (unsigned long long)st_snd_wait_max_us.load(),
++                (unsigned long long)st_backoff_sleeps.load());
++    if (g_snd) std::printf("[VIGIA] S2 ctx: pc 0x%08x lr 0x%08x msr 0x%x | fibras: %s hosted %d n %d, %s hosted %d n %d | mutex del sonido %zu\n",
++                           g_snd->pc, g_snd->lr, g_snd->msr, fibers[0].name, (int)fibers[0].hosted.load(), fibers[0].n, fibers[1].name,
++                           (int)fibers[1].hosted.load(), fibers[1].n, snd_mtx.size());
++  }
++  {
++    char b[256];
++    c38_gx_state(b, sizeof b);
++    std::printf("[VIGIA] gx: %s | dsp: candado %d\n", b, (int)hw::c38_dsp_lock_busy());
++  }
++  // hilos invitados (0x800000DC, enlace +0x2FC): estado, prioridad, cola, pc/lr guardados
++  if (g_wd_ctx) {
++    uint32_t t = wd_rd32(0x800000DC);
++    std::printf("[VIGIA] hilos invitados (actual 0x%08x):", wd_rd32(kCurThread));
++    for (int i = 0; i < 20 && guest_ok(t); ++i) {
++      const uint32_t q = wd_rd32(t + kThQueue);
++      std::printf(" | 0x%08x st %u pri %u q 0x%08x", t, wd_rd16(t + kThState), wd_rd32(t + kThPrio), q);
++      if (guest_ok(q)) std::printf(" (mutex? dueno 0x%08x)", wd_rd32(q + kMtxThread));
++      std::printf(" srr0 0x%08x lr 0x%08x", wd_rd32(t + 0x198), wd_rd32(t + 0x84));
++      t = wd_rd32(t + 0x2FC);
++    }
++    std::printf("\n");
++  }
++  c38_log_flush();
++}
++void vigia_main() {
++#ifdef __SWITCH__
++  svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2C);
++#endif
++  uint64_t lr = c38_frames_render(), lg = c38_frames_game(), t_prog = now_ns();
++  int episode = 0, total = 0;
++  for (;;) {
++    sleep_us(1000000);
++    const uint64_t r = c38_frames_render(), g = c38_frames_game(), now = now_ns();
++    if (r != lr || g != lg) { lr = r; lg = g; t_prog = now; episode = 0; continue; }
++    const double st = (now - t_prog) / 1e9;
++    if (st >= 5.0 * (episode + 1) && episode < 4 && total < 8) {
++      ++episode; ++total; vigia_dump(total, st);
++#ifndef __SWITCH__
++      if (episode == 2) pc_unsched_all();  // PC con NWII_C_PCSCHED: romper un bloqueo por prioridades y ver si sigue
++#endif
++    }
++  }
++}
++}  // namespace
++void vigia_start(CPUContext *main_ctx) {
++  const char *off = NWII_ENV("NWII_C_VIGIA_OFF");
++  if (off && *off) return;
++  g_wd_ctx = main_ctx;
++  pthread_attr_t attr;
++  pthread_attr_init(&attr);
++  pthread_attr_setstacksize(&attr, 256 * 1024);
++  pthread_t th;
++  pthread_create(&th, &attr, [](void *) -> void * { vigia_main(); return nullptr; }, nullptr);
++  pthread_detach(th);
++  std::printf("[VIGIA] vigilante de cuelgues activo (5 s sin fotogramas -> volcado al registro)\n");
++}
++namespace {
+ }  // namespace
+ 
+ bool on_snd_thread() { return t_snd; }
++}  // namespace s2
++void c38_log_flush() {
++#ifdef __SWITCH__
++  nx::c38_sink_flush();
++#else
++  std::fflush(stdout);
++#endif
++}
++namespace s2 {
++void spin_backoff(uint32_t &spins) { backoff(spins); }
++#ifdef __SWITCH__
++void pc_sched(int) {}
++bool pc_set_prio(int) { return false; }
++#else
++}  // namespace s2
++}  // namespace nwii::runtime
++#include <sched.h>
++namespace nwii::runtime {
++namespace s2 {
++static bool pcs_on() { static const bool on = [] { const char *e = std::getenv("NWII_C_PCSCHED"); return e && *e && *e != '0'; }(); return on; }
++static std::mutex pcs_mx;
++static std::vector<pthread_t> pcs_threads;
++// Valvula de seguridad (vigia): todos los hilos fijados vuelven a SCHED_OTHER (sin prioridades estrictas).
++void pc_unsched_all() {
++  std::lock_guard<std::mutex> lk(pcs_mx);
++  sched_param sp{};
++  for (pthread_t t : pcs_threads) pthread_setschedparam(t, SCHED_OTHER, &sp);
++  std::printf("[C38] PCSCHED deshecho: %zu hilos vuelven a SCHED_OTHER\n", pcs_threads.size());
++}
++bool pc_set_prio(int hp) {
++  if (!pcs_on()) return false;
++  sched_param sp{};
++  sp.sched_priority = std::max(1, 0x3C - hp);  // 0x2C -> 16, 0x2D -> 15, 0x3B -> 1
++  return pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0;
++}
++void pc_sched(int slot) {
++  if (!pcs_on()) return;
++  // nucleos de la Switch 0..2 -> CPUs del PC (NWII_C_PCSCHED_CPUS, por defecto 2,3,4)
++  int cpus[3] = {2, 3, 4};
++  if (const char *e = std::getenv("NWII_C_PCSCHED_CPUS")) std::sscanf(e, "%d,%d,%d", &cpus[0], &cpus[1], &cpus[2]);
++  auto envi = [](const char *n, int d) { const char *e = std::getenv(n); return e ? (int)std::strtol(e, nullptr, 0) : d; };
++  int core = 0, prio = 0x2C;
++  switch (slot) {
++    case 0: core = 0; prio = 0x2C; break;
++    case 1: core = 1; prio = 0x3B; break;
++    case 4: core = envi("NWII_RENDER_WORKER_CORE", 2); prio = envi("NWII_RENDER_WORKER_PRIO", 0x2D); break;
++    case 5: core = envi("NWII_S2_CORE", 2); prio = envi("NWII_S2_PRIO", 0x2C); break;
++    default: return;
++  }
++  cpu_set_t cs;
++  CPU_ZERO(&cs);
++  CPU_SET(cpus[core % 3], &cs);
++  const int a = pthread_setaffinity_np(pthread_self(), sizeof cs, &cs);
++  const bool p = pc_set_prio(prio);
++  { std::lock_guard<std::mutex> lk(pcs_mx); pcs_threads.push_back(pthread_self()); }
++  std::printf("[C38] PCSCHED: hilo %d -> nucleo %d (CPU %d%s), prioridad 0x%X%s\n", slot, core, cpus[core % 3], a ? " FALLO" : "", prio,
++              p ? " (SCHED_FIFO)" : " FALLO");
++}
++#endif
+ CPUContext *snd_ctx() { return g_snd; }
+ 
+ uint64_t snd_now() { return g_snd->wall_timebase_now() - snd_slip; }
+@@ -907,6 +1180,10 @@
+ 
+ void game_irq_enter(CPUContext &ctx) {
+   if (!gs.holds) game_acquire(ctx, kHoldIrq, rd32(kCurThread), true);
++  // r38c NWII_C_STRESS_SFIFO=1 (solo pruebas): con S tomado, el juego toca el candado del FIFO de GX en cada
++  // interrupcion (como el vaciado por edad de Z22 dentro del manejador de alarmas): agranda la ventana del cuelgue.
++  static const bool s_stress = [] { const char *e = NWII_ENV("NWII_C_STRESS_SFIFO"); return e && *e && *e != '0'; }();
++  if (__builtin_expect(s_stress, 0)) c38_stress_fifo_touch();
+ }
+ void game_sync(CPUContext &ctx) { game_rules(ctx, false, false); }
+ 
+@@ -927,6 +1204,15 @@
+ }
+ 
+ void init(CPUContext *main_ctx) {
++  { const char *e = NWII_ENV("NWII_C_SPIN_OFF"); g_spin_old = e && *e; }
++  {  // r38c: prioridad dinamica (sin NWII_C_PRIO_HI: nada)
++    const char *pl = NWII_ENV("NWII_S2_PRIO"), *ph = NWII_ENV("NWII_C_PRIO_HI"), *lt = NWII_ENV("NWII_C_LATE_US");
++    g_prio_lo = pl ? (int)std::strtol(pl, nullptr, 0) : 0x2C;
++    g_prio_hi = ph ? (int)std::strtol(ph, nullptr, 0) : 0;
++    if (g_prio_hi >= g_prio_lo) g_prio_hi = 0;  // solo tiene sentido si sube
++    if (lt) g_late_boost_us = std::strtoull(lt, nullptr, 0);
++  }
++  vigia_start(main_ctx);  // r38c
+   // [r35m4 m5] S2 ENCENDIDO por defecto. Apagado: NWII_S2_OFF=1 (llega desde debug.toml; apply_env borra los
+   // "0"/"off") o NWII_S2=0 explicito (PC).
+   const char *e = NWII_ENV("NWII_S2");
+@@ -957,7 +1243,8 @@
+   pthread_t th;
+   pthread_create(&th, &attr, [](void *) -> void * { snd_thread_main(); return nullptr; }, nullptr);
+   pthread_detach(th);
+-  std::printf("[S2] sonido en otro nucleo ACTIVADO (NWII_S2=1%s)\n", g_check ? ", NWII_S2_CHECK" : "");
++  std::printf("[S2] sonido en otro nucleo ACTIVADO (NWII_S2=1%s)%s\n", g_check ? ", NWII_S2_CHECK" : "",
++              g_spin_old ? " [r38c: esperas como m5, NWII_C_SPIN_OFF]" : " [r38c: esperas que duermen]");
+ }
+ 
+ void shutdown() {
+@@ -1006,6 +1293,20 @@
+                 (unsigned long long)late, lk * k, lf * k, mw * k, self * k, rw * k / 1e6, snd * k, wk * k, gsec * k, girq * k, gw * k / 1e6, gwn * k,
+                 (unsigned long long)st.takeovers.load(), (unsigned long long)st.handbacks.load(), (unsigned long long)st.msg_drop.load(),
+                 (unsigned long long)st.traps.load(), (unsigned long long)st.checks_bad.load(), (unsigned long long)st.g_stash.load());
++  // r38c: segunda linea [C38] (subidas de prioridad, recuperacion de pasadas del DMA, esperas maximas, siestas)
++  static uint64_t q[8] = {0};
++  auto dq = [&](int i, uint64_t v) { const uint64_t r = v - q[i]; q[i] = v; return r; };
++  const uint64_t b0 = dq(0, st_boost_n[0].load()), b1 = dq(1, st_boost_n[1].load()), b2 = dq(2, st_boost_n[2].load());
++  const uint64_t bns = dq(3, st_boost_ns.load()), sl = dq(4, st_backoff_sleeps.load());
++  uint64_t cu = 0, rs = 0;
++  hw::c38_dsp_catchup_stats(&cu, &rs);
++  const uint64_t dcu = dq(5, cu), drs = dq(6, rs);
++  const size_t used = std::strlen(buf);
++  std::snprintf(buf + used, n - (int)used,
++                "\n[C38] prio base 0x%X alta 0x%X | subidas: tarde %.0f/s juego-S %.0f/s juego-mutex %.0f/s, en alta %.1f ms/s | DMA: "
++                "pasadas recuperadas %.0f/s, reinicios %.0f/s | max espera S: juego %llu us, sonido %llu us | siestas %.0f/s",
++                g_prio_lo, g_prio_hi, b0 * k, b1 * k, b2 * k, bns * k / 1e6, dcu * k, drs * k,
++                (unsigned long long)st_game_wait_max_us.exchange(0), (unsigned long long)st_snd_wait_max_us.exchange(0), sl * k);
+ }
+ 
+ }  // namespace s2
+@@ -1052,6 +1353,12 @@
+       }
+   } else if (fn == F_OSSendMessage) {
+     if (g_active.load(std::memory_order_relaxed) && fiber_of_queue(ctx.gpr[3])) do_handback(ctx);
++  } else if (fn == F_OSLockMutex && g_prio_hi && g_active.load(std::memory_order_relaxed)) {
++    // r38c: herencia: si el mutex es de un hilo que corre la CPU de sonido, el juego va a dormir esperandolo
++    const uint32_t owner = rd32(ctx.gpr[3] + kMtxThread);
++    if (owner)
++      for (Fiber &f : fibers)
++        if (owner == f.thread && f.hosted.load(std::memory_order_relaxed)) { boost(4); break; }
+   }
+   return false;
+ }
+diff --color -ruN r35m4/nWiiRuntime_m5/src/core/s2.h r41m/nWiiRuntime/src/core/s2.h
+--- r35m4/nWiiRuntime_m5/src/core/s2.h	2026-11-14 21:30:17.115283862 -0500
++++ r41m/nWiiRuntime/src/core/s2.h	2026-11-15 14:01:44.214600733 -0500
+@@ -41,6 +41,13 @@
+ uint64_t snd_schedule_at(uint64_t due, Cb cb);
+ bool snd_cancel(uint64_t id, uint64_t *due);
+ void stats_line(char *buf, int n, double dt);
++// --- r38c (frente C) ---
++void spin_backoff(uint32_t &spins);    // espera activa: gira poco y luego DUERME (cede el nucleo a los de abajo)
++void vigia_start(CPUContext *main_ctx);
++// PC: NWII_C_PCSCHED=1 imita el reparto de la Switch (nucleo fijo + SCHED_FIFO con las prioridades de Horizon:
++// mayor prioridad = numero menor). slot: 0 render, 1 juego, 4 trabajador, 5 CPU de sonido. En la Switch, nada.
++void pc_sched(int slot);
++bool pc_set_prio(int horizon_prio);  // PC: cambia la del hilo actual
+ 
+ }  // namespace s2
+ 
+@@ -50,5 +57,13 @@
+ void s2_dsp_handback();   // lo devuelve a la agenda del juego
+ int s2_dsp_irq();         // CPU de sonido: 5 (AID), 7 (DSP) o 0
+ bool s2_dsp_quiescent();  // sin eventos de correo en vuelo ni interrupciones de sonido pendientes
++bool c38_dsp_lock_busy();  // r38c: vigia
++void c38_dsp_catchup_stats(uint64_t *caught, uint64_t *resets);  // r38c: NWII_C_CATCHUP
+ }  // namespace hw
++// r38c: vigia (gx.cpp / plataforma)
++uint64_t c38_frames_render();
++uint64_t c38_frames_game();
++void c38_gx_state(char *buf, int n);
++void c38_log_flush();
++void c38_stress_fifo_touch();  // gx.cpp: toma y suelta g_fifo_mutex (solo pruebas)
+ }  // namespace nwii::runtime
+diff --color -ruN r35m4/nWiiRuntime_m5/src/hle/gx/renderer_gl.cpp r41m/nWiiRuntime/src/hle/gx/renderer_gl.cpp
+--- r35m4/nWiiRuntime_m5/src/hle/gx/renderer_gl.cpp	2026-11-15 06:18:14.236574383 -0500
++++ r41m/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-15 14:01:02.815458154 -0500
+@@ -5733,6 +5733,9 @@
+ const std::vector<uint32_t> *g_render_pack = nullptr;
+ // r36r NWII_R_PREFIX: register writes of dropped frames, run before the frame (gx.cpp).
+ const std::vector<GXCommand> *g_render_prefix = nullptr;
++// r40d NWII_D_DROPFAST: first command of the frame to render (gx.cpp; the ones
++// before it are the dropped part of the batch, whose kept writes are in the prefix).
++size_t g_render_start = 0;
+ 
+ // R14 R5, GPU XF: prefetch from the worker's entry list, without the
+ // dependent loads of the old prefetch (command -> DecodedVerts -> entry, each
+@@ -6119,7 +6122,7 @@
+     for (int pass = pre ? 0 : 1; pass < 2; ++pass) {
+     const GXCommand *const cmd0 = pass == 0 ? pre->data() : commands.data();
+     const size_t ncmd = pass == 0 ? pre->size() : commands.size();
+-    for (size_t ci = 0; ci < ncmd; ++ci) {
++    for (size_t ci = pass == 0 ? 0 : std::min(g_render_start, ncmd); ci < ncmd; ++ci) {  // r40d: start
+       const GXCommand &cmd = cmd0[ci];
+       // R14 R5: the command array is walked once, in order, 136 bytes a
+       // command (~45 000 per world-map frame, ~6 MB: the first load of each was
+diff --color -ruN r35m4/nWiiRuntime_m5/src/hle/gx.cpp r41m/nWiiRuntime/src/hle/gx.cpp
+--- r35m4/nWiiRuntime_m5/src/hle/gx.cpp	2026-11-15 06:18:14.229822228 -0500
++++ r41m/nWiiRuntime/src/hle/gx.cpp	2026-11-15 14:01:36.337212689 -0500
+@@ -8,6 +8,7 @@
+ #include <unordered_map>
+ #include <memory>
+ #include "runtime/cpu_context.h"
++#include "../core/s2.h"  // r38c: pc_sched (PC), vigia
+ 
+ namespace nwii::runtime { extern CPUContext *g_ctx_ptr; }
+ 
+@@ -57,19 +58,31 @@
+ // GXPosition/GXColor call) and took a pthread mutex for each write (2.6% of
+ // all samples, Switch-like CPU profile). The host holds the lock only to take
+ // the bytes, so a test-and-test-and-set spinlock is enough.
++// r38c: `owner` / `waiters` solo para el vigilante de cuelgues (quien lo tiene, cuantos esperan).
+ struct FifoLock {
+     std::atomic<bool> busy{false};
++    std::atomic<uint32_t> owner{0}, waiters{0};
+     void lock() {
+         for (unsigned spins = 0; busy.exchange(true, std::memory_order_acquire);) {
++            if (spins > 64) waiters.fetch_add(1, std::memory_order_relaxed);
+             while (busy.load(std::memory_order_relaxed)) {
+                 if (++spins > 64) std::this_thread::yield();
+ #if defined(__x86_64__) || defined(__i386__)
+                 else __builtin_ia32_pause();
+ #endif
+             }
++            if (spins > 64) waiters.fetch_sub(1, std::memory_order_relaxed);
+         }
++        owner.store(self_tag(), std::memory_order_relaxed);
+     }
+     void unlock() { busy.store(false, std::memory_order_release); }
++    static uint32_t self_tag() {
++#ifdef __SWITCH__
++        return threadGetCurHandle();
++#else
++        return (uint32_t)std::hash<std::thread::id>{}(std::this_thread::get_id());
++#endif
++    }
+ };
+ FifoLock g_fifo_mutex;
+ std::vector<uint8_t> g_hw_fifo;
+@@ -103,11 +116,99 @@
+     return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+ }
++// ---- r37v (frente V): NWII_V_TL=<ruta> linea de tiempo de la tuberia ----------
++// Anillo de sucesos con hora (PipeNow, ns) de todos los hilos: retrazo VI (disparo y si se
++// lanzo la interrupcion), interrupciones entregadas al invitado, tramos ociosos del hilo del
++// juego, copia XFB, trabajador listo, render toma/acaba, swap. El hilo de render vuelca los
++// nuevos cada ~2 s (PrintProf) a <ruta> en binario: registros de 16 bytes <q t, I kind, I arg>.
++// Solo diagnostico: apagado no cuesta mas que una carga y un salto por suceso.
++namespace vtl {
++struct Ev { int64_t t; uint32_t kind; uint32_t arg; };
++static constexpr uint64_t kN = 1u << 16;
++static Ev s_ring[kN];
++static std::atomic<uint64_t> s_head{0};
++static uint64_t s_tail = 0;   // hilo de render
++static FILE *s_f = nullptr;
++static const char *s_path = nullptr;
++static const char *Path() { return s_path; }
++bool g_on = false;
++static inline void NoteAt(int64_t t, uint32_t kind, uint32_t arg) {
++    const uint64_t i = s_head.fetch_add(1, std::memory_order_relaxed);
++    Ev &e = s_ring[i & (kN - 1)];
++    e.t = t; e.kind = kind; e.arg = arg;
++}
++static void Dump() {  // hilo de render
++    if (!g_on) return;
++    if (!s_f) {
++        s_f = std::fopen(Path(), "wb");
++        if (!s_f) { g_on = false; return; }
++        std::printf("[VTL] linea de tiempo -> %s\n", Path());
++    }
++    const uint64_t h = s_head.load(std::memory_order_acquire);
++    const uint64_t end = h > 64 ? h - 64 : 0;  // los ultimos pueden estar a medio escribir
++    if (end <= s_tail) return;
++    uint64_t from = s_tail;
++    if (end - from > kN - 256) from = end - (kN - 256);  // desbordado: se pierden los viejos
++    for (uint64_t i = from; i < end; ++i) std::fwrite(&s_ring[i & (kN - 1)], sizeof(Ev), 1, s_f);
++    std::fflush(s_f);
++    s_tail = end;
++}
++}  // namespace vtl
++namespace nwii::runtime {
++extern bool g_vtl_on_ios;
++extern uint64_t g_v_held_n, g_v_held_idle_n, g_v_held_to_n, g_v_held_drop_n, g_v_held_us;  // ios.cpp
++}
++// main.cpp, con el entorno ya aplicado (en la Switch, debug.toml), antes del hilo de la CPU.
++void vtl_init() {
++    const char *e = std::getenv("NWII_V_TL");
++    if (!(e && e[0] && e[0] != '0')) return;
++    vtl::s_path = e;
++    vtl::g_on = true;
++    nwii::runtime::g_vtl_on_ios = true;
++}
++// Usado desde ios.cpp / os_hle_stubs.cpp / main.cpp (declaracion extern alli).
++void vtl_note(uint32_t kind, uint32_t arg) {
++    if (__builtin_expect(vtl::g_on, 0)) vtl::NoteAt(PipeNow(), kind, arg);
++}
++// Hilo del juego, en cada vuelta de idle_wait: tramos ociosos (fin = ultima vuelta antes de
++// un hueco de mas de 300 us sin idle_wait).
++void vtl_idle_turn(bool at_end) {
++    if (__builtin_expect(!vtl::g_on, 1)) return;
++    static int64_t last = 0;
++    const int64_t t = PipeNow();
++    if (!at_end && t - last > 300000) {
++        if (last) vtl::NoteAt(last, 4, 0);  // fin de tramo ocioso
++        vtl::NoteAt(t, 3, 0);               // empieza tramo ocioso
++    }
++    last = t;
++}
+ static std::atomic<int64_t> s_pipe_xfb_last{0};
+ static std::atomic<uint64_t> s_pipe_xfb_n{0}, s_pipe_xfb_sum{0}, s_pipe_xfb_max{0};
+ static std::atomic<uint32_t> s_pipe_xfb_h[5];  // interval <=18, <=22, <=30, <=36, >36 ms
++// r37v (frente V), SOLO PRUEBAS EN PC: NWII_V_SLOWTEST=<base_us>,<azar_us>: tras cada copia XFB el hilo del
++// juego gira base + azar(0..azar) us (simula un juego lento como el de la Switch en un PC rapido).
++static bool s_v_slow_due = false;
++static NWII_NOINLINE void VSlowTest() {
++    static long base = -1, jit = 0;
++    static uint32_t rnd = 12345;
++    if (base < 0) {
++        const char *e = std::getenv("NWII_V_SLOWTEST");
++        base = 0;
++        if (e) std::sscanf(e, "%ld,%ld", &base, &jit);
++    }
++    if (base <= 0 && jit <= 0) return;
++    rnd = rnd * 1103515245u + 12345u;
++    const long us = base + (jit > 0 ? (long)((rnd >> 8) % (uint32_t)jit) : 0);
++    const auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
++    while (std::chrono::steady_clock::now() < end) {}
++}
++static std::atomic<uint64_t> s_c38_xfb{0};  // r38c: copias XFB del juego (vigia)
+ static inline void PipeNoteXfb() {  // guest thread, g_fifo_mutex held
++    s_c38_xfb.fetch_add(1, std::memory_order_relaxed);
+     const int64_t t = PipeNow();
++    static uint32_t s_vtl_xfb = 0;
++    s_v_slow_due = true;  // r37v NWII_V_SLOWTEST
++    if (__builtin_expect(vtl::g_on, 0)) vtl::NoteAt(t, 5, ++s_vtl_xfb);
+     const int64_t l = s_pipe_xfb_last.exchange(t, std::memory_order_relaxed);
+     if (!l) return;
+     const uint64_t d = (uint64_t)(t - l);
+@@ -158,6 +259,7 @@
+                             std::chrono::steady_clock::now() - t0).count();
+     s_fifo_waits.fetch_add(1, std::memory_order_relaxed);
+     s_fifo_wait_us.fetch_add(us, std::memory_order_relaxed);
++    vtl_note(10, (uint32_t)us);
+     if (wall) {
+         // Guest time stands still while it waits: the governor's clock
+         // mapping (guest = wall - slip) absorbs the wait, and the wait counts
+@@ -699,6 +801,7 @@
+ extern const std::vector<const void *> *g_render_entries;  // renderer_gl.cpp (R14 R5)
+ extern const std::vector<uint32_t> *g_render_pack;         // renderer_gl.cpp (R14 R5)
+ extern const std::vector<GXCommand> *g_render_prefix;      // renderer_gl.cpp (r36r NWII_R_PREFIX)
++extern size_t g_render_start;                              // renderer_gl.cpp (r40d NWII_D_DROPFAST)
+ }
+ static uint64_t g_ph[8], g_ph_n;
+ static std::vector<nwii::runtime::gx::GXCommand*> s_draws;
+@@ -916,6 +1019,10 @@
+     // r36r NWII_R_PREFIX: the kept register writes of the frames retracted
+     // before this one (no draws), rendered before `frame`.
+     std::vector<nwii::runtime::gx::GXCommand> pre;
++    // r40d NWII_D_DROPFAST: `frame` starts with the dropped part of its batch
++    // (draws and dead writes, never rendered; its kept writes are in `pre`):
++    // the renderer starts at frame[start].
++    size_t start = 0;
+     uint64_t seq = 0;          // R22 R7: frame number (s_prep_frames) of its frame
+     bool has_draws = false;    // R22 R7: its commands may point at retired vertices
+     bool render_frees = false; // R22 R7: no command shares a reference count with the worker
+@@ -1146,14 +1253,19 @@
+ // exactly as a drain that finds two frame ends drops the first one's draws.
+ static void RetractToPrefix(FramePacket &pkt) {
+     auto &v = pkt.frame;
++    // r40d NWII_D_DROPFAST: frame[0, start) is the dropped part of the packet's
++    // batch (its kept writes are already in pkt.pre): never looked at again.
++    const size_t b = std::min(pkt.start, v.size());
++    pkt.start = 0;
+     if (rcoal::On()) {
+-        const size_t w = rcoal::Compact(v, 0, v.size(), [&](nwii::runtime::gx::GXCommand &c) {
++        const size_t w = rcoal::Compact(v, b, v.size(), [&](nwii::runtime::gx::GXCommand &c) {
+             if (c.type == nwii::runtime::gx::GXCommandType::BPRegister && c.reg == 0x52) {
+                 if ((c.val & 0x4000) && !c.stale_copy) ++pkt.stats.dropped;
+                 c.stale_copy = true;
+             }
+         });
+         v.erase(v.begin() + w, v.end());
++        if (b) v.erase(v.begin(), v.begin() + b);  // r40d
+         pkt.draws.clear();
+         pkt.entries.clear();
+         pkt.pack.clear();
+@@ -1165,8 +1277,8 @@
+         }
+         return;
+     }
+-    size_t w = 0;
+-    for (size_t i = 0; i < v.size(); ++i) {
++    size_t w = b;  // r40d (was 0)
++    for (size_t i = b; i < v.size(); ++i) {
+         auto &c = v[i];
+         if (c.type == nwii::runtime::gx::GXCommandType::DrawPrimitive) continue;
+         if (c.type == nwii::runtime::gx::GXCommandType::BPRegister && c.reg == 0x52) {
+@@ -1177,6 +1289,7 @@
+         ++w;
+     }
+     v.erase(v.begin() + w, v.end());
++    if (b) v.erase(v.begin(), v.begin() + b);  // r40d
+     pkt.draws.clear();
+     pkt.entries.clear();
+     pkt.pack.clear();
+@@ -1188,6 +1301,192 @@
+     }
+ }
+ 
++// ---- r40d (frente D): NWII_D_DROPFAST ----------------------------------------
++// A drain whose batch holds two or more frame ends (the worker fell behind)
++// drops the frames before the last one. The old path (PrepFrame, `else` below)
++// moves EVERY command of the batch one by one into s_frame, the kept frame's
++// included, and forgets the parser's draw entries (all its draws prepared
++// again): on the Switch ~14 ms split + ~8 ms decode per prepared frame in
++// agua_pinguino and the castle party, so the next batch holds two or three
++// frame ends again (the slow regime keeps itself going).
++// NWII_D_DROPFAST=1: the dropped part [0, D) of the batch is handled as a
++// retracted packet is (RetractToPrefix): its kept register writes (no draws,
++// rcoal's dead writes removed, EFB copies stale) are APPENDED to pkt.pre, which
++// the renderer runs first, in the same order; the kept frame takes the fast path
++// (s_carry handed over whole, the parser's entries kept) and the renderer starts
++// at frame[D] (FramePacket::start, g_render_start). The dropped commands stay in
++// the frame vector, never rendered, until the packet is freed (render thread or
++// worker, as the frame); their owning pointers (DrawRaw, decoded vertices: counts
++// not atomic, shared with the display-list cache) are reset here, on the worker,
++// so the packet's render_frees still holds. One backward pass over [0, D) does
++// rcoal's marking (same rules as rcoal::Mark) and collects the kept commands;
++// only those (~15 % of the dropped part) are moved.
++namespace dfast {
++static bool On() {
++    static const bool on = [] {
++        const char *e = NWII_ENV("NWII_D_DROPFAST");
++        const bool v = e && e[0] && e[0] != '0';
++        if (v) std::printf("[D40] descarte barato en el trabajador: NWII_D_DROPFAST=1\n");
++        return v;
++    }();
++    return on;
++}
++// Counters (worker), printed by Report every ~2 s when there was a multi-end
++// batch: fast path (this) and old path (PrepFrame's `else`), for both settings.
++static uint64_t st_parts = 0, st_frames = 0, st_cmds = 0, st_kept = 0, st_ticks = 0;
++static uint64_t st_old_parts = 0, st_old_frames = 0, st_old_cmds = 0, st_old_ticks = 0;
++static std::vector<uint32_t> s_keep;
++// The dropped part v[0, D): kept writes appended to `pre`, draws disowned.
++static void DropPart(std::vector<nwii::runtime::gx::GXCommand> &v, size_t D,
++                     std::vector<nwii::runtime::gx::GXCommand> &pre, uint64_t &dropped_xfb) {
++    using nwii::runtime::gx::GXCommandType;
++    const uint64_t t0 = wprof::Tick();
++    const bool coal = rcoal::On(), check = coal && rcoal::CheckOn();
++    if (check) rcoal::s_dead.assign(D, 0);
++    s_keep.clear();
++    rcoal::NewSegment();
++    size_t draws = 0, dead = 0;
++    for (size_t i = D; i-- > 0;) {
++        auto &c = v[i];
++        if (i >= 8) __builtin_prefetch(&v[i - 8]);
++        if (c.type == GXCommandType::DrawPrimitive) {
++            ++draws;
++            if (c.raw) c.raw.reset();
++            if (c.shared_vertices) c.shared_vertices.reset();
++            continue;
++        }
++        if (coal) {
++            if (c.type == GXCommandType::BPRegister) {
++                const uint8_t reg = (uint8_t)c.reg;
++                if (rcoal::IsBarrierBP(reg)) {
++                    rcoal::NewSegment();
++                } else {
++                    const uint32_t k = rcoal::BpKey(c);
++                    if (rcoal::s_bp_stamp[k] == rcoal::s_stamp) {
++                        ++dead;
++                        if (check) rcoal::s_dead[i] = 1;
++                        continue;
++                    }
++                    rcoal::s_bp_stamp[k] = rcoal::s_stamp;
++                }
++            } else if (c.type == GXCommandType::XFRegister) {
++                const uint32_t a = c.reg, n = (uint32_t)c.payload.size();
++                if (n != 0 && a + n <= rcoal::kXfWords) {
++                    bool all = true;
++                    for (uint32_t k = 0; k < n; ++k)
++                        if (rcoal::s_xf_stamp[a + k] != rcoal::s_stamp) {
++                            all = false;
++                            rcoal::s_xf_stamp[a + k] = rcoal::s_stamp;
++                        }
++                    if (all) {
++                        ++dead;
++                        if (check) rcoal::s_dead[i] = 1;
++                        continue;
++                    }
++                }
++            }
++        }
++        s_keep.push_back((uint32_t)i);
++    }
++    if (coal) {
++        rcoal::st_dead += dead;
++        rcoal::st_draws += draws;
++        ++rcoal::st_calls;
++        rcoal::st_in += D;
++        if (check) rcoal::Check(v, 0, D, rcoal::s_dead);
++    }
++    uint64_t ends = 0;
++    pre.reserve(pre.size() + s_keep.size());
++    for (size_t j = s_keep.size(); j-- > 0;) {
++        auto &c = v[s_keep[j]];
++        if (c.type == GXCommandType::BPRegister && c.reg == 0x52) {
++            if ((c.val & 0x4000) && !c.stale_copy) ++ends;
++            c.stale_copy = true;
++        }
++        pre.push_back(std::move(c));
++    }
++    dropped_xfb += ends;
++    ++st_parts;
++    st_frames += ends;
++    st_cmds += D;
++    st_kept += s_keep.size();
++    st_ticks += wprof::Tick() - t0;
++}
++// NWII_D_DROPFAST_CHECK=1 (tests): the command list the renderer gets from the
++// fast drop (the appended part of pkt.pre, then frame[start, end]) must equal,
++// command by command, the one the old path would have built (same commands,
++// same values and payloads, same draw objects, same stale flags).
++static bool CheckOn() {
++    static const bool on = NWII_ENV("NWII_D_DROPFAST_CHECK") != nullptr;
++    return on;
++}
++static uint64_t st_chk = 0, st_chk_bad = 0, st_chk_cmds = 0;
++static std::vector<uint64_t> s_exp;
++static inline uint64_t CmdHash(const nwii::runtime::gx::GXCommand &c, bool stale) {
++    uint64_t h = (uint64_t)c.type | ((uint64_t)c.prim_type << 8) | ((uint64_t)stale << 16) |
++                 ((uint64_t)c.reg << 24) | ((uint64_t)c.length << 40);
++    h = h * 0x9E3779B97F4A7C15ull ^ c.val;
++    h = h * 0x9E3779B97F4A7C15ull ^ c.bp_raw;
++    h = h * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)c.raw.get();
++    h = h * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)c.shared_vertices.get();
++    h = h * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)c.vertices.size();
++    const size_t n = c.payload.size();
++    h = h * 0x9E3779B97F4A7C15ull ^ n;
++    for (size_t k = 0; k < n; ++k) {
++        uint32_t u;
++        std::memcpy(&u, &c.payload.data()[k], 4);
++        h = h * 0x100000001B3ull ^ u;
++    }
++    return h;
++}
++// Before DropPart: what the old path would hand the renderer from v[0, end].
++static void CheckExpect(const std::vector<nwii::runtime::gx::GXCommand> &v, size_t D, size_t end) {
++    using nwii::runtime::gx::GXCommandType;
++    const bool coal = rcoal::On();
++    if (coal) rcoal::Mark(v, 0, D);
++    s_exp.clear();
++    for (size_t i = 0; i < end; ++i) {
++        const auto &c = v[i];
++        if (i < D) {
++            if (c.type == GXCommandType::DrawPrimitive) continue;
++            if (coal && rcoal::s_dead[i]) continue;
++            s_exp.push_back(CmdHash(c, c.stale_copy || (c.type == GXCommandType::BPRegister && c.reg == 0x52)));
++        } else {
++            s_exp.push_back(CmdHash(c, c.stale_copy));
++        }
++    }
++}
++static void CheckGot(const std::vector<nwii::runtime::gx::GXCommand> &pre, size_t pre0,
++                     const std::vector<nwii::runtime::gx::GXCommand> &frame, size_t start, size_t end) {
++    size_t k = 0;
++    bool ok = (pre.size() - pre0) + (end - start) == s_exp.size();
++    for (size_t i = pre0; ok && i < pre.size(); ++i) ok = CmdHash(pre[i], pre[i].stale_copy) == s_exp[k++];
++    for (size_t i = start; ok && i < end; ++i) ok = CmdHash(frame[i], frame[i].stale_copy) == s_exp[k++];
++    ++st_chk;
++    st_chk_cmds += s_exp.size();
++    if (!ok) ++st_chk_bad;
++}
++static void Report() {
++    static auto last = std::chrono::steady_clock::now();
++    const auto now = std::chrono::steady_clock::now();
++    if (now - last < std::chrono::seconds(2)) return;
++    last = now;
++    if (CheckOn())
++        std::printf("[D40CHECK] lotes comprobados=%llu ordenes=%llu distintos=%llu\n", (unsigned long long)st_chk,
++                    (unsigned long long)st_chk_cmds, (unsigned long long)st_chk_bad);
++    if (st_parts || st_old_parts)
++        std::printf("[D40] lotes con varios finales: barato %llu (fot. tirados %llu, ordenes %llu, conservadas %llu,"
++                    " %.0f us/lote) | viejo %llu (fot. tirados %llu, ordenes %llu, %.0f us/lote)\n",
++                    (unsigned long long)st_parts, (unsigned long long)st_frames, (unsigned long long)st_cmds,
++                    (unsigned long long)st_kept, st_parts ? wprof::TickUs(st_ticks) / (double)st_parts : 0.0,
++                    (unsigned long long)st_old_parts, (unsigned long long)st_old_frames,
++                    (unsigned long long)st_old_cmds,
++                    st_old_parts ? wprof::TickUs(st_old_ticks) / (double)st_old_parts : 0.0);
++    st_parts = st_frames = st_cmds = st_kept = st_ticks = 0;
++    st_old_parts = st_old_frames = st_old_cmds = st_old_ticks = 0;
++}
++}  // namespace dfast
++
+ // The preparing half of a drain (see above). Returns the packet a frame was
+ // produced into (nullptr: none yet): the one `acquire` returns (called once a frame end is
+ // parsed; `retracted`: it hands back a packet not rendered yet, whose
+@@ -1202,6 +1501,13 @@
+     TrimBuffers();
+     {
+         std::lock_guard<FifoLock> lock(g_fifo_mutex);
++        // r38c NWII_C_STRESS_FIFO_US (solo pruebas): el trabajador retiene el candado del FIFO ese tiempo
++        // (girando) en cada llamada, para agrandar la ventana del cuelgue de Z22 y reproducirlo.
++        static const long s_c38_stress = [] { const char *e = NWII_ENV("NWII_C_STRESS_FIFO_US"); return e ? std::atol(e) : 0L; }();
++        if (__builtin_expect(s_c38_stress > 0, 0) && !apply_now) {
++            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(s_c38_stress);
++            while (std::chrono::steady_clock::now() < until) {}
++        }
+         if (!apply_now) {  // worker: still not taken by the render thread
+             s_held_frames += s_fifo_frames;
+             s_prep_pending.held += s_fifo_frames;
+@@ -1388,7 +1694,14 @@
+     auto &frame = s_frame;
+     frame.clear();
+     s_draws.clear();
+-    if (prev_frame_end < 0 && !retr_slow) {
++    // r40d NWII_D_DROPFAST: a batch with two or more frame ends also takes the
++    // fast path; its dropped part [0, fstart) goes to pkt.pre (see dfast::).
++    const bool dfast_now = prev_frame_end >= 0 && !retr_slow && RPrefixOn() && dfast::On();
++    const size_t fstart = dfast_now ? (size_t)prev_frame_end + 1 : 0;
++    if ((prev_frame_end < 0 || dfast_now) && !retr_slow) {
++        const size_t d_pre0 = pkt.pre.size();
++        if (dfast_now && dfast::CheckOn()) dfast::CheckExpect(s_carry, fstart, (size_t)last_frame_end + 1);
++        if (dfast_now) dfast::DropPart(s_carry, fstart, pkt.pre, s_prep_pending.dropped);
+         // Nothing to drop (the usual case at full speed): move only the
+         // commands after the frame end (the next frame's start) out, and
+         // take the rest as the frame without touching it.
+@@ -1400,10 +1713,12 @@
+         s_carry.erase(s_carry.begin() + last_frame_end + 1, s_carry.end());
+         frame.swap(s_carry);
+         s_carry.swap(tail);
++        if (dfast_now && dfast::CheckOn()) dfast::CheckGot(pkt.pre, d_pre0, frame, fstart, frame.size());
+         // Draw positions: the frame keeps those up to its end (same
+         // indices), the carried-over tail gets the rest, rebased.
+         size_t k = 0;
+         s_draw_entries.clear();
++        while (k < s_carry_draws.size() && s_carry_draws[k] < fstart) ++k;  // r40d: dropped draws
+         for (; k < s_carry_draws.size() && (int)s_carry_draws[k] <= last_frame_end; ++k) {
+             s_draws.push_back(&frame[s_carry_draws[k]]);
+             s_draw_entries.push_back(s_carry_ents[k]);
+@@ -1416,6 +1731,8 @@
+         s_carry_draws.resize(w);
+         s_carry_ents.resize(w);
+     } else {
++    const uint64_t old_t0 = wprof::Tick();  // r40d: cost of this path ([D40])
++    const uint64_t old_drop0 = s_prep_pending.dropped;
+     frame.reserve(pkt.frame.size() + s_carry.size());
+     // R11: a retracted packet's commands (draws already dropped) come first.
+     for (auto &c : pkt.frame) frame.push_back(std::move(c));
+@@ -1460,6 +1777,12 @@
+             s_carry_draws.push_back((uint32_t)i);
+             s_carry_ents.push_back(nwii::runtime::gx::FifoParser::kEntryUnknown);
+         }
++    if (prev_frame_end >= 0) {  // r40d: counters of the old path ([D40])
++        ++dfast::st_old_parts;
++        dfast::st_old_frames += s_prep_pending.dropped - old_drop0;
++        dfast::st_old_cmds += (uint64_t)prev_frame_end + 1;
++        dfast::st_old_ticks += wprof::Tick() - old_t0;
++    }
+     }
+ 
+     // NWII_FRAMESIG: per-frame signature (draw count + TEV colour/konst regs
+@@ -1521,9 +1844,11 @@
+     if (s_r7check) {
+         size_t k = 0;
+         bool ok = true;
+-        for (auto &c : frame)
++        for (size_t fi = fstart; fi < frame.size(); ++fi) {  // r40d: from the kept frame
++            auto &c = frame[fi];
+             if (c.type == nwii::runtime::gx::GXCommandType::DrawPrimitive)
+                 ok = ok && k < s_draws.size() && s_draws[k++] == &c;
++        }
+         ok = ok && k == s_draws.size();
+         static uint64_t checked = 0, bad = 0, nty[4], npay;
+         for (auto &c : frame) { ++nty[(int)c.type & 3]; npay += c.payload.size(); }
+@@ -1586,7 +1911,7 @@
+     s_prep_pending.draws += nd;
+     if (!wprof_split) st.mark(wprof::kDecode);
+     wprof::s_frames.fetch_add(1, std::memory_order_relaxed);
+-    wprof::s_cmds.fetch_add(s_frame.size(), std::memory_order_relaxed);
++    wprof::s_cmds.fetch_add(s_frame.size() - fstart, std::memory_order_relaxed);
+     wprof::s_draws.fetch_add(nd, std::memory_order_relaxed);
+     PH(4);
+     auto d1 = std::chrono::steady_clock::now();
+@@ -1599,6 +1924,7 @@
+     pkt.draws.swap(s_draws);
+     pkt.entries.swap(s_draw_entries);
+     pkt.pack.swap(s_draw_pack);
++    pkt.start = fstart;  // r40d
+     pkt.seq = s_prep_frames;
+     pkt.has_draws = !pkt.draws.empty();
+     // (the draws not in the todo list are display-list memo draws: never owning)
+@@ -1673,6 +1999,7 @@
+         }
+     }
+     rcoal::Report();  // r36r
++    dfast::Report();  // r40d
+     return &pkt;
+ }
+ 
+@@ -1737,6 +2064,20 @@
+                       (unsigned long long)s_pipe_r_n, ms(s_pipe_s_sum, s_pipe_s_n), s_pipe_s_max / 1e6,
+                       ms(s_pipe_l_sum, s_pipe_l_n), s_pipe_l_max / 1e6, (unsigned long long)s_pipe_l_n);
+         std::cout << b;
++        vtl::Dump();
++        {
++            // r37v NWII_V_LATE: retrazos retenidos en estos ~2 s (contadores del hilo del juego, ios.cpp)
++            static uint64_t n0 = 0, i0 = 0, t0 = 0, d0 = 0, u0 = 0;
++            const uint64_t n = nwii::runtime::g_v_held_n, i = nwii::runtime::g_v_held_idle_n,
++                           t = nwii::runtime::g_v_held_to_n, d = nwii::runtime::g_v_held_drop_n,
++                           u = nwii::runtime::g_v_held_us;
++            if (n != n0)
++                std::printf("[V] retrazos retenidos %llu (lanzados al esperar %llu, por plazo %llu, perdidos %llu),"
++                            " retencion media %.2f ms\n",
++                            (unsigned long long)(n - n0), (unsigned long long)(i - i0), (unsigned long long)(t - t0),
++                            (unsigned long long)(d - d0), (i + t > i0 + t0) ? (u - u0) / 1000.0 / (double)(i + t - i0 - t0) : 0.0);
++            n0 = n; i0 = i; t0 = t; d0 = d; u0 = u;
++        }
+         s_pipe_r_n = s_pipe_r_wait = s_pipe_r_wait_max = s_pipe_r_draw = s_pipe_r_draw_max = 0;
+         s_pipe_s_n = s_pipe_s_sum = s_pipe_s_max = s_pipe_l_n = s_pipe_l_sum = s_pipe_l_max = 0;
+     }
+@@ -1820,6 +2161,7 @@
+                 pkt.entries.size() == pkt.draws.size() ? &pkt.entries : nullptr;
+             nwii::runtime::gx::g_render_pack = &pkt.pack;
+             nwii::runtime::gx::g_render_prefix = &pkt.pre;  // r36r (empty unless NWII_R_PREFIX)
++            nwii::runtime::gx::g_render_start = pkt.start;  // r40d (0 unless NWII_D_DROPFAST)
+             // r31t (frente T), SOLO MEDIR: NWII_T_NORENDER=N dibuja 1 de cada N fotogramas
+             // (el hilo de render queda casi parado) para ver cuanto frena al hilo del juego
+             // el trabajo del render en los otros nucleos (cache L2 compartida, memoria).
+@@ -1834,6 +2176,7 @@
+             nwii::runtime::gx::g_render_entries = nullptr;
+             nwii::runtime::gx::g_render_pack = nullptr;
+             nwii::runtime::gx::g_render_prefix = nullptr;
++            nwii::runtime::gx::g_render_start = 0;
+             if (gpuprof) g_gpu_timer.end();
+             g_prof_render_cpu_us += thread_cpu_us() - rc0;
+             auto r1 = std::chrono::steady_clock::now();
+@@ -1870,6 +2213,9 @@
+ 
+ static void WorkerMain() {
+     t_on_worker = true;
++#ifndef __SWITCH__
++    nwii::runtime::s2::pc_sched(4);  // r38c: NWII_C_PCSCHED (solo PC)
++#endif
+ #ifdef __SWITCH__
+     // Homebrew gets cores 0-2: render (main) on 0, the recompiled CPU on 1,
+     // audio (AX mixer, audren output) on 2, a few % busy. One priority step
+@@ -1919,8 +2265,39 @@
+         return s_rendering == &s_pkts[0] ? &s_pkts[1] : &s_pkts[0];
+     };
+     auto last_frame = clk::now();
++#if !defined(__SWITCH__)
++    // r40d, SOLO PRUEBAS EN PC: NWII_D_SLOWWORKER=<factor>[,<us>]: tras cada llamada a PrepFrame que trabajo, el
++    // trabajador duerme (factor - 1) x lo que tardo (+ us si preparo un fotograma): un trabajador <factor> veces
++    // mas lento, como el de la Switch (nucleo 2 compartido con la CPU de sonido); asi llegan lotes con dos
++    // finales de fotograma y el coste del descarte realimenta el siguiente lote, como en la consola.
++    static const double s_d_slow_f = [] {
++        const char *e = std::getenv("NWII_D_SLOWWORKER");
++        return e ? std::atof(e) : 0.0;
++    }();
++    static const long s_d_slow_us = [] {
++        const char *e = std::getenv("NWII_D_SLOWWORKER");
++        const char *c = e ? std::strchr(e, ',') : nullptr;
++        return c ? std::atol(c + 1) : 0L;
++    }();
++#endif
+     for (;;) {
+-        if (FramePacket *fill = PrepFrame(acquire, false)) {
++#if !defined(__SWITCH__)
++        const auto d_t0 = clk::now();
++        const uint64_t d_f0 = s_prep_frames;
++        const bool d_had = s_d_slow_f > 1.0 &&
++                           (!s_parse_buf.empty() ||
++                            [] { std::lock_guard<FifoLock> lock(g_fifo_mutex); return !g_hw_fifo.empty(); }());
++#endif
++        FramePacket *fill = PrepFrame(acquire, false);
++#if !defined(__SWITCH__)
++        if (d_had) {
++            const auto el = clk::now() - d_t0;
++            std::this_thread::sleep_for(
++                std::chrono::duration_cast<std::chrono::microseconds>(el * (s_d_slow_f - 1.0)) +
++                std::chrono::microseconds(s_prep_frames != d_f0 ? s_d_slow_us : 0L));
++        }
++#endif
++        if (fill) {
+             {
+                 const int64_t t = PipeNow();
+                 const int64_t x = s_pipe_xfb_last.load(std::memory_order_relaxed);
+@@ -1933,6 +2310,8 @@
+                 }
+                 fill->t_ready = t;
+                 std::lock_guard<std::mutex> lk(s_pm);
++                if (__builtin_expect(vtl::g_on, 0))
++                    vtl::NoteAt(t, 6, (uint32_t)fill->seq | (s_ready ? 0x80000000u : 0u));
+                 s_ready = fill;
+             }
+             s_cv_main.notify_one();
+@@ -2072,7 +2451,9 @@
+         if (noskip) s_cv_worker.notify_one();  // the worker may wait for this
+         const uint64_t c0 = thread_cpu_us();
+         const int64_t t0 = PipeNow();
++        if (__builtin_expect(vtl::g_on, 0)) vtl::NoteAt(t0, 7, (uint32_t)p->seq);
+         RenderPacket(*p, true);
++        if (__builtin_expect(vtl::g_on, 0)) vtl::NoteAt(PipeNow(), 8, (uint32_t)p->seq);
+         g_prof_drain_cpu_us += thread_cpu_us() - c0;
+         {
+             // R22 R7: free the frame's commands here instead of on the worker
+@@ -2677,6 +3058,13 @@
+         }
+     }
+     if (__builtin_expect(full, 0)) FifoWaitForHost();
++    if (__builtin_expect(s_v_slow_due, 0)) {
++        s_v_slow_due = false;
++        static const bool on = std::getenv("NWII_V_SLOWTEST") != nullptr;
++        if (on) VSlowTest();
++    }
++    if (bp && __builtin_expect(vtl::g_on, 0) && (reg == 0x45 || reg == 0x47 || reg == 0x48))
++        vtl_note(12, (uint32_t)reg << 24 | (val & 0xFFFF));
+     if (bp && g_early_gx_sync) {
+         if (reg == 0x45 && (val & 0xF) == 2)
+             nwii::runtime::hw::pe_signal_finish();
+@@ -2791,3 +3179,23 @@
+ 
+ } 
+ uint64_t g_prof_decode_us_accum = 0;
++
++
++// ---- r38c (frente C): estado para el vigilante de cuelgues (s2.cpp) ----
++namespace nwii::runtime {
++uint64_t c38_frames_render() { return __atomic_load_n(&g_stat_frames, __ATOMIC_RELAXED); }
++uint64_t c38_frames_game() { return s_c38_xfb.load(std::memory_order_relaxed); }
++void c38_stress_fifo_touch() { std::lock_guard<FifoLock> lock(g_fifo_mutex); }
++void c38_gx_state(char *buf, int n) {
++    const uint32_t own = g_fifo_mutex.owner.load(std::memory_order_relaxed);
++    const char *who = "?";
++#ifdef __SWITCH__
++    static const char *const nm[] = {"main", "cpu", "ax", "aud", "gxw", "snd"};
++    for (int i = 0; i < 6; ++i)
++        if (own && own == nwii::runtime::nx::thread_handle(i)) who = nm[i];
++#endif
++    std::snprintf(buf, n, "fifo candado %d (ultimo dueno %s 0x%x, esperan %u) fot en cola %u retenidos %u bytes %zu",
++                  (int)g_fifo_mutex.busy.load(), who, own, g_fifo_mutex.waiters.load(), s_fifo_frames, s_held_frames,
++                  g_hw_fifo.size());
++}
++}  // namespace nwii::runtime
+diff --color -ruN r35m4/nWiiRuntime_m5/src/hle/ios.cpp r41m/nWiiRuntime/src/hle/ios.cpp
+--- r35m4/nWiiRuntime_m5/src/hle/ios.cpp	2026-11-15 00:31:52.262762646 -0500
++++ r41m/nWiiRuntime/src/hle/ios.cpp	2026-11-15 14:01:02.810452781 -0500
+@@ -17,6 +17,9 @@
+ #define NWII_LONGJMP(b) longjmp(b, 1)
+ #endif
+ #include "runtime/nwii_env.h"
++
++void vtl_note(uint32_t kind, uint32_t arg);  // r37v (gx.cpp): NWII_V_TL
++void vtl_idle_turn(bool at_end);             // r37v (gx.cpp)
+ #include "runtime/platform/platform.h"
+ #include "runtime/config.h"
+ #include "runtime/cpu_context.h"
+@@ -31,6 +34,7 @@
+ #include <string>
+ #include <vector>
+ #include <thread>
++#include <chrono>
+ #include "runtime/hw/hw.h"
+ #include "runtime/event_scheduler.h"
+ #include "runtime/os_thread.h"
+@@ -891,6 +895,56 @@
+ // The fast path performs exactly the side effects the full body would (DI
+ // tick, timebase read + scheduler advance, decrementer check) and enters
+ // ppc_tail at the same point, so behaviour is unchanged.
++bool g_vtl_on_ios = false;  // r37v: NWII_V_TL (vtl_init, gx.cpp)
++// r37v (NWII_V_WAKE): cuenta de entregas al invitado (interrupcion externa, DEC, callback); idle_wait
++// no duerme en la vuelta en la que ha habido una (ver os_hle_stubs.cpp).
++std::atomic<uint32_t> g_v_dispatch_seq{0};
++// r37v (frente V), NWII_V_LATE=<ms> (1..12): retrazo VI elastico. Si el retrazo llega con el hilo del juego
++// ocupado (no ha pasado por el bucle ocioso en los ultimos 300 us: aun no ha terminado su fotograma), la
++// interrupcion VI se retiene hasta que el juego entra en el bucle ocioso (idle_wait: ya espera al retrazo) o
++// hasta <ms> despues, lo que llegue antes; los retrazos siguientes siguen en su sitio (60 por segundo, el
++// reloj invitado y el audio no cambian). Un fotograma que acaba un poco tarde ya no espera al retrazo
++// siguiente entero (16,7 ms): el juego encadena y recupera en los fotogramas siguientes.
++extern CPUContext *g_ctx_ptr;  // main.cpp
++int64_t g_v_idle_ns = 0;     // ultima entrada/salida de idle_wait del hilo del juego (ns, steady_clock)
++bool g_v_vi_held = false;    // hay un retrazo retenido
++static int64_t s_v_held_ns = 0;
++uint64_t g_v_held_n = 0, g_v_held_idle_n = 0, g_v_held_to_n = 0, g_v_held_drop_n = 0, g_v_held_us = 0;
++static inline int64_t v_now_ns() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++static uint64_t v_late_ticks(const CPUContext &c) {
++  static const uint64_t t = [&c] {
++    const char *e = std::getenv("NWII_V_LATE");
++    if (!(e && e[0] && e[0] != '0')) return (uint64_t)0;
++    double ms = std::atof(e);
++    if (ms < 0.5) ms = 0.5;
++    if (ms > 12) ms = 12;
++    std::printf("[V] retrazo elastico: NWII_V_LATE=%.1f ms\n", ms);
++    return (uint64_t)(c.tb_freq * ms / 1000.0);
++  }();
++  return t;
++}
++static inline bool v_vi_ok(CPUContext &c) {
++  return (nwii::runtime::hw::pi_intmr & 0x100) && !c.in_callback && !(nwii::runtime::hw::pi_intsr & 0x100) &&
++         (c.dispatch_saved_ctx == 0 || c.mmu.read32(0x800000E4) == 0);
++}
++// why: 1 = el juego entra en el bucle ocioso, 2 = se acabo el plazo
++void v_deliver_held(CPUContext &c, int why) {
++  if (!g_v_vi_held) return;
++  g_v_vi_held = false;
++  const int64_t us = (v_now_ns() - s_v_held_ns) / 1000;
++  g_v_held_us += (uint64_t)us;
++  (why == 1 ? g_v_held_idle_n : g_v_held_to_n)++;
++  if (v_vi_ok(c)) {
++    nwii::runtime::hw::vi_trigger_interrupt();
++  } else {
++    ++g_v_held_drop_n;  // como sin retencion: un retrazo que no se puede lanzar se pierde
++  }
++  if (__builtin_expect(g_vtl_on_ios, 0)) ::vtl_note(15, (uint32_t)us | (uint32_t)why << 28);
++}
++
+ static bool g_vi_registered = false;
+ // r21s: core/force_demo.cpp (aquí ya estamos dentro de nwii::runtime)
+ extern bool g_force_demo_on;
+@@ -1170,10 +1224,33 @@
+ 
+                   
+                   
+-                  if ((nwii::runtime::hw::pi_intmr & 0x100) && !c.in_callback &&
++                  const bool vi_ok = (nwii::runtime::hw::pi_intmr & 0x100) && !c.in_callback &&
+                       !(nwii::runtime::hw::pi_intsr & 0x100) &&
+-                      (c.dispatch_saved_ctx == 0 || c.mmu.read32(0x800000E4) == 0)) {
+-                      nwii::runtime::hw::vi_trigger_interrupt();
++                      (c.dispatch_saved_ctx == 0 || c.mmu.read32(0x800000E4) == 0);
++                  if (vi_ok) {
++                      // r37v NWII_V_LATE: retener si el juego aun no ha acabado su fotograma
++                      const uint64_t late = v_late_ticks(c);
++                      if (late && &c == nwii::runtime::g_ctx_ptr && !g_v_vi_held &&
++                          v_now_ns() - g_v_idle_ns > 300000) {
++                          g_v_vi_held = true;
++                          s_v_held_ns = v_now_ns();
++                          ++g_v_held_n;
++                          nwii::runtime::EventScheduler::get().schedule_after(
++                              late, [](CPUContext &c2, uint64_t) { v_deliver_held(c2, 2); });
++                      } else {
++                          nwii::runtime::hw::vi_trigger_interrupt();
++                      }
++                  }
++                  {
++                      extern bool g_vtl_on_ios;  // r37v: NWII_V_TL (ios.cpp)
++                      if (__builtin_expect(g_vtl_on_ios, 0)) {
++                          ::vtl_note(1, (vi_ok ? 1u : 0u) | ((nwii::runtime::hw::pi_intmr & 0x100) ? 0u : 2u) |
++                                          (c.in_callback ? 4u : 0u) |
++                                          ((nwii::runtime::hw::pi_intsr & 0x100) ? 8u : 0u) |
++                                          (c.dispatch_saved_ctx != 0 ? 16u : 0u) |
++                                          (&c == nwii::runtime::s2::snd_ctx() ? 32u : 0u) |
++                                          (g_v_vi_held ? 64u : 0u));
++                      }
+                   }
+               });
+       }
+@@ -1247,7 +1324,7 @@
+           
+           ctx.lr = 0xFFFFFFFC;
+           ctx.pc = dec_handler;
+-          { if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
++          { g_v_dispatch_seq.fetch_add(1, std::memory_order_relaxed); if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
+       }
+   }
+ 
+@@ -1366,7 +1443,7 @@
+                                 << std::dec << "\n";
+               }
+ 
+-              { if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
++              { g_v_dispatch_seq.fetch_add(1, std::memory_order_relaxed); if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
+ 
+           } else {
+ 
+@@ -1388,6 +1465,9 @@
+ 
+               if (os_intr != -1) {
+                   uint32_t handler = ctx.mmu.read32(0x80003040 + os_intr * 4);
++                  if (__builtin_expect(g_vtl_on_ios, 0)) {  // r37v
++                      ::vtl_note(2, (uint32_t)os_intr | (&ctx == nwii::runtime::s2::snd_ctx() ? 0x100u : 0u));
++                  }
+ 
+                   if (handler != 0 && handler != 0xFFFFFFFF) {
+                       if (g_env_sample && os_intr == 24) {
+@@ -1448,7 +1528,7 @@
+                           ctx.pc = handler;
+                           ctx.ext_resched_pending = true;
+                           hle_lock_scheduler_for_dispatch(ctx);
+-                          { if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
++                          { g_v_dispatch_seq.fetch_add(1, std::memory_order_relaxed); if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
+                       }
+ 
+                       ctx.msr &= ~0x8000u;
+@@ -1478,7 +1558,7 @@
+                       ctx.gpr[4] = 0;
+                       ctx.lr = 0xFFFFFFFC;
+                       ctx.pc = handler;
+-                      { if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
++                      { g_v_dispatch_seq.fetch_add(1, std::memory_order_relaxed); if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
+                   } else {
+                       
+                       static uint32_t last_null_pc = 0;
+@@ -1549,7 +1629,7 @@
+ 
+     ctx.lr = 0xFFFFFFFC;
+     ctx.pc = cb.cb_addr;
+-    { if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
++    { g_v_dispatch_seq.fetch_add(1, std::memory_order_relaxed); if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
+   }
+ 
+   CPUContext::BackupState bk;
+@@ -1583,7 +1663,7 @@
+ 
+   ctx.lr = 0xFFFFFFFC;
+   ctx.pc = cb.cb_addr;
+-  { if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
++  { g_v_dispatch_seq.fetch_add(1, std::memory_order_relaxed); if (__builtin_expect(s2::g_enabled, 0)) s2::game_irq_enter(ctx); NWII_LONGJMP(ctx.exception_jmp_buf); }
+ }
+ 
+ // ---- R9 guestloop: the per-back-edge poll ---------------------------------
+diff --color -ruN r35m4/nWiiRuntime_m5/src/hw/hw_dsp.cpp r41m/nWiiRuntime/src/hw/hw_dsp.cpp
+--- r35m4/nWiiRuntime_m5/src/hw/hw_dsp.cpp	2026-11-14 22:08:42.633149169 -0500
++++ r41m/nWiiRuntime/src/hw/hw_dsp.cpp	2026-11-15 14:01:44.214733719 -0500
+@@ -63,10 +63,12 @@
+         if (on && t_dsp_depth++ == 0) {
+             bool exp = false;
+             unsigned spins = 0;
++            uint32_t spins32 = 0;  // r38c: gira poco y luego duerme (s2::spin_backoff)
+             while (!s_dsp_lock.compare_exchange_weak(exp, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+                 exp = false;
+-                if (++spins > 2000) std::this_thread::yield();
++                nwii::runtime::s2::spin_backoff(spins32);
+             }
++            (void)spins;
+         }
+     }
+     ~DspGuard() {
+@@ -377,6 +379,22 @@
+     return on;
+ }
+ 
++// r38c NWII_C_CATCHUP=<n pasadas> (CPU de sonido): si el fin de pasada se atiende tarde, la hora TEORICA se conserva
++// hasta n pasadas de retraso (antes: solo hasta 1; con mas, se reprogramaba desde ahora y se perdian ticks -> AID < 333/s
++// cuando la CPU de sonido va por debajo del trabajador de render). Las pasadas atrasadas se recuperan seguidas, pero
++// separadas al menos NWII_C_CATCHUP_GAP_US (1200: el correo DSP_YIELD de la lista anterior llega a 1 ms).
++static uint64_t s_c38_theo_next = 0;  // hora teorica (reloj de sonido) del siguiente fin de pasada; 0 = no se sigue
++static uint64_t s_c38_caught = 0, s_c38_resets = 0;
++static uint32_t c38_catchup() {
++    static const uint32_t n = [] { const char *e = NWII_ENV("NWII_C_CATCHUP"); return e ? (uint32_t)std::atoi(e) : 0u; }();
++    return n;
++}
++static uint64_t c38_gap_ticks() {
++    static const uint64_t us = [] { const char *e = NWII_ENV("NWII_C_CATCHUP_GAP_US"); return e ? (uint64_t)std::atol(e) : 1200ull; }();
++    return us * g_ctx_ptr->tb_freq / 1000000;
++}
++void c38_dsp_catchup_stats(uint64_t *caught, uint64_t *resets) { *caught = s_c38_caught; *resets = s_c38_resets; }
++
+ static void adma_start_pass() {
+     s_adma_pass_blocks = adma_control & 0x7FFF;
+     s_adma_pass_start = dsp_now();
+@@ -388,7 +406,24 @@
+     const uint32_t blocks = std::max<uint32_t>(s_adma_pass_blocks, 1);
+     uint64_t ticks = (uint64_t)blocks * 8 * g_ctx_ptr->tb_freq / kAudioRate;
+     // r34s2: en la CPU de sonido siempre desde la hora teorica (32 kHz justos, 333,3 listas/s).
+-    if ((adma_abs_on() || s_route_snd) && s_adma_late < ticks) ticks -= s_adma_late;
++    const uint32_t cn = c38_catchup();
++    if (cn && s_route_snd) {  // r38c
++        const uint64_t now = dsp_now();
++        if (s_adma_late < (uint64_t)cn * ticks) {
++            const uint64_t theo = now - s_adma_late + ticks;
++            const uint64_t gap = c38_gap_ticks();
++            const uint64_t due = std::max(theo, now + std::min(gap, ticks));
++            if (due > theo) ++s_c38_caught;
++            s_c38_theo_next = theo;
++            ticks = due - now;
++        } else {
++            if (s_c38_theo_next) ++s_c38_resets;
++            s_c38_theo_next = now + ticks;
++        }
++    } else {
++        s_c38_theo_next = 0;
++        if ((adma_abs_on() || s_route_snd) && s_adma_late < ticks) ticks -= s_adma_late;
++    }
+     s_adma_late = 0;
+     s_adma_on_snd = s_route_snd && nwii::runtime::s2::on_snd_thread();
+     s_adma_event_id = dsp_sched(ticks, adma_event_cb, false);
+@@ -398,6 +433,10 @@
+     s_adma_event_id = 0;
+     if (!(adma_control & 0x8000))
+         return;
++    if (s_c38_theo_next && s_route_snd) {  // r38c: retraso contra la hora teorica (no contra la programada)
++        const uint64_t now = dsp_now();
++        late = now > s_c38_theo_next ? now - s_c38_theo_next : 0;
++    }
+     s_adma_late = late;
+     adma_start_pass();
+     dsp_control |= 0x0008;
+@@ -431,6 +470,7 @@
+     return s_ev_pending == 0 && !s_ax_sync_pending && s_dsp_mails.empty() &&
+            (((dsp_control >> 1) & dsp_control & 0x0088) == 0);
+ }
++bool c38_dsp_lock_busy() { return s_dsp_lock.load(std::memory_order_relaxed); }  // r38c: vigia
+ bool s2_dsp_quiescent() {
+     DspGuard g;
+     return dsp_quiescent_locked();
+diff --color -ruN r35m4/nWiiRuntime_m5/src/platform/switch/switch_alloc.cpp r41m/nWiiRuntime/src/platform/switch/switch_alloc.cpp
+--- r35m4/nWiiRuntime_m5/src/platform/switch/switch_alloc.cpp	2026-11-08 17:48:03.876784029 -0500
++++ r41m/nWiiRuntime/src/platform/switch/switch_alloc.cpp	2026-11-15 14:01:36.346934702 -0500
+@@ -20,6 +20,7 @@
+ #include <malloc.h>
+ #include <new>
+ #include <atomic>
++#include <switch.h>  // r38c: svcSleepThread
+ 
+ namespace {
+ 
+@@ -65,8 +66,11 @@
+ Shared g_shared[kClasses + 1];
+ 
+ inline void shared_lock(Shared &sh) {
+-  while (sh.lock.test_and_set(std::memory_order_acquire)) {
+-  }
++  // r38c: giro puro sin ceder: si el que lo tiene es un hilo de menos prioridad del MISMO nucleo (p. ej. el
++  // trabajador de render 0x2D bajo la CPU de sonido 0x2C en el nucleo 2), en Horizon no vuelve a correr nunca.
++  // Tras un giro corto se duerme 10 us (cede el nucleo de verdad).
++  for (unsigned spins = 0; sh.lock.test_and_set(std::memory_order_acquire);)
++    if (++spins > 4096) svcSleepThread(10000);
+ }
+ inline void shared_unlock(Shared &sh) { sh.lock.clear(std::memory_order_release); }
+ 
+diff --color -ruN r35m4/nWiiRuntime_m5/src/platform/switch/switch_platform.cpp r41m/nWiiRuntime/src/platform/switch/switch_platform.cpp
+--- r35m4/nWiiRuntime_m5/src/platform/switch/switch_platform.cpp	2026-11-14 21:42:03.272932233 -0500
++++ r41m/nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-11-15 14:01:44.215039105 -0500
+@@ -749,7 +749,7 @@
+     std::printf("[NX] game %.1f fps, host loop %.1f/s, cpu %u MHz, gpu %u MHz%s%s%s\n", (frames - last_frames) / dt,
+                 host_frames / dt, cpu_hz / 1000000, gpu_hz / 1000000, gov, thr, aud);
+     if (nwii::runtime::s2::g_enabled) {  // r34s2
+-      char s2l[768];
++      char s2l[1400];  // r38c: + linea [C38]
+       nwii::runtime::s2::stats_line(s2l, sizeof s2l, dt);
+       std::printf("%s\n", s2l);
+     }
+@@ -767,6 +767,13 @@
+   }
+ }
+ 
++// r38c: el vigilante de cuelgues (s2.cpp) vuelca su informe al registro normal y lo lleva a la SD ya.
++void c38_sink_flush() {
++  if (g_log_mode != LogMode::File) return;
++  std::fflush(stdout);
++  g_out_sink.flush();
++}
++
+ void shutdown() {
+   rumble(false);
+   std::fflush(stdout);
+diff --color -ruN r35m4/nWiiRuntime_m5/src/platform/switch/switch_platform.h r41m/nWiiRuntime/src/platform/switch/switch_platform.h
+--- r35m4/nWiiRuntime_m5/src/platform/switch/switch_platform.h	2026-11-14 21:42:03.272660029 -0500
++++ r41m/nWiiRuntime/src/platform/switch/switch_platform.h	2026-11-15 14:01:36.350934807 -0500
+@@ -41,6 +41,9 @@
+ // Once per host frame: periodic log flush and (with NWII_LOG) fps/memory stats.
+ void frame_tick();
+ 
++// r38c: flush stdout + log file to the SD (hang watchdog).
++void c38_sink_flush();
++
+ // At exit: stop rumble, flush and close logs.
+ void shutdown();
+ 

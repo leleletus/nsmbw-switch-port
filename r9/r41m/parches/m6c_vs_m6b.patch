@@ -1,0 +1,223 @@
+--- nWiiRuntime_m6b/src/platform/switch/switch_platform.cpp	2026-11-15 14:01:44.215039105 -0500
++++ nWiiRuntime_m6c/src/platform/switch/switch_platform.cpp	2026-11-15 15:51:21.117050476 -0500
+@@ -14,6 +14,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <condition_variable>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -110,9 +111,41 @@
+   std::mutex m;
+   std::vector<char> buf;
+ 
++  // r41m (frente M) NWII_M_LOGBG=1: los escritores solo copian a `pend` bajo `m`; un hilo de fondo de prioridad
++  // baja (logbg_main) intercambia `pend` por `wbuf` y hace fwrite/fflush/fsync SIN `m` (con `fm`, que solo
++  // toman el hilo de fondo, el vaciado síncrono del vigía y el cierre). Sin el interruptor: como antes.
++  bool bg = false;
++  std::vector<char> pend;  // bajo m
++  std::vector<char> wbuf;  // bajo fm
++  std::mutex fm;
++  size_t pend_drop = 0;    // bajo m: bytes tirados porque el hilo de fondo no daba abasto
++  static constexpr size_t kPendMax = 8u << 20;
++  // r41m: medidas ([LOGF]): tiempo de pared de write() (espera del mutex incluida)
++  std::atomic<uint64_t> st_w_n{0}, st_w_max_ticks{0};
++
+   ssize_t write(const char *ptr, size_t len) {
++    const uint64_t t0 = armGetSystemTick();
++    struct Note {
++      LogSink &s; uint64_t t0;
++      ~Note() {
++        const uint64_t d = armGetSystemTick() - t0;
++        s.st_w_n.fetch_add(1, std::memory_order_relaxed);
++        if (d > s.st_w_max_ticks.load(std::memory_order_relaxed)) s.st_w_max_ticks.store(d, std::memory_order_relaxed);
++      }
++    } note{*this, t0};
+     std::lock_guard<std::mutex> lk(m);
+     if (failed || written >= cap) return (ssize_t)len;  // dropped, not an error
++    if (bg) {
++      const size_t n = std::min(len, cap - written);
++      if (pend.size() + n > kPendMax) { pend_drop += n; return (ssize_t)len; }
++      pend.insert(pend.end(), ptr, ptr + n);
++      written += n;
++      if (written >= cap) {
++        static const char kLim[] = "\n[NX] log size limit reached, later output dropped\n";
++        pend.insert(pend.end(), kLim, kLim + sizeof kLim - 1);
++      }
++      return (ssize_t)len;
++    }
+     if (!f) {
+       // logs/ only appears once something is logged (errors, or a debug log).
+       mkdir(path.substr(0, path.rfind('/')).c_str(), 0777);
+@@ -135,7 +168,39 @@
+     }
+     return (ssize_t)len;
+   }
++  // r41m NWII_M_LOGBG: lleva `pend` a la SD (fwrite + fflush + fsync) sin tener `m` durante la escritura.
++  // La llaman el hilo de fondo, flush() (vigía, frame_tick) y close(). Devuelve los bytes escritos.
++  size_t drain() {
++    std::lock_guard<std::mutex> lf(fm);
++    {
++      std::lock_guard<std::mutex> lk(m);
++      if (!f && failed) return 0;
++      std::swap(pend, wbuf);
++    }
++    if (wbuf.empty()) return 0;
++    if (!f) {
++      mkdir(path.substr(0, path.rfind('/')).c_str(), 0777);
++      FILE *nf = std::fopen(path.c_str(), "w");
++      if (!nf) {
++        std::lock_guard<std::mutex> lk(m);
++        failed = true;
++        wbuf.clear();
++        return 0;
++      }
++      buf.resize(256 * 1024);
++      setvbuf(nf, buf.data(), _IOFBF, buf.size());
++      std::lock_guard<std::mutex> lk(m);
++      f = nf;
++    }
++    const size_t n = wbuf.size();
++    std::fwrite(wbuf.data(), 1, n, f);
++    std::fflush(f);
++    fsync(fileno(f));
++    wbuf.clear();
++    return n;
++  }
+   void flush() {
++    if (bg) { drain(); return; }
+     std::lock_guard<std::mutex> lk(m);
+     if (!f) return;
+     std::fflush(f);
+@@ -144,6 +209,8 @@
+     fsync(fileno(f));
+   }
+   void close() {
++    if (bg) drain();
++    std::lock_guard<std::mutex> lf(fm);
+     std::lock_guard<std::mutex> lk(m);
+     if (f) std::fclose(f);
+     f = nullptr;
+@@ -154,6 +221,62 @@
+ LogSink g_out_sink{"", 64u << 20, false};  // paths set by choose_root()
+ LogSink g_err_sink{"", 1u << 20, true};
+ 
++// r41m (frente M) NWII_M_LOGBG=1: hilo de fondo del registro (prioridad 0x3B, por debajo de render 0x2C, sonido 0x2C
++// y trabajador 0x2D; núcleo ideal 2, puede usar cualquiera de los permitidos si está libre). Cada 2 s (o al avisarle
++// frame_tick) vacía g_out_sink a la SD. Medidas para [LOGF]: duración de cada vaciado y bytes.
++Thread g_logbg_thr;
++std::atomic<bool> g_logbg_on{false}, g_logbg_quit{false};
++std::mutex g_logbg_mx;
++std::condition_variable g_logbg_cv;
++bool g_logbg_kick = false;
++std::atomic<uint64_t> st_bg_n{0}, st_bg_sum_ticks{0}, st_bg_max_ticks{0}, st_bg_bytes{0};
++void logbg_main(void *) {
++  u64 allowed = 0;
++  svcGetInfo(&allowed, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
++  if (allowed & 4) svcSetThreadCoreMask(CUR_THREAD_HANDLE, 2, (u32)(allowed & 7));
++  while (!g_logbg_quit.load(std::memory_order_relaxed)) {
++    {
++      std::unique_lock<std::mutex> lk(g_logbg_mx);
++      g_logbg_cv.wait_for(lk, std::chrono::seconds(2), [] { return g_logbg_kick || g_logbg_quit.load(); });
++      g_logbg_kick = false;
++    }
++    const uint64_t t0 = armGetSystemTick();
++    const size_t n = g_out_sink.drain();
++    if (n) {
++      const uint64_t d = armGetSystemTick() - t0;
++      st_bg_n.fetch_add(1, std::memory_order_relaxed);
++      st_bg_sum_ticks.fetch_add(d, std::memory_order_relaxed);
++      st_bg_bytes.fetch_add(n, std::memory_order_relaxed);
++      if (d > st_bg_max_ticks.load(std::memory_order_relaxed)) st_bg_max_ticks.store(d, std::memory_order_relaxed);
++    }
++  }
++}
++void logbg_start() {
++  const char *e = std::getenv("NWII_M_LOGBG");
++  if (!e || !*e || e[0] == '0') return;
++  {
++    std::lock_guard<std::mutex> lk(g_out_sink.m);
++    g_out_sink.bg = true;  // antes de la primera escritura de stdout (setup_logging)
++  }
++  const Result rc = threadCreate(&g_logbg_thr, logbg_main, nullptr, nullptr, 64 * 1024, 0x3B, -2);
++  if (R_SUCCEEDED(rc) && R_SUCCEEDED(threadStart(&g_logbg_thr))) {
++    g_logbg_on = true;
++  } else {
++    std::lock_guard<std::mutex> lk(g_out_sink.m);
++    g_out_sink.bg = false;  // sin hilo: modo de siempre
++  }
++}
++void logbg_stop() {
++  if (!g_logbg_on.exchange(false)) return;
++  {
++    std::lock_guard<std::mutex> lk(g_logbg_mx);
++    g_logbg_quit = true;
++  }
++  g_logbg_cv.notify_one();
++  threadWaitForExit(&g_logbg_thr);
++  threadClose(&g_logbg_thr);
++}
++
+ ssize_t out_write(struct _reent *, void *, const char *ptr, size_t len) {
+   return g_out_sink.write(ptr, len);
+ }
+@@ -507,6 +630,7 @@
+     g_out_dotab.write_r = out_write;
+     devoptab_list[STD_OUT] = &g_out_dotab;
+     setvbuf(stdout, g_stdout_buf, _IOFBF, sizeof g_stdout_buf);
++    logbg_start();  // r41m NWII_M_LOGBG
+   } else {
+     // Quiet: stdout stays on libnx's null device, and a stream in a failed
+     // state skips all std::cout formatting (~250 call sites, some per
+@@ -758,13 +882,41 @@
+     host_frames = 0;
+     last_stat = now;
+   }
++  // r41m (frente M): medida del vaciado periódico ([LOGF], cada 5 s). Sin NWII_M_LOGBG: fflush(stdout) +
++  // g_out_sink.flush() (fwrite hasta 256 KB + fsync a la SD) en ESTE hilo (render) con el mutex del sumidero tomado.
++  // Con NWII_M_LOGBG: aquí solo fflush(stdout) (copia a memoria) y aviso al hilo de fondo.
++  static uint64_t lf_n = 0, lf_sum = 0, lf_max = 0;
++  static clk::time_point last_lf = now;
+   if (now - last_flush >= std::chrono::seconds(2)) {
+     last_flush = now;
+     if (g_log_mode == LogMode::File) {
++      const uint64_t t0 = armGetSystemTick();
+       std::fflush(stdout);
+-      g_out_sink.flush();
++      if (g_logbg_on.load(std::memory_order_relaxed)) {
++        { std::lock_guard<std::mutex> lk(g_logbg_mx); g_logbg_kick = true; }
++        g_logbg_cv.notify_one();
++      } else {
++        g_out_sink.flush();
++      }
++      const uint64_t d = armGetSystemTick() - t0;
++      ++lf_n; lf_sum += d; lf_max = std::max(lf_max, d);
+     }
+   }
++  if (g_log_mode == LogMode::File && now - last_lf >= std::chrono::seconds(5)) {
++    last_lf = now;
++    auto ms = [](uint64_t t) { return armTicksToNs(t) / 1e6; };
++    const uint64_t wn = g_out_sink.st_w_n.exchange(0), wmax = g_out_sink.st_w_max_ticks.exchange(0);
++    const uint64_t bn = st_bg_n.exchange(0), bsum = st_bg_sum_ticks.exchange(0), bmax = st_bg_max_ticks.exchange(0),
++                   bb = st_bg_bytes.exchange(0);
++    size_t drop;
++    { std::lock_guard<std::mutex> lk(g_out_sink.m); drop = g_out_sink.pend_drop; }
++    std::printf("[LOGF] %s | vaciado en render: n %llu media %.2f ms max %.2f ms | write() n %llu max %.2f ms | "
++                "fondo: n %llu media %.2f ms max %.2f ms %.0f KB | tirados %zu B\n",
++                g_logbg_on.load() ? "fondo" : "sincrono", (unsigned long long)lf_n, lf_n ? ms(lf_sum) / lf_n : 0.0,
++                ms(lf_max), (unsigned long long)wn, ms(wmax), (unsigned long long)bn, bn ? ms(bsum) / bn : 0.0, ms(bmax),
++                bb / 1024.0, drop);
++    lf_n = lf_sum = lf_max = 0;
++  }
+ }
+ 
+ // r38c: el vigilante de cuelgues (s2.cpp) vuelca su informe al registro normal y lo lleva a la SD ya.
+@@ -778,6 +930,7 @@
+   rumble(false);
+   std::fflush(stdout);
+   std::fflush(stderr);
++  logbg_stop();  // r41m NWII_M_LOGBG (close() vacía lo pendiente)
+   g_out_sink.close();
+   g_err_sink.close();
+ }

@@ -1,0 +1,965 @@
+diff -ruN '--color=never' r13/nWiiRuntime/include/runtime/res_scale.h r16res/nWiiRuntime/include/runtime/res_scale.h
+--- r13/nWiiRuntime/include/runtime/res_scale.h	1969-12-31 19:00:00.000000000 -0500
++++ r16res/nWiiRuntime/include/runtime/res_scale.h	2026-11-08 18:59:24.575793461 -0500
+@@ -0,0 +1,78 @@
++#pragma once
++// r16res: fractional internal resolution. Runtime-only header (the generated
++// game code never includes it), so it can change without a full rebuild; the
++// Config struct (config.h) keeps its int fields untouched.
++//
++// [graphics] internal_resolution / internal_resolution_handheld and the
++// NWII_INTERNAL_RES environment variable accept:
++//   "auto"            PC: the presented frame fills the window height 1:1;
++//                     Switch: "1080p" docked, "720p" handheld
++//   1 .. 4            integer scale (1 = the Wii's 640x528 EFB)
++//   "1.3636", "1.5x"  any scale from 1 to 4
++//   "720p", "1080p"   the scale at which the presented XFB (456 lines in
++//                     SMNE01) is exactly that many lines: 1:1 on the screen
++//                     (720p = 720/456 = 1.579, 1080p = 2.368)
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++namespace nwii::runtime::res {
++
++struct Spec {
++  enum Kind : unsigned char { Unset, Auto, Scale, Lines } kind = Unset;
++  float value = 0.0f;  // Scale: the scale; Lines: the target lines
++};
++
++// Parsed by Config::load (config.cpp): [0] internal_resolution,
++// [1] internal_resolution_handheld (Unset = same as [0]).
++extern Spec g_cfg[2];
++
++inline bool Parse(const char *s, Spec &out) {
++  if (!s) return false;
++  while (*s == ' ') ++s;
++  if (!*s) return false;
++  if (!std::strcmp(s, "auto")) { out = {Spec::Auto, 0.0f}; return true; }
++  char *end = nullptr;
++  const double v = std::strtod(s, &end);
++  if (end == s || !(v > 0.0)) return false;
++  if (*end == 'p' || *end == 'P') {
++    if (end[1] || v < 120.0 || v > 4320.0) return false;
++    out = {Spec::Lines, (float)v};
++    return true;
++  }
++  if (*end == 'x' || *end == 'X') ++end;
++  if (*end) return false;
++  out = {Spec::Scale, (float)std::fmin(4.0, std::fmax(1.0, v))};
++  return true;
++}
++
++inline std::string Describe(const Spec &s) {
++  char b[48];
++  switch (s.kind) {
++    case Spec::Scale: std::snprintf(b, sizeof b, "%gx", s.value); return b;
++    case Spec::Lines: std::snprintf(b, sizeof b, "%gp", s.value); return b;
++    case Spec::Auto: return "auto";
++    default: return "unset";
++  }
++}
++
++// Scale for a spec: `lines` is the height the presented frame should have
++// (auto), `xfb_lines` the guest height of the presented XFB. 1..4.
++inline float Resolve(const Spec &s, float auto_lines, int xfb_lines) {
++  if (xfb_lines <= 0) xfb_lines = 456;
++  double v = 1.0;
++  if (s.kind == Spec::Scale) v = s.value;
++  else if (s.kind == Spec::Lines) v = s.value / xfb_lines;
++  else v = auto_lines > 0.0f ? auto_lines / xfb_lines : 1.0;
++  // A scale within 0.1 % of an integer is that integer (the integer paths are
++  // the bit-exact ones); others keep 4 decimals so a window or a setting
++  // gives the same scale every frame.
++  const double r = std::round(v);
++  if (std::fabs(v - r) < 0.001 * r) v = r;
++  else v = std::round(v * 10000.0) / 10000.0;
++  return (float)std::fmin(4.0, std::fmax(1.0, v));
++}
++
++}  // namespace nwii::runtime::res
+diff -ruN '--color=never' r13/nWiiRuntime/include/runtime/texture_cache_gl.h r16res/nWiiRuntime/include/runtime/texture_cache_gl.h
+--- r13/nWiiRuntime/include/runtime/texture_cache_gl.h	2026-10-31 06:08:13.574700760 -0500
++++ r16res/nWiiRuntime/include/runtime/texture_cache_gl.h	2026-11-08 19:28:44.295430117 -0500
+@@ -86,14 +86,19 @@
+     // whose RAM range contains it (NSMBW animates tiles by copying 32x32
+     // frames into its 1024x1024 tileset). `copy_fmt` is the real EFB copy
+     // format (0-15), `stride` the destination row pitch in bytes (BP 0x4D).
+-    // Internal resolution: the GL texture is (w * scale) x (h * scale); w, h
+-    // stay the guest (texel) size the cache matches texture maps against.
+-    GLuint acquire_efb_copy(uint32_t addr, uint32_t w, uint32_t h, int scale = 1);
++    // Internal resolution: the GL texture is gl_w x gl_h (w x h when 0; about
++    // w * scale x h * scale, r16res: any scale); w, h stay the guest (texel)
++    // size the cache matches texture maps against.
++    GLuint acquire_efb_copy(uint32_t addr, uint32_t w, uint32_t h, uint32_t gl_w = 0,
++                            uint32_t gl_h = 0);
+     // Scaled copies only: a w x h texture the renderer fills with the copy
+     // downsampled to native size, right after the scaled copy. Stitching into
+     // a RAM-decoded (native-size) texture copies from it, so stitches never
+     // need a scaling blit (which would depend on the renderer's GL state).
+     GLuint efb_copy_native(uint32_t addr);
++    // r16res: the copy at `addr` has been stitched into a RAM texture (so
++    // the renderer makes the next one at native size directly).
++    bool efb_copy_stitched(uint32_t addr) const;
+     void efb_copy_done(CPUContext* ctx, uint32_t addr, uint32_t w, uint32_t h,
+                        uint32_t copy_fmt, uint32_t stride);
+ 
+@@ -144,6 +149,7 @@
+         uint32_t bytes = 0;       // encoded size in guest RAM
+         uint32_t ram_hash = 0;    // RAM content when the copy was made
+         uint64_t frame = 0;
++        mutable bool stitched = false;  // r16res: stitch_one used it
+     };
+ 
+     std::unordered_map<TextureKey, Entry, TextureKeyHash> cache;
+diff -ruN '--color=never' r13/nWiiRuntime/src/core/config.cpp r16res/nWiiRuntime/src/core/config.cpp
+--- r13/nWiiRuntime/src/core/config.cpp	2026-10-31 06:08:13.576226154 -0500
++++ r16res/nWiiRuntime/src/core/config.cpp	2026-11-08 18:59:24.577528898 -0500
+@@ -1,4 +1,5 @@
+ #include "runtime/config.h"
++#include "runtime/res_scale.h"
+ #include <toml++/toml.hpp>
+ #include <algorithm>
+ #include <string>
+@@ -12,6 +13,8 @@
+ namespace nwii {
+ namespace runtime {
+ 
++res::Spec res::g_cfg[2] = {{res::Spec::Auto, 0.0f}, {}};  // r16res (res_scale.h)
++
+ // [input.playerN] entry: a string or an array of strings.
+ static std::vector<std::string> toml_names(const toml::node &n) {
+     std::vector<std::string> out;
+@@ -160,9 +163,26 @@
+         };
+         internal_resolution = parse_scale("internal_resolution", 0);
+         internal_resolution_handheld = parse_scale("internal_resolution_handheld", -1);
+-        std::cout << "[Config] Internal resolution: "
+-                  << (internal_resolution ? std::to_string(internal_resolution) + "x"
+-                                          : std::string("auto"))
++        // r16res: the same keys as a fractional spec (res_scale.h): "auto",
++        // 1..4, "1.3636", "720p"... (the int fields above stay for the
++        // generated code's view of Config; the renderer uses these).
++        for (int k = 0; k < 2; ++k) {
++            const char *key = k ? "internal_resolution_handheld" : "internal_resolution";
++            auto node = tbl["graphics"][key];
++            res::Spec sp;
++            bool ok = true;
++            if (auto n = node.value<double>()) ok = res::Parse(std::to_string(*n).c_str(), sp);
++            else if (auto str = node.value<std::string>()) ok = res::Parse(str->c_str(), sp);
++            if (!ok) {
++                std::cout << "[Config] " << key << ": not understood, using auto" << std::endl;
++                sp = {res::Spec::Auto, 0.0f};
++            }
++            if (!k && sp.kind == res::Spec::Unset) sp = {res::Spec::Auto, 0.0f};
++            res::g_cfg[k] = sp;
++        }
++        std::cout << "[Config] Internal resolution: " << res::Describe(res::g_cfg[0])
++                  << (res::g_cfg[1].kind != res::Spec::Unset
++                          ? " (handheld " + res::Describe(res::g_cfg[1]) + ")" : std::string())
+                   << std::endl;
+ 
+         auto gid = tbl["game"]["id"].value<std::string>();
+diff -ruN '--color=never' r13/nWiiRuntime/src/core/main.cpp r16res/nWiiRuntime/src/core/main.cpp
+--- r13/nWiiRuntime/src/core/main.cpp	2026-11-08 13:20:49.850719849 -0500
++++ r16res/nWiiRuntime/src/core/main.cpp	2026-11-08 18:59:50.334260944 -0500
+@@ -10,6 +10,7 @@
+ #include "runtime/config.h"
+ #include "runtime/cpu_context.h"
+ #include "runtime/virtual_disc.h"
++#include "runtime/res_scale.h"
+ #include <algorithm>
+ #include <atomic>
+ #include <cctype>
+@@ -106,59 +107,64 @@
+ std::string CaptureSave(int kind, unsigned fbo, int x0, int y0, int x1, int y1);
+ }
+ 
+-// Internal resolution (renderer_gl.cpp): EFB storage at 640s x 528s.
+-void GX_CreateEfb(int scale, unsigned *fbo, unsigned *tex);
+-bool GX_ResizeEfb(int scale, unsigned *tex);
+-int GX_GetEfbScale();
++// Internal resolution (renderer_gl.cpp): EFB storage at 640s x 528s, s a
++// float (r16res: fractional scales; GL sizes from GX_GetEfbSize).
++void GX_CreateEfb(float scale, unsigned *fbo, unsigned *tex);
++bool GX_ResizeEfb(float scale, unsigned *tex);
++float GX_GetEfbScale();
++void GX_GetEfbSize(int *w, int *h);
++int GX_GetXfbLines();
+ void GX_PresentBlit(unsigned src, int sx0, int sy0, int sx1, int sy1, int dx0,
+                     int dy0, int dx1, int dy1);
+ 
+-// The internal resolution wanted right now. [graphics] internal_resolution =
+-// "auto" | 1..4; NWII_INTERNAL_RES=auto|1..4 overrides it (tests).
+-//   PC, auto: the smallest scale whose 528*s EFB covers the height the 16:9
+-//     frame takes in the window (1 up to 528 lines, 2 up to 1056: 720p,
+-//     3 up to 1584: 1080p/1440p, 4 above: 4K), so it follows window resizes.
+-//   Switch, auto: 2 docked (1920x1080 output) and 1 handheld (1280x720
+-//     screen; R8: 1x until 2x is measured on hardware, the handheld GPU runs
+-//     at 307-384 MHz); [graphics] internal_resolution_handheld sets the
+-//     undocked scale separately. Re-evaluated every host frame: docking and
+-//     undocking change it at run time (appletGetOperationMode is libnx's
+-//     cached value, updated by appletMainLoop).
+-static int DesiredInternalScale(SDL_Window *win) {
+-  const auto &cfg = nwii::runtime::Config::get();
+-  static const int env = [] {
++// The internal resolution wanted right now (r16res: a float scale, see
++// runtime/res_scale.h). [graphics] internal_resolution = "auto" | 1..4 |
++// "1.3636" | "720p" ...; NWII_INTERNAL_RES (same syntax) overrides it (tests).
++//   PC, auto: the scale at which the presented 16:9 frame (the game's XFB,
++//     456 lines) is exactly as tall as its place in the window, so the
++//     present blit is 1:1 vertically; it follows window resizes.
++//   Switch, auto: "1080p" docked (1920x1080 output) and "720p" handheld
++//     (1280x720 screen): 1:1 present on both. [graphics]
++//     internal_resolution_handheld sets the undocked scale separately.
++//     Re-evaluated every host frame: docking and undocking change it at run
++//     time (appletGetOperationMode is libnx's cached value, updated by
++//     appletMainLoop).
++static float DesiredInternalScale(SDL_Window *win) {
++  namespace res = nwii::runtime::res;
++  static const res::Spec env = [] {
++    res::Spec sp;
+     const char *e = std::getenv("NWII_INTERNAL_RES");
+-    if (!e || !*e) return -1;
+-    if (e[0] >= '1' && e[0] <= '4' && !e[1]) return e[0] - '0';
+-    return 0;  // "auto" (or anything else)
++    if (e && *e && !res::Parse(e, sp)) sp = {res::Spec::Auto, 0.0f};
++    return sp;
+   }();
+-  int want = env >= 0 ? env : cfg.internal_resolution;
+   // NWII_INTERNAL_RES_CYCLE=<n> (tests): 1x, 2x, 3x, 2x, 1x... changing every
+-  // n rendered frames, to exercise the run-time resize (Switch docking).
++  // n rendered frames, to exercise the run-time resize (Switch docking);
++  // NWII_INTERNAL_RES_CYCLE_FRAC=1: 1x, 1.3636x, 2x, 1.5789x instead.
+   static const long cycle = [] {
+     const char *e = std::getenv("NWII_INTERNAL_RES_CYCLE");
+     return e ? std::atol(e) : 0L;
+   }();
+   if (cycle > 0) {
+     extern uint64_t g_stat_frames;
+-    static const int seq[4] = {1, 2, 3, 2};
+-    return seq[(g_stat_frames / (uint64_t)cycle) % 4];
++    static const bool frac = std::getenv("NWII_INTERNAL_RES_CYCLE_FRAC") != nullptr;
++    static const float seq[2][4] = {{1, 2, 3, 2}, {1, 1.3636f, 2, 1.5789f}};
++    return seq[frac][(g_stat_frames / (uint64_t)cycle) % 4];
+   }
++  res::Spec want = env.kind != res::Spec::Unset ? env : res::g_cfg[0];
++  float auto_lines = 0.0f;
+ #ifdef __SWITCH__
+   (void)win;
+   const bool docked = appletGetOperationMode() == AppletOperationMode_Console;
+-  if (!docked && env < 0 && cfg.internal_resolution_handheld >= 0)
+-    want = cfg.internal_resolution_handheld;
+-  if (want <= 0) want = docked ? 2 : 1;
++  if (!docked && env.kind == res::Spec::Unset && res::g_cfg[1].kind != res::Spec::Unset)
++    want = res::g_cfg[1];
++  auto_lines = docked ? 1080.0f : 720.0f;
+ #else
+-  if (want <= 0) {
+-    int w = 0, h = 0;
+-    if (win) SDL_GL_GetDrawableSize(win, &w, &h);
+-    const int fh = std::min(h, (int)(w * 9LL / 16));  // 16:9 frame height
+-    want = fh <= 0 ? 1 : (fh + 527) / 528;
+-  }
++  int w = 0, h = 0;
++  if (win) SDL_GL_GetDrawableSize(win, &w, &h);
++  auto_lines = (float)std::min(h, (int)(w * 9LL / 16));  // 16:9 frame height
+ #endif
+-  return want < 1 ? 1 : want > 4 ? 4 : want;
++  if (want.kind == res::Spec::Unset) want = {res::Spec::Auto, 0.0f};
++  return res::Resolve(want, auto_lines, GX_GetXfbLines());
+ }
+ 
+ namespace nwii::runtime::gx { void DrawPerfOverlay(); }  // renderer_gl.cpp (r10)
+@@ -325,9 +331,12 @@
+     // GX EFB is 640x528; with an internal resolution s the GL EFB is
+     // 640s x 528s (renderer_gl.cpp GX_CreateEfb, RGBA8 + 24-bit depth).
+     GX_CreateEfb(DesiredInternalScale(window), &efb_fbo, &efb_tex);
+-    std::cout << "[GL] internal resolution " << GX_GetEfbScale() << "x (EFB "
+-              << 640 * GX_GetEfbScale() << "x" << 528 * GX_GetEfbScale() << ")"
+-              << std::endl;
++    {
++      int ew = 0, eh = 0;
++      GX_GetEfbSize(&ew, &eh);
++      std::cout << "[GL] internal resolution " << GX_GetEfbScale() << "x (EFB " << ew
++                << "x" << eh << ")" << std::endl;
++    }
+     {
+       
+       GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+@@ -794,7 +803,7 @@
+       // ProcessGXFifo issues GL calls only when it renders, so the target
+       // set here holds for every drain below.
+       glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
+-      glViewport(0, 0, 640 * GX_GetEfbScale(), 528 * GX_GetEfbScale());
++      { int ew, eh; GX_GetEfbSize(&ew, &eh); glViewport(0, 0, ew, eh); }
+       bool drained_empty = false;
+       for (;;) {
+         const auto t = clk::now();
+@@ -957,8 +966,9 @@
+         // dock state (Switch): a change that holds for 30 host frames
+         // (~0.5 s; window drags do not reallocate every frame) re-sizes the
+         // EFB here, between two renders.
+-        static int pending_scale = 0, pending_frames = 0;
+-        const int want = DesiredInternalScale(window);
++        static float pending_scale = 0;
++        static int pending_frames = 0;
++        const float want = DesiredInternalScale(window);
+         if (want == GX_GetEfbScale()) {
+           pending_frames = 0;
+         } else {
+@@ -969,7 +979,7 @@
+           }
+         }
+         glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
+-        glViewport(0, 0, 640 * GX_GetEfbScale(), 528 * GX_GetEfbScale());
++        { int ew, eh; GX_GetEfbSize(&ew, &eh); glViewport(0, 0, ew, eh); }
+       }
+ 
+       extern void GX_GetXfb(uint32_t*, unsigned*, unsigned*, unsigned*);
+diff -ruN '--color=never' r13/nWiiRuntime/src/hle/gx/renderer_gl.cpp r16res/nWiiRuntime/src/hle/gx/renderer_gl.cpp
+--- r13/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-08 13:54:53.995221226 -0500
++++ r16res/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-08 19:28:53.380716031 -0500
+@@ -1794,7 +1794,43 @@
+ // EFB copies to textures are made at the scaled size, the XFB copy too.
+ // s = 1 is the console's EFB, bit for bit the renderer before scaling.
+ // Changed only between frames (GX_ResizeEfb).
+-static int s_scale = 1;
++//
++// r16res: s may be fractional (1.3636, 1.5789 = "720p" ...). Rule: GX
++// coordinates map to scaled ones as X = s * x (geometry, through a float
++// viewport), and scaled pixel p (centre p + 0.5) belongs to native pixel
++// floor((p + 0.5) / s). Every GX rectangle edge x (scissor, clears, copy
++// sources, the XFB) becomes SE(x), the first scaled pixel whose centre is at
++// or past s * x: rectangles that share an edge share it exactly (no seams or
++// overlaps), and they cover the same pixels the rasterizer gives geometry
++// with that edge. For integer s, SE(x) = x * s and the float viewport is not
++// used: integer scales are bit for bit what they were.
++static float s_scale = 1.0f;
++static int s_iscale = 1;  // s when it is an integer, else 0
++static int s_efb_w = kEfbWidth, s_efb_h = kEfbHeight;  // GL size of the EFB
++static inline int SE(int x) {
++  return s_iscale ? x * s_iscale : (int)std::ceil(x * (double)s_scale - 0.5);
++}
++static void SetScale(float s) {
++  s_scale = s;
++  s_iscale = s == std::round(s) ? (int)std::round(s) : 0;
++  s_efb_w = SE(kEfbWidth);
++  s_efb_h = SE(kEfbHeight);
++}
++// glViewportIndexedf (GL 4.1 / ARB_viewport_array; glad here is 3.3): the
++// subpixel viewport of fractional scales. Null: viewports are rounded edge
++// by edge instead.
++typedef void (APIENTRYP PFNViewportIndexedf)(GLuint, GLfloat, GLfloat, GLfloat, GLfloat);
++static PFNViewportIndexedf s_viewport_f = nullptr;
++static float s_vpf[4];
++static inline void CViewportF(float x, float y, float w, float h) {
++  constexpr GLint kFloatVp = -0x7FFFFFF0;  // g_gl.vp[0] while a float viewport is set
++  if (g_gl.vp[0] != kFloatVp || s_vpf[0] != x || s_vpf[1] != y || s_vpf[2] != w ||
++      s_vpf[3] != h) {
++    s_viewport_f(0, x, y, w, h);
++    g_gl.vp[0] = kFloatVp;
++    s_vpf[0] = x; s_vpf[1] = y; s_vpf[2] = w; s_vpf[3] = h;
++  }
++}
+ 
+ // BP 0x59: scissor/viewport offset in 2-pixel units, biased by 342 like the
+ // rectangles it offsets. Unset (0) means no offset.
+@@ -1811,7 +1847,7 @@
+   std::memcpy(vp, &g_state.xf[0x1A], sizeof(vp));
+   float w = 2.0f * vp[0], h = -2.0f * vp[1];
+   if (!(w > 0.0f && h > 0.0f)) {
+-    CViewport(0, 0, kEfbWidth * s_scale, kEfbHeight * s_scale);
++    CViewport(0, 0, s_efb_w, s_efb_h);
+     CDepthRange(0.0, 1.0);
+     return;
+   }
+@@ -1844,8 +1880,19 @@
+   ScissorOffset(ox, oy);
+   float left = vp[3] - vp[0] - 342.0f - ox;
+   float top = vp[4] + vp[1] - 342.0f - oy;
++  if (!s_iscale) {  // r16res: fractional scale
++    const double s = s_scale, x0 = s * left, x1 = s * (left + w);
++    const double y0 = s_efb_h - s * (top + h), y1 = s_efb_h - s * top;  // GL rows
++    if (s_viewport_f) {
++      CViewportF((float)x0, (float)y0, (float)(x1 - x0), (float)(y1 - y0));
++    } else {
++      const GLint ix = (GLint)std::lround(x0), iy = (GLint)std::lround(y0);
++      CViewport(ix, iy, (GLsizei)std::lround(x1) - ix, (GLsizei)std::lround(y1) - iy);
++    }
++    return;
++  }
+   // Scaled in float before rounding (x 1.0f is exact: native is unchanged).
+-  const float fs = (float)s_scale;
++  const float fs = (float)s_iscale;
+   CViewport((GLint)std::lround(left * fs),
+             (GLint)std::lround((kEfbHeight - (top + h)) * fs),
+             (GLsizei)std::lround(w * fs), (GLsizei)std::lround(h * fs));
+@@ -1873,8 +1920,7 @@
+     return;
+   }
+   CEnable(kEnScissor, GL_SCISSOR_TEST, true);
+-  const int sc = s_scale;
+-  CScissor(x0 * sc, (kEfbHeight - y1) * sc, (x1 - x0) * sc, (y1 - y0) * sc);
++  CScissor(SE(x0), s_efb_h - SE(y1), SE(x1) - SE(x0), SE(y1) - SE(y0));
+ }
+ 
+ // TX_SETMODE0 (BP 0x80-0x83 for maps 0-3, 0xA0-0xA3 for 4-7): wrap S in bits
+@@ -1921,7 +1967,9 @@
+   if (w <= 0 || h <= 0 || w > 1024 || h > 1024)
+     return;
+   const GLuint efb = s_efb_fbo;
+-  const int sc = s_scale, pw = w * sc, ph = h * sc;
++  // Scaled source rectangle (r16res: SE edges, so fractional scales too).
++  const int sx = SE(g_state.efbSrcX), sy = s_efb_h - SE(g_state.efbSrcY + h);
++  const int pw = SE(g_state.efbSrcX + w) - sx, ph = s_efb_h - SE(g_state.efbSrcY) - sy;
+   // 1024x1024 as always at native scale; grown when a scaled copy needs more.
+   if (!s_xfb_fbo || pw > s_xfb_cap_w || ph > s_xfb_cap_h) {
+     const bool first = !s_xfb_fbo;
+@@ -1937,7 +1985,6 @@
+                            s_xfb_tex, 0);
+   }
+   glDisable(GL_SCISSOR_TEST);
+-  int sx = g_state.efbSrcX * sc, sy = (kEfbHeight - (g_state.efbSrcY + h)) * sc;
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, efb);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_xfb_fbo);
+   glBlitFramebuffer(sx, sy, sx + pw, sy + ph, 0, 0, pw, ph, GL_COLOR_BUFFER_BIT,
+@@ -2066,8 +2113,9 @@
+   }
+   int w = g_state.efbW, h = g_state.efbH;
+   glEnable(GL_SCISSOR_TEST);
+-  glScissor(g_state.efbSrcX * s_scale, (kEfbHeight - (g_state.efbSrcY + h)) * s_scale,
+-            w * s_scale, h * s_scale);
++  glScissor(SE(g_state.efbSrcX), s_efb_h - SE(g_state.efbSrcY + h),
++            SE(g_state.efbSrcX + w) - SE(g_state.efbSrcX),
++            SE(g_state.efbSrcY + h) - SE(g_state.efbSrcY));
+   glClearColor(cc[0] / 255.f, cc[1] / 255.f, cc[2] / 255.f, cc[3] / 255.f);
+   glClearDepth((g_state.bp[0x51] & 0xFFFFFF) / 16777215.0);
+   glColorMask(c, c, c, a);
+@@ -2114,7 +2162,7 @@
+ // row 0 is the top GX row of the source rectangle.
+ static GLuint s_copy_prog = 0, s_copy_vao = 0, s_copy_fbo = 0;
+ static GLint s_cp_src = -1, s_cp_half = -1, s_cp_fmt = -1, s_cp_int = -1,
+-             s_cp_alpha = -1, s_cp_efb = -1;
++             s_cp_alpha = -1, s_cp_efb = -1, s_cp_down = -1;
+ 
+ static void InitCopyShader() {
+   if (s_copy_prog)
+@@ -2130,16 +2178,29 @@
+       "uniform sampler2D uEfb;\n"
+       "uniform ivec3 uSrc;   // x, top GX row, EFB height\n"
+       "uniform int uHalf, uFmt, uIntensity, uHasAlpha;\n"
++      "uniform float uDown;  // r16res: >0 = native-size copy from an EFB at this scale\n"
+       "out vec4 o;\n"
+       "vec4 fetch(int x, int gy) {\n"
+       "  vec4 c = texelFetch(uEfb, ivec2(x, uSrc.z - 1 - gy), 0);\n"
+       "  if (uHasAlpha == 0) c.a = 1.0;\n"
+       "  return c;\n"
+       "}\n"
++      "int SE(int x) { return int(ceil(float(x) * uDown - 0.5)); }\n"
+       "void main() {\n"
+       "  ivec2 d = ivec2(gl_FragCoord.xy);\n"
+       "  vec4 c;\n"
+-      "  if (uHalf != 0) {\n"
++      "  if (uDown > 0.0) {\n"
++      "    // uSrc.xy native: average the scaled pixels of the 1 (2x2 if half)\n"
++      "    // native source pixels of this texel (renderer_gl.cpp SE rule).\n"
++      "    int n = uHalf != 0 ? 2 : 1;\n"
++      "    int gx = uSrc.x + n * d.x, gy = uSrc.y + n * d.y;\n"
++      "    int x0 = SE(gx), x1 = max(SE(gx + n), x0 + 1);\n"
++      "    int y0 = SE(gy), y1 = max(SE(gy + n), y0 + 1);\n"
++      "    c = vec4(0.0);\n"
++      "    for (int y = y0; y < y1; ++y)\n"
++      "      for (int x = x0; x < x1; ++x) c += fetch(x, y);\n"
++      "    c /= float((x1 - x0) * (y1 - y0));\n"
++      "  } else if (uHalf != 0) {\n"
+       "    int x = uSrc.x + 2 * d.x, y = uSrc.y + 2 * d.y;\n"
+       "    c = 0.25 * (fetch(x, y) + fetch(x + 1, y) + fetch(x, y + 1) + fetch(x + 1, y + 1));\n"
+       "  } else {\n"
+@@ -2174,6 +2235,7 @@
+   s_cp_int = glGetUniformLocation(s_copy_prog, "uIntensity");
+   s_cp_alpha = glGetUniformLocation(s_copy_prog, "uHasAlpha");
+   s_cp_efb = glGetUniformLocation(s_copy_prog, "uEfb");
++  s_cp_down = glGetUniformLocation(s_copy_prog, "uDown");
+   glGenVertexArrays(1, &s_copy_vao);
+   glGenFramebuffers(1, &s_copy_fbo);
+ }
+@@ -2209,9 +2271,28 @@
+   // scaled source rectangle (the shader's half-scale box filter and format
+   // conversion work per GL pixel, unchanged); the texture cache keeps dw x dh
+   // as the copy's guest size.
+-  const int sc = s_scale;
+-  const uint32_t pw = dw * (uint32_t)sc, ph = dh * (uint32_t)sc;
+-  GLuint tex = nwii::runtime::hle::TextureCache::get().acquire_efb_copy(dest, dw, dh, sc);
++  // r16res: at a fractional scale the copy is the source rectangle's scaled
++  // pixels 1:1 (SE edges), halved (floor) for half-scale copies.
++  // Copies the texture cache stitched into a RAM texture before (animated
++  // tiles: ~20 32x32 copies a frame in the title demo) are only ever used at
++  // native size: at any scale above 1 they are made native directly (one
++  // box-filter pass) instead of scaled + a downsample blit.
++  const int sx0 = SE(g_state.efbSrcX), sy0 = SE(g_state.efbSrcY);
++  const bool down = s_scale != 1.0f &&
++                    nwii::runtime::hle::TextureCache::get().efb_copy_stitched(dest);
++  uint32_t pw, ph;
++  if (down) {
++    pw = dw;
++    ph = dh;
++  } else if (s_iscale) {
++    pw = dw * (uint32_t)s_iscale;
++    ph = dh * (uint32_t)s_iscale;
++  } else {
++    pw = (uint32_t)(SE(g_state.efbSrcX + (int)w) - sx0);
++    ph = (uint32_t)(SE(g_state.efbSrcY + (int)h) - sy0);
++    if (half) { pw = std::max<uint32_t>(1, pw / 2); ph = std::max<uint32_t>(1, ph / 2); }
++  }
++  GLuint tex = nwii::runtime::hle::TextureCache::get().acquire_efb_copy(dest, dw, dh, pw, ph);
+   InitCopyShader();
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_copy_fbo);
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+@@ -2224,7 +2305,9 @@
+   glDisable(GL_COLOR_LOGIC_OP);
+   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+   glUseProgram(s_copy_prog);
+-  glUniform3i(s_cp_src, g_state.efbSrcX * sc, g_state.efbSrcY * sc, kEfbHeight * sc);
++  if (down) glUniform3i(s_cp_src, g_state.efbSrcX, g_state.efbSrcY, s_efb_h);
++  else glUniform3i(s_cp_src, sx0, sy0, s_efb_h);
++  glUniform1f(s_cp_down, down ? s_scale : 0.0f);
+   glUniform1i(s_cp_half, half);
+   glUniform1i(s_cp_fmt, (GLint)fmt);
+   glUniform1i(s_cp_int, intensity);
+@@ -2251,7 +2334,7 @@
+       }
+     }
+   }
+-  if (sc > 1) {
++  if (pw != dw || ph != dh) {
+     // Native-size downsample for stitching into RAM-decoded textures (tile
+     // animation frames copied into a tileset). Bilinear at an exact 2:1 is a
+     // 2x2 box; scissor is off and the colour mask fully on here.
+@@ -2725,8 +2808,8 @@
+   glBindBuffer(GL_PIXEL_PACK_BUFFER, s_pw_pbo);
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, s_efb_fbo);
+   // (GX pixel -> the centre GL pixel of its s x s block.)
+-  glReadPixels(wx * s_scale + s_scale / 2,
+-               kEfbHeight * s_scale - 1 - (wy * s_scale + s_scale / 2), 1, 1, GL_RGBA,
++  glReadPixels((SE(wx) + SE(wx + 1)) / 2,
++               s_efb_h - 1 - (SE(wy) + SE(wy + 1)) / 2, 1, 1, GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                (void *)(s_pw_labels.size() * 4));
+   glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+@@ -4831,8 +4914,8 @@
+       sum += ms;
+       mx = std::max(mx, ms);
+       if (++n == 300) {
+-        printf("[GPUTIME] scale=%dx avg=%.3f max=%.3f ms per render (%d renders)\n",
+-               s_scale, sum / n, mx, n);
++        printf("[GPUTIME] scale=%gx avg=%.3f max=%.3f ms per render (%d renders)\n",
++               (double)s_scale, sum / n, mx, n);
+         std::fflush(stdout);
+         sum = mx = 0;
+         n = 0;
+@@ -4842,6 +4925,119 @@
+   }
+ };
+ GpuTimer g_gpu_timer;
++
++// r16res, NWII_RES_GPUPROF=1: where the GPU time of a frame goes, by segment.
++// A frame is draw segment 0, copy 0, draw segment 1, copy 1, ... (EFB copies
++// split it); GL_TIMESTAMP queries at every boundary, read back a few frames
++// later (never waits). Every 300 frames, per-frame average of each segment
++// (label: draw#k with its GX draw count, or the copy kind, size and scale).
++struct ResGpuProf {
++  static bool On() {
++    static const bool on = NWII_ENV("NWII_RES_GPUPROF") != nullptr;
++    return on;
++  }
++  struct Mark { GLuint q; std::string label; uint64_t draws = 0; };
++  struct FrameRec { std::vector<Mark> marks; };
++  std::deque<FrameRec> pending;
++  std::vector<GLuint> pool;
++  FrameRec cur;
++  bool open = false;
++  int seg = 0;
++  uint64_t draws0 = 0;
++  std::unordered_map<std::string, double> acc, acc_draws;
++  std::vector<std::string> order;
++  int frames = 0;
++  GLuint Q() {
++    if (pool.empty()) {
++      GLuint q[64];
++      glGenQueries(64, q);
++      pool.assign(q, q + 64);
++    }
++    GLuint q = pool.back();
++    pool.pop_back();
++    return q;
++  }
++  void Add(const std::string &label) {
++    if (!open) return;
++    GLuint q = Q();
++    glQueryCounter(q, GL_TIMESTAMP);
++    cur.marks.push_back({q, label, 0});
++  }
++  void BeginFrame() {
++    Collect();
++    open = pending.size() < 8;
++    cur.marks.clear();
++    seg = 0;
++    draws0 = g_prof_gx_draws;
++    Add("draw#0");
++  }
++  // Before an EFB copy: closes the draw segment (its label gets the draw count).
++  void Copy(const char *kind, int w, int h, int pw, int ph, bool half) {
++    if (!open) return;
++    char b[96];
++    cur.marks.back().draws = g_prof_gx_draws - draws0;
++    std::snprintf(b, sizeof b, "copy#%d %s %dx%d%s -> GL %dx%d", seg, kind, w, h,
++                  half ? " half" : "", pw, ph);
++    Add(b);
++  }
++  void AfterCopy() {
++    if (!open) return;
++    draws0 = g_prof_gx_draws;
++    Add("draw#" + std::to_string(++seg));
++  }
++  void EndFrame() {
++    if (!open) return;
++    cur.marks.back().draws = g_prof_gx_draws - draws0;
++    Add("end");
++    pending.push_back(std::move(cur));
++    cur = FrameRec{};
++    open = false;
++  }
++  void Collect() {
++    while (!pending.empty()) {
++      FrameRec &f = pending.front();
++      GLint avail = 0;
++      glGetQueryObjectiv(f.marks.back().q, GL_QUERY_RESULT_AVAILABLE, &avail);
++      if (!avail) return;
++      std::vector<GLuint64> t(f.marks.size());
++      for (size_t i = 0; i < f.marks.size(); ++i) {
++        glGetQueryObjectui64v(f.marks[i].q, GL_QUERY_RESULT, &t[i]);
++        pool.push_back(f.marks[i].q);
++      }
++      for (size_t i = 0; i + 1 < f.marks.size(); ++i) {
++        auto it = acc.find(f.marks[i].label);
++        if (it == acc.end()) {
++          order.push_back(f.marks[i].label);
++          it = acc.emplace(f.marks[i].label, 0.0).first;
++        }
++        it->second += (double)(t[i + 1] - t[i]) / 1e6;
++        acc_draws[f.marks[i].label] += (double)f.marks[i].draws;
++      }
++      double total = (double)(t.back() - t.front()) / 1e6;
++      acc["total"] += total;
++      pending.pop_front();
++      if (++frames == 300) Report();
++    }
++  }
++  void Report() {
++    printf("[RESGPU] scale %gx, GPU ms per frame over %d frames: total %.3f\n",
++           (double)s_scale, frames, acc["total"] / frames);
++    for (const auto &l : order) {
++      const double ms = acc[l] / frames;
++      const double d = acc_draws[l] / frames;
++      if (ms >= 0.005) {
++        if (d > 0) printf("[RESGPU]   %8.3f  %s (%.0f GX draws)\n", ms, l.c_str(), d);
++        else printf("[RESGPU]   %8.3f  %s\n", ms, l.c_str());
++      }
++    }
++    std::fflush(stdout);
++    acc_draws.clear();
++    acc.clear();
++    order.clear();
++    frames = 0;
++  }
++};
++ResGpuProf g_res_gpu;
+ }  // namespace
+ 
+ const std::vector<GXCommand *> *g_render_draws = nullptr;
+@@ -4974,9 +5170,9 @@
+     static int logged = 0;
+     if ((diff && logged++ < 16) || checks % 20 == 0)
+       printf("[FRAMECHECK] checks=%llu identical=%llu (pass1 differs %llu) | xfb %ld %dx%d "
+-             "scale %dx: %zu pixels differ (max %d)\n",
++             "scale %gx: %zu pixels differ (max %d)\n",
+              (unsigned long long)checks, (unsigned long long)same, (unsigned long long)p1diff,
+-             s_xfb_copies, s_xfb_w, s_xfb_h, s_scale, diff, maxd);
++             s_xfb_copies, s_xfb_w, s_xfb_h, (double)s_scale, diff, maxd);
+   }
+ 
+   static void ReadXfb(std::vector<uint8_t> &px) {
+@@ -5040,6 +5236,7 @@
+     s_cap_cur = CapStats{};
+     const auto cap_t0 = std::chrono::steady_clock::now();
+     if (GpuTimer::On()) g_gpu_timer.Begin();
++    if (ResGpuProf::On()) g_res_gpu.BeginFrame();
+     const uint64_t cap_up0 = g_prof_tex_uploads, cap_sh0 = g_prof_shader_compiles;
+     if (g_state.pe_clear_pending) {
+       g_state.pe_clear_pending = false;
+@@ -5199,6 +5396,17 @@
+                    (cmd.val >> 11) & 1, CopyRealFormat(cmd.val),
+                    (cmd.val >> 9) & 1, ((cmd.val >> 15) & (cmd.val >> 16)) & 1,
+                    g_state.bp[0x43] & 7, (g_state.bp[0x4D] & 0x3FF) << 5);
++          if (ResGpuProf::On() && !cmd.stale_copy) {
++            const bool hf = (cmd.val >> 9) & 1, xfb = cmd.val & 0x4000;
++            const int cw = (int)g_state.efbW, ch = (int)g_state.efbH;
++            const bool nat = !xfb && s_scale != 1.0f &&
++                             nwii::runtime::hle::TextureCache::get().efb_copy_stitched(
++                                 g_state.efbCopyDest);
++            const int gw = nat ? cw : SE(g_state.efbSrcX + cw) - SE(g_state.efbSrcX),
++                      gh = nat ? ch : SE(g_state.efbSrcY + ch) - SE(g_state.efbSrcY);
++            g_res_gpu.Copy(xfb ? "XFB" : (cmd.val & 0x800) ? "TEX+clear" : "TEX", cw, ch,
++                           hf && !xfb ? gw / 2 : gw, hf && !xfb ? gh / 2 : gh, hf);
++          }
+           if (cmd.val & 0x4000) {
+             if (cmd.stale_copy)
+               ++s_xfb_copies;  // keeps the dump numbering in guest frames
+@@ -5213,6 +5421,7 @@
+           if (cmd.val & 0x800)
+             ClearEfbCopySource();
+           if (DrawTraceOn()) PixWatch("copy");
++          if (ResGpuProf::On() && !cmd.stale_copy) g_res_gpu.AfterCopy();
+           // Copies and clears changed GL state behind the cache.
+           GLInvalidate();
+           s_state_dirty = true;
+@@ -5237,7 +5446,7 @@
+       glBindSampler(i, 0);
+     glActiveTexture(GL_TEXTURE0);
+     glDisable(GL_SCISSOR_TEST);
+-    glViewport(0, 0, kEfbWidth * s_scale, kEfbHeight * s_scale);
++    glViewport(0, 0, s_efb_w, s_efb_h);
+     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+     glDepthMask(GL_TRUE);
+     glDisable(GL_COLOR_LOGIC_OP);
+@@ -5246,6 +5455,7 @@
+       DrawStatsFrame();
+     PixWatchEnd();
+     if (GpuTimer::On()) g_gpu_timer.End();
++    if (ResGpuProf::On()) g_res_gpu.EndFrame();
+     DumpPresentedXfb();
+     nwii::runtime::hle::TextureCache::get().end_frame();
+     ecache::EndFrame();
+@@ -5301,11 +5511,11 @@
+   int h = g_state.xfbH ? g_state.xfbH : 480;
+   int sx = g_state.xfbW ? g_state.xfbSrcX : 0;
+   int sy = g_state.xfbW ? g_state.xfbSrcY : 0;
+-  const int sc = nwii::runtime::gx::s_scale;
+-  *x0 = sx * sc;
+-  *x1 = (sx + w) * sc;
+-  *y1 = (nwii::runtime::gx::kEfbHeight - sy) * sc;
+-  *y0 = *y1 - h * sc;
++  using nwii::runtime::gx::SE;
++  *x0 = SE(sx);
++  *x1 = SE(sx + w);
++  *y1 = nwii::runtime::gx::s_efb_h - SE(sy);
++  *y0 = nwii::runtime::gx::s_efb_h - SE(sy + h);
+ }
+ 
+ // ---- Internal resolution: EFB storage -------------------------------------
+@@ -5315,31 +5525,30 @@
+ // resize, Switch dock/undock): the old contents are scaled into the new
+ // storage so the frame on screen does not flash.
+ static GLuint s_efb_depth = 0;
+-static void AllocEfbStorage(GLuint tex, GLuint rbo, int sc) {
++static void AllocEfbStorage(GLuint tex, GLuint rbo, int w, int h) {
+   glBindTexture(GL_TEXTURE_2D, tex);
+-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, nwii::runtime::gx::kEfbWidth * sc,
+-               nwii::runtime::gx::kEfbHeight * sc, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+-  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24,
+-                        nwii::runtime::gx::kEfbWidth * sc,
+-                        nwii::runtime::gx::kEfbHeight * sc);
++  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+ }
+ 
+-void GX_CreateEfb(int scale, unsigned *fbo, unsigned *tex) {
++void GX_CreateEfb(float scale, unsigned *fbo, unsigned *tex) {
+   using namespace nwii::runtime::gx;
+-  scale = std::min(4, std::max(1, scale));
++  scale = std::min(4.0f, std::max(1.0f, scale));
++  s_viewport_f = (PFNViewportIndexedf)SDL_GL_GetProcAddress("glViewportIndexedf");
++  if (NWII_ENV("NWII_NO_FLOAT_VIEWPORT")) s_viewport_f = nullptr;
++  SetScale(scale);
+   GLuint f = 0, t = 0;
+   glGenFramebuffers(1, &f);
+   glBindFramebuffer(GL_FRAMEBUFFER, f);
+   glGenTextures(1, &t);
+   glGenRenderbuffers(1, &s_efb_depth);
+-  AllocEfbStorage(t, s_efb_depth, scale);
++  AllocEfbStorage(t, s_efb_depth, s_efb_w, s_efb_h);
+   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0);
+   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER,
+                             s_efb_depth);
+-  s_scale = scale;
+   s_efb_fbo = f;
+   s_efb_tex = t;
+   nwii::runtime::hle::TextureCache::get().set_restore_read_fbo(f);
+@@ -5347,19 +5556,30 @@
+   *tex = t;
+ }
+ 
+-int GX_GetEfbScale() { return nwii::runtime::gx::s_scale; }
++float GX_GetEfbScale() { return nwii::runtime::gx::s_scale; }
++void GX_GetEfbSize(int *w, int *h) {
++  *w = nwii::runtime::gx::s_efb_w;
++  *h = nwii::runtime::gx::s_efb_h;
++}
++// Guest height of the presented XFB (0 before the first copy): "720p" and
++// auto scales are relative to it.
++int GX_GetXfbLines() { return nwii::runtime::gx::s_xfb_lh; }
+ 
+ // New storage at `scale` for the EFB made by GX_CreateEfb; the texture name
+ // changes (returned in *tex), the framebuffer object stays. Leaves the EFB
+ // bound as GL_FRAMEBUFFER.
+-bool GX_ResizeEfb(int scale, unsigned *tex) {
++bool GX_ResizeEfb(float scale, unsigned *tex) {
+   using namespace nwii::runtime::gx;
+-  scale = std::min(4, std::max(1, scale));
++  scale = std::min(4.0f, std::max(1.0f, scale));
+   if (!s_efb_fbo || scale == s_scale) return false;
++  const float old_scale = s_scale;
++  const int ow = s_efb_w, oh = s_efb_h;
++  SetScale(scale);
++  const int nw = s_efb_w, nh = s_efb_h;
+   GLuint t = 0, rbo = 0, tmp = 0;
+   glGenTextures(1, &t);
+   glGenRenderbuffers(1, &rbo);
+-  AllocEfbStorage(t, rbo, scale);
++  AllocEfbStorage(t, rbo, nw, nh);
+   glGenFramebuffers(1, &tmp);
+   glBindFramebuffer(GL_FRAMEBUFFER, tmp);
+   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0);
+@@ -5367,8 +5587,6 @@
+   glDisable(GL_SCISSOR_TEST);
+   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+   glDepthMask(GL_TRUE);
+-  const int ow = kEfbWidth * s_scale, oh = kEfbHeight * s_scale;
+-  const int nw = kEfbWidth * scale, nh = kEfbHeight * scale;
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, s_efb_fbo);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, tmp);
+   glBlitFramebuffer(0, 0, ow, oh, 0, 0, nw, nh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+@@ -5381,9 +5599,10 @@
+   glDeleteRenderbuffers(1, &s_efb_depth);
+   s_efb_tex = t;
+   s_efb_depth = rbo;
+-  printf("[GX] internal resolution %dx -> %dx (EFB %dx%d)\n", s_scale, scale, nw, nh);
++  printf("[GX] internal resolution %gx -> %gx (EFB %dx%d%s)\n", (double)old_scale,
++         (double)scale, nw, nh, !s_iscale && s_viewport_f ? ", float viewport" : "");
+   std::fflush(stdout);
+-  s_scale = scale;
++  GLInvalidate();  // the viewport cache may hold either kind of viewport
+   *tex = t;
+   return true;
+ }
+@@ -5399,7 +5618,7 @@
+   using namespace nwii::runtime::gx;
+   int sw = sx1 - sx0, sh = sy1 - sy0;
+   const int dw = std::max(1, dx1 - dx0), dh = std::max(1, dy1 - dy0);
+-  if (s_scale > 1 && (sw > 2 * dw || sh > 2 * dh)) {
++  if (s_scale > 1.0f && (sw > 2 * dw || sh > 2 * dh)) {
+     static GLuint fbo[2] = {0, 0}, tex[2] = {0, 0};
+     static int tw[2] = {0, 0}, th[2] = {0, 0};
+     if (!fbo[0]) {
+@@ -5632,8 +5851,9 @@
+   if (!g_cap.on || x1 <= x0 || y1 <= y0) return;
+   // Ring frames stay at native/NWII_CAPTURE_SCALE size at any internal
+   // resolution (the scaled source is just blitted down further).
+-  const int div = g_cap.scale * nwii::runtime::gx::s_scale;
+-  const int w = std::max(1, (x1 - x0) / div), h = std::max(1, (y1 - y0) / div);
++  const float div = g_cap.scale * nwii::runtime::gx::s_scale;
++  const int w = std::max(1, (int)std::lround((x1 - x0) / div)),
++            h = std::max(1, (int)std::lround((y1 - y0) / div));
+   if (!g_cap.tex || w != g_cap.w || h != g_cap.h) {
+     if (!g_cap.tex) {
+       glGenTextures(1, &g_cap.tex);
+@@ -5658,7 +5878,7 @@
+   glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, g_cap.tex, 0, layer);
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+   glBlitFramebuffer(x0, y0, x1, y1, 0, 0, w, h, GL_COLOR_BUFFER_BIT,
+-                    div > 1 ? GL_LINEAR : GL_NEAREST);
++                    div > 1.0f ? GL_LINEAR : GL_NEAREST);
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+   CapSlot &s = g_cap.slots[layer];
+@@ -5700,10 +5920,11 @@
+       glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+       glReadPixels(x0, y0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+       // Native size unless NWII_DUMP_SCALED=1 (like NWII_XFBDUMP).
+-      if (const int sc = nwii::runtime::gx::s_scale; sc > 1 && !DumpScaled()) {
+-        BoxDownsample(px, w, h, w / sc, h / sc);
+-        w /= sc;
+-        h /= sc;
++      if (const float sc = nwii::runtime::gx::s_scale; sc > 1.0f && !DumpScaled()) {
++        const int nw = (int)std::lround(w / sc), nh = (int)std::lround(h / sc);
++        BoxDownsample(px, w, h, nw, nh);
++        w = nw;
++        h = nh;
+       }
+       std::snprintf(b, sizeof b, "screenshot_xfb%06ld.png", s_cap_last.xfb);
+       imgs->push_back({b, w, h, rgba_to_rgb_flip(px, w, h)});
+diff -ruN '--color=never' r13/nWiiRuntime/src/hle/texture_cache_gl.cpp r16res/nWiiRuntime/src/hle/texture_cache_gl.cpp
+--- r13/nWiiRuntime/src/hle/texture_cache_gl.cpp	2026-10-31 06:08:13.580305463 -0500
++++ r16res/nWiiRuntime/src/hle/texture_cache_gl.cpp	2026-11-08 19:28:44.296463030 -0500
+@@ -241,10 +241,11 @@
+     }
+ }
+ 
+-GLuint TextureCache::acquire_efb_copy(uint32_t addr, uint32_t w, uint32_t h, int scale) {
++GLuint TextureCache::acquire_efb_copy(uint32_t addr, uint32_t w, uint32_t h, uint32_t gl_w,
++                                      uint32_t gl_h) {
+     addr &= 0x1FFFFFFF;
+     EfbCopy& c = efb_copies[addr];
+-    const uint32_t gw = w * (uint32_t)scale, gh = h * (uint32_t)scale;
++    const uint32_t gw = gl_w ? gl_w : w, gh = gl_h ? gl_h : h;
+     if (!c.tex || c.gl_w != gw || c.gl_h != gh) {
+         if (!c.tex)
+             glGenTextures(1, &c.tex);
+@@ -280,6 +281,11 @@
+     return c.native;
+ }
+ 
++bool TextureCache::efb_copy_stitched(uint32_t addr) const {
++    auto it = efb_copies.find(addr & 0x1FFFFFFF);
++    return it != efb_copies.end() && it->second.stitched;
++}
++
+ void TextureCache::efb_copy_done(CPUContext* ctx, uint32_t addr, uint32_t w,
+                                  uint32_t h, uint32_t copy_fmt, uint32_t stride) {
+     addr &= 0x1FFFFFFF;
+@@ -350,6 +356,7 @@
+     bind_scratch(dst);
+     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x, y, 0, 0, cw, ch);
+     glBindFramebuffer(GL_READ_FRAMEBUFFER, restore_read_fbo_);
++    c.stitched = true;
+     ++g_prof_stitches;
+     return true;
+ }
+diff -ruN '--color=never' r13/nWiiRuntime/src/platform/switch/switch_platform.cpp r16res/nWiiRuntime/src/platform/switch/switch_platform.cpp
+--- r13/nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-11-08 13:20:49.854024547 -0500
++++ r16res/nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-11-08 19:06:18.034703874 -0500
+@@ -75,12 +75,13 @@
+     "tilt_invert = false       # true = inclinación al revés\n"
+     "\n"
+     "[graphics]\n"
+-    "# Resolución interna: \"auto\" = 1x (la de la Wii, 640x528) en portátil y 2x (1280x1056)\n"
+-    "# en el dock (salida 1080p). 1 = la de la Wii (lo más ligero), 2, 3 o 4 = más nítido y más\n"
+-    "# trabajo de GPU. Un número aquí vale para los dos modos.\n"
++    "# Resolución interna: \"auto\" = \"720p\" en portátil y \"1080p\" en el dock (la imagen del\n"
++    "# juego sale 1:1 en la pantalla). 1 = la de la Wii (640x528, lo más ligero); también vale\n"
++    "# cualquier número entre 1 y 4 (\"1.3636\", \"1.5\", 2...) o \"720p\"/\"1080p\". Más alto = más\n"
++    "# nítido y más trabajo de GPU. Un valor aquí vale para los dos modos.\n"
+     "internal_resolution = \"auto\"\n"
+-    "# Solo en modo portátil (quítale el # para usarla): por ejemplo 2 para probar más nitidez.\n"
+-    "#internal_resolution_handheld = 2\n"
++    "# Solo en modo portátil (quítale el # para usarla): por ejemplo 1 si la GPU no llega.\n"
++    "#internal_resolution_handheld = 1\n"
+     "backend = \"opengl\"        # no tocar\n"
+     "window_width = 1280       # no tocar\n"
+     "window_height = 720       # no tocar\n"

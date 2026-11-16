@@ -1,0 +1,510 @@
+diff --color -ruN r22r7/nWiiRuntime/include/runtime/x2_wgpipe.h r27x2/nWiiRuntime/include/runtime/x2_wgpipe.h
+--- r22r7/nWiiRuntime/include/runtime/x2_wgpipe.h	1969-12-31 19:00:00.000000000 -0500
++++ r27x2/nWiiRuntime/include/runtime/x2_wgpipe.h	2026-11-10 05:15:27.873845054 -0500
+@@ -0,0 +1,152 @@
++// X2 (r9/r27x2): stores to the GX write-gather pipe (0xCC008000) appended in
++// line, at the generated call sites the recompiler already proved to be MMIO
++// (`mv_.writeN_io`, the "listed MMIO sites" of R12 fastmem).
++//
++// Before: mv_.write8_io -> MMU::write8_slow (out of line: watch test, page
++// test) -> GX_WGPIPE_Write8 (out of line, another TU: mode/redirect tests,
++// BP/LOAD_INDX state machine, room test, store). Now the site itself tests
++// "pipe page and room in the buffer while the inline paths are allowed" with
++// one compare (g_wgi.lim is the buffer cap only while the R16w inline paths
++// may be used: write-gather on, no debug check, no display list being built
++// into RAM, NWII_X2_INLINE not 0; 0 otherwise) and does exactly what the
++// inline paths of GX_WGPIPE_Write8/16/32/F32 (hle/gx.cpp) do: same bytes into
++// the same buffer, same state machine (shared code: x2_sniff8), same write
++// counter. Everything else (no room -> flush, BP that hands the buffer over,
++// CP/LOAD_INDX/CALL_DL values, redirect, debug modes, other MMIO pages) falls
++// back to the old call, which handles it as before.
++//
++// Only the generated files rewritten by r27x2/tools/apply_x2.py include this
++// header; no header the base objects were compiled against changes.
++#pragma once
++#include "runtime/cpu_context.h"
++#include <cstdint>
++#include <cstring>
++
++namespace nwii {
++namespace runtime {
++
++struct alignas(64) WgInline {
++    uint32_t n;          // bytes in buf (R16w s_wg_n)
++    uint32_t lim;        // s_wg_cap while the inline paths may be used, else 0
++    int32_t sn_st;       // LOAD_INDX / CP / CALL_DL sniffer state (R16w s_sn_st)
++    uint32_t sn_a;       // its pending byte / address (s_sn_a)
++    bool bp_armed;       // last write was Write8(0x61) (s_bp_armed)
++    bool idx_on;         // NWII_IDXSNAP (s_idx_on), copied at the first write
++    bool flush_all_bp;   // NWII_WGP_FLUSH_ALL_BP
++    uint64_t writes;     // pipe writes (s_wg_writes_l)
++    uint32_t sn_base[4]; // CP array bases / strides seen in the pipe (s_sn_base / s_sn_stride)
++    uint32_t sn_stride[4];
++    alignas(64) uint8_t buf[4096];  // the write-gather buffer (s_wg)
++};
++// hidden: the sites reach it PC-relative (adrp+add), not through the GOT
++extern WgInline g_wgi __attribute__((visibility("hidden")));
++
++// R16w idx_sniff8 (with NWII_IDXSNAP on): the one copy of the state machine.
++NWII_FORCEINLINE void x2_sniff8(WgInline &g, uint8_t b) {
++    switch (g.sn_st) {
++    case 1: g.sn_st = 2; g.sn_a = b; return;
++    case 6: g.sn_st = 7; return;
++    case 7: g.sn_st = 0; return;
++    default: break;
++    }
++    g.sn_st = b == 0x08 ? 1 : (b & 0xE7) == 0x20 ? 3 : b == 0x40 ? 4 : b == 0x78 ? 6 : 0;
++    g.sn_a = b;
++}
++// BPs that hand the buffer over (R16w wg_bp_hands_over)
++NWII_FORCEINLINE bool x2_bp_hands_over(const WgInline &g, uint8_t reg) {
++    return reg == 0x52 || reg == 0x45 || reg == 0x47 || reg == 0x48 || g.flush_all_bp;
++}
++
++#define NWII_X2_PIPE(a) ((((a) & 0x3FFFF000u) == 0x0C008000u))
++
++NWII_FORCEINLINE void x2_w8(MemView &mv, uint32_t addr, uint8_t v) {
++    WgInline &g = g_wgi;
++    const uint32_t n = g.n;
++    if (NWII_LIKELY(NWII_X2_PIPE(addr) && n < g.lim)) {
++        g.bp_armed = v == 0x61;
++        if (g.idx_on) x2_sniff8(g, v);
++        ++g.writes;
++        g.buf[n] = v;
++        g.n = n + 1;
++        return;
++    }
++    mv.write8_io(addr, v);
++}
++NWII_FORCEINLINE void x2_w16(MemView &mv, uint32_t addr, uint16_t v) {
++    WgInline &g = g_wgi;
++    const uint32_t n = g.n;
++    if (NWII_LIKELY(NWII_X2_PIPE(addr) && n + 2 <= g.lim)) {
++        g.bp_armed = false;
++        g.sn_st = 0;
++        ++g.writes;
++        const uint16_t be = __builtin_bswap16(v);
++        std::memcpy(g.buf + n, &be, 2);
++        g.n = n + 2;
++        return;
++    }
++    mv.write16_io(addr, v);
++}
++NWII_FORCEINLINE void x2_wf32(MemView &mv, uint32_t addr, float f) {
++    WgInline &g = g_wgi;
++    const uint32_t n = g.n;
++    if (NWII_LIKELY(NWII_X2_PIPE(addr) && n + 4 <= g.lim)) {
++        uint32_t u;
++        std::memcpy(&u, &f, 4);
++        g.bp_armed = false;
++        g.sn_st = 0;
++        ++g.writes;
++        const uint32_t be = __builtin_bswap32(u);
++        std::memcpy(g.buf + n, &be, 4);
++        g.n = n + 4;
++        return;
++    }
++    mv.write_f32_io(addr, f);
++}
++// Integer word: data (nothing pending), a BP that needs no hand-over and the
++// value of a CP register write go in line, as in GX_WGPIPE_Write32 (R16w w4);
++// the word after a LOAD_INDX / CALL_DL opcode and a hand-over BP take the old
++// path.
++NWII_FORCEINLINE void x2_w32(MemView &mv, uint32_t addr, uint32_t v) {
++    WgInline &g = g_wgi;
++    const uint32_t n = g.n;
++    if (NWII_LIKELY(NWII_X2_PIPE(addr) && n + 4 <= g.lim)) {
++        const int32_t st = g.sn_st;
++        if (NWII_LIKELY(st == 0 && (!g.bp_armed || !x2_bp_hands_over(g, (uint8_t)(v >> 24))))) {
++            g.bp_armed = false;
++        } else if (st == 2 && !g.bp_armed) {
++            g.sn_st = 0;
++            const uint32_t a = g.sn_a;
++            if (a >= 0xAC && a <= 0xAF) g.sn_base[a - 0xAC] = v & 0x3FFFFFFF;
++            else if (a >= 0xBC && a <= 0xBF) g.sn_stride[a - 0xBC] = v & 0xFF;
++        } else {
++            mv.write32_io(addr, v);
++            return;
++        }
++        ++g.writes;
++        const uint32_t be = __builtin_bswap32(v);
++        std::memcpy(g.buf + n, &be, 4);
++        g.n = n + 4;
++        return;
++    }
++    mv.write32_io(addr, v);
++}
++
++// psq_st at a listed MMIO site (GXLoadPosMtxImm / GXLoadTexMtxImm copy the
++// matrix rows into the pipe with psq_l/psq_st). The out-of-line
++// CPUContext::psq_store with a float GQR stores ps0 (and ps1 if W == 0) as
++// MMU::write_f32 of ConvertToSingleFTZ; for the pipe page that reaches
++// write_f32_slow -> GX_WGPIPE_WriteF32, so x2_wf32 does the same (and falls
++// back to write_f32_slow, which also covers RAM, as MMU::write_f32 does once
++// its fast test fails). Other GQR types: the original call.
++NWII_FORCEINLINE void x2_psq_st(CPUContext &ctx, MemView &mv, uint32_t S, uint32_t ea, uint32_t W, uint32_t I) {
++    if (NWII_LIKELY((ctx.gqr[I] & 0x7u) == 0 && NWII_X2_PIPE(ea))) {
++        const double p0 = ctx.fpr[S], p1 = ctx.ps1[S];
++        x2_wf32(mv, ea, f32_from(ppc_single_bits_ftz(p0)));
++        if (W == 0) x2_wf32(mv, ea + 4, f32_from(ppc_single_bits_ftz(p1)));
++        return;
++    }
++    ctx.psq_store(S, ea, W, I);
++}
++
++}  // namespace runtime
++}  // namespace nwii
+diff --color -ruN r22r7/nWiiRuntime/src/hle/gx.cpp r27x2/nWiiRuntime/src/hle/gx.cpp
+--- r22r7/nWiiRuntime/src/hle/gx.cpp	2026-11-09 04:19:55.311882174 -0500
++++ r27x2/nWiiRuntime/src/hle/gx.cpp	2026-11-10 02:30:36.424845600 -0500
+@@ -16,6 +16,7 @@
+ #include "runtime/gx/renderer.h"
+ #include "runtime/hw/hw.h"
+ #include "runtime/gx_state.h"
++#include "runtime/x2_wgpipe.h"
+ #include "runtime/cpu_context.h"
+ #include <iostream>
+ #include <cstdlib>
+@@ -301,7 +302,9 @@
+ static uint64_t s_idx_drops = 0;  // guest: records dropped at a full ring
+ 
+ // Guest thread: the CP array state seen in the pipe.
+-static uint32_t s_sn_base[4], s_sn_stride[4];
++WgInline g_wgi{};  // X2: the write-gather state the generated sites share (x2_wgpipe.h)
++#define s_sn_base g_wgi.sn_base
++#define s_sn_stride g_wgi.sn_stride
+ static uint32_t s_sn_frame = 0;  // XFB copies written (stamps the records)
+ 
+ static bool idx_copy(uint32_t phys, uint32_t len, uint8_t *dst) {
+@@ -327,8 +330,10 @@
+ // + Write32 x2, is skipped). Data that merely looks like one makes a record
+ // the parser never takes: it only takes records that match the command it
+ // is parsing.
+-static int s_sn_st = 0;   // 1 0x08, 2 0x08 reg, 3 LOAD_INDX op, 4 0x40, 5 0x40 addr, 6/7 0x78 marker
+-static uint32_t s_sn_a = 0;
++// X2: s_sn_st / s_sn_a live in g_wgi (x2_wgpipe.h) so the generated sites can run the same machine.
++#define s_sn_st g_wgi.sn_st
++#define s_sn_a g_wgi.sn_a
++//      s_sn_st: 1 0x08, 2 0x08 reg, 3 LOAD_INDX op, 4 0x40, 5 0x40 addr, 6/7 0x78 marker
+ 
+ static void idx_loadindx(uint8_t op, uint32_t v) {
+     if (!g_mmu) return;
+@@ -348,14 +353,7 @@
+ }
+ static inline void idx_sniff8(uint8_t b) {
+     if (!s_idx_on) return;
+-    switch (s_sn_st) {
+-    case 1: s_sn_st = 2; s_sn_a = b; return;
+-    case 6: s_sn_st = 7; return;
+-    case 7: s_sn_st = 0; return;
+-    default: break;
+-    }
+-    s_sn_st = b == 0x08 ? 1 : (b & 0xE7) == 0x20 ? 3 : b == 0x40 ? 4 : b == 0x78 ? 6 : 0;
+-    s_sn_a = b;
++    x2_sniff8(g_wgi, b);  // X2: the one copy of the machine (x2_wgpipe.h)
+ }
+ static inline void idx_sniff16(uint16_t) { s_sn_st = 0; }
+ static inline void idx_sniff32(uint32_t v, bool is_int) {
+@@ -2079,7 +2077,7 @@
+ // The renderer already owns a copy of everything before it, so this matches an
+ // infinitely fast GPU. NWII_LATE_SYNC=1 restores signalling from the parser.
+ bool g_early_gx_sync = NWII_ENV("NWII_LATE_SYNC") == nullptr;
+-static bool s_bp_armed = false;
++#define s_bp_armed g_wgi.bp_armed  // X2: in g_wgi
+ 
+ namespace hw { extern bool g_wgp_redirect_on; }  // hw_pi.cpp
+ 
+@@ -2120,19 +2118,23 @@
+ // Guest thread only (all GX_WGPIPE_* callers are: MMIO writes, GX seams, the
+ // CP FIFO drain of an MMIO write).
+ static constexpr uint32_t kWgCap = 4096;
+-alignas(64) static uint8_t s_wg[kWgCap];
+-static uint32_t s_wg_n = 0;
++static_assert(sizeof(g_wgi.buf) == kWgCap, "x2_wgpipe.h buffer size");
++#define s_wg g_wgi.buf      // X2: buffer and fill in g_wgi
++#define s_wg_n g_wgi.n
+ static uint32_t s_wg_cap = kWgCap;  // NWII_WGP_CAP (test: a smaller buffer)
+ // R16w: -1 not decided yet, 0 every write takes the full path (direct path,
+ // NWII_WGP_CHECK, NWII_SAMPLE), 1 the inline paths below may be used.
+ static int s_wg_mode = -1;
+-static bool s_wg_flush_all_bp = false;
++#define s_wg_flush_all_bp g_wgi.flush_all_bp
+ // wgp_gather() / NWII_SAMPLE as plain flags once decided (function-local
+ // statics cost an acquire load of their guard on every call: ~1/3 of the full
+ // path's samples on the console).
+ static bool s_wg_gather = true, s_wg_sample = false;
+ // Counters: plain on the guest thread, published at each hand-over.
+-static uint64_t s_wg_writes_l = 0, s_wg_flushes_l = 0, s_wg_bytes_l = 0, s_wg_bpf_l = 0,
++#define s_wg_writes_l g_wgi.writes
++static uint64_t s_x2_slow_l = 0;
++static std::atomic<uint64_t> s_x2_slow{0};
++static uint64_t s_wg_flushes_l = 0, s_wg_bytes_l = 0, s_wg_bpf_l = 0,
+                 s_wg_agef_l = 0;
+ static std::atomic<uint64_t> s_wg_writes{0}, s_wg_flushes{0}, s_wg_bytes{0}, s_wg_bpf{0},
+     s_wg_agef{0};
+@@ -2202,7 +2204,30 @@
+     }
+ }
+ 
++// X2: NWII_X2_FIFOREC=<file> records every hand-over (the byte stream the
++// host gets), whatever the write path, without changing the write mode
++// (NWII_WGP_CHECK forces the checked paths; this one keeps the inline ones):
++// the stream of two builds can be compared byte for byte.
++static FILE *const s_x2_rec = [] {
++    const char *p = NWII_ENV("NWII_X2_FIFOREC");
++    FILE *f = p ? std::fopen(p, "wb") : nullptr;
++    if (f) std::printf("[X2] recording the FIFO stream to %s\n", p);
++    return f;
++}();
++static uint64_t s_x2_rec_n = 0;
++// X2 self-test: while set, hand-overs go to this vector instead of the host.
++static std::vector<uint8_t> *s_x2_cap = nullptr;
++
+ static NWII_NOINLINE void wg_flush_now() {
++    if (__builtin_expect(s_x2_cap != nullptr, 0)) {
++        s_x2_cap->insert(s_x2_cap->end(), s_wg, s_wg + s_wg_n);
++        s_wg_n = 0;
++        return;
++    }
++    if (__builtin_expect(s_x2_rec != nullptr, 0)) {
++        std::fwrite(s_wg, 1, s_wg_n, s_x2_rec);
++        if (((s_x2_rec_n += s_wg_n) & ~0xFFFFFull) != ((s_x2_rec_n - s_wg_n) & ~0xFFFFFull)) std::fflush(s_x2_rec);
++    }
+     {
+         std::lock_guard<FifoLock> lock(g_fifo_mutex);
+         g_hw_fifo.insert(g_hw_fifo.end(), s_wg, s_wg + s_wg_n);
+@@ -2222,6 +2247,7 @@
+     s_wg_flushes.store(s_wg_flushes_l, std::memory_order_relaxed);
+     s_wg_bytes.store(s_wg_bytes_l, std::memory_order_relaxed);
+     s_wg_writes.store(s_wg_writes_l, std::memory_order_relaxed);
++    s_x2_slow.store(s_x2_slow_l, std::memory_order_relaxed);
+     s_wg_bpf.store(s_wg_bpf_l, std::memory_order_relaxed);
+     s_wg_agef.store(s_wg_agef_l, std::memory_order_relaxed);
+     s_wg_n = 0;
+@@ -2255,6 +2281,15 @@
+     }
+ }
+ 
++// X2: g_wgi.lim = the buffer cap while the inline paths may be used (the R16w
++// wg_fast() condition), else 0. Called when the mode is decided and at every
++// change of the redirect flag (hw_pi.cpp wgp_redirect_update).
++static bool s_x2_on = true;
++void GX_WgInlineUpdate() {
++    g_wgi.lim = (s_wg_mode > 0 && s_x2_on && !hw::g_wgp_redirect_on) ? s_wg_cap : 0;
++}
++static void x2_selftest();
++
+ static NWII_NOINLINE void wg_init_mode() {
+     static const bool sample = NWII_ENV("NWII_SAMPLE") != nullptr;
+     if (const char *e = NWII_ENV("NWII_WGP_CAP")) {
+@@ -2265,6 +2300,15 @@
+     s_wg_gather = wgp_gather();
+     s_wg_sample = sample;
+     s_wg_mode = wgp_gather() && !s_wcheck && !sample ? 1 : 0;
++    g_wgi.idx_on = s_idx_on;
++    {
++        const char *e = NWII_ENV("NWII_X2_INLINE");
++        s_x2_on = !(e && e[0] == '0');
++    }
++    GX_WgInlineUpdate();
++    std::printf("[X2] inline pipe stores at the generated MMIO sites: %s\n",
++                g_wgi.lim ? "on" : s_wg_mode > 0 ? "off (NWII_X2_INLINE=0)" : "off (checked/direct paths)");
++    if (s_wg_mode > 0 && NWII_ENV("NWII_X2_SELFTEST")) x2_selftest();
+     std::printf("[WGP] write-gather: %s, buffer %u B, hand-over at full / BP 0x45 0x47 0x48 0x52%s"
+                 " / age / idle\n",
+                 !wgp_gather() ? "off (direct path)" : s_wg_mode ? "on (inline paths)" : "on (checked paths)",
+@@ -2324,6 +2368,7 @@
+ }
+ 
+ void GX_WGPIPE_Write8(uint8_t val) {
++    ++s_x2_slow_l;  // X2: writes that came through the entry points
+     if (wg_fast()) {
+         s_bp_armed = (val == 0x61);
+         idx_sniff8(val);
+@@ -2353,6 +2398,7 @@
+ }
+ 
+ void GX_WGPIPE_Write16(uint16_t val) {
++    ++s_x2_slow_l;  // X2: writes that came through the entry points
+     if (wg_fast()) {
+         s_bp_armed = false;
+         idx_sniff16(val);
+@@ -2439,6 +2485,7 @@
+ // hand-over (no XFB count, no PE signal; ~250 000/s in the title demo) and the
+ // value of a CP register write (array base/stride for the LOAD_INDX copies).
+ void GX_WGPIPE_Write32(uint32_t val) {
++    ++s_x2_slow_l;  // X2: writes that came through the entry points
+     if (wg_fast()) {
+         if (__builtin_expect(!s_bp_armed & (s_sn_st == 0), 1)) {
+             ++s_wg_writes_l;
+@@ -2466,6 +2513,7 @@
+ }
+ 
+ void GX_WGPIPE_WriteF32(float val) {
++    ++s_x2_slow_l;  // X2: writes that came through the entry points
+     union { float f; uint32_t i; } u; u.f = val;
+     if (wg_fast()) {
+         s_bp_armed = false;
+@@ -2501,6 +2549,7 @@
+ }
+ 
+ void GX_WGPIPE_WriteF64(double val) {
++    ++s_x2_slow_l;  // X2: writes that came through the entry points
+     union { double d; uint64_t i; } u; u.d = val;
+     if (wg_fast()) {
+         s_bp_armed = false;
+@@ -2512,11 +2561,106 @@
+     wgp_write64_full(u.i);
+ }
+ 
++// X2 self-test (NWII_X2_SELFTEST=1, at the first pipe write): the same random
++// write sequence goes (A) through the generated sites' inline functions
++// (x2_wgpipe.h, with their fallback to the old call) and (B) through the
++// R16w GX_WGPIPE_* entry points; the hand-over streams, the sniffer state,
++// the CP array state and the write counters must be equal. The hand-overs
++// are captured (not sent to the host) and the state is restored afterwards.
++// The sequence avoids what has side effects outside this state (BPs that
++// signal the PE or end a frame, LOAD_INDX and CALL_DL values).
++static void x2_selftest() {
++    if (!g_mmu) return;
++    struct St { WgInline g; uint32_t base[4], stride[4]; };
++    auto save = [](St &t) {
++        std::memcpy(&t.g, &g_wgi, sizeof g_wgi);
++        std::memcpy(t.base, s_sn_base, sizeof t.base);
++        std::memcpy(t.stride, s_sn_stride, sizeof t.stride);
++    };
++    auto load = [](const St &t) {
++        std::memcpy(&g_wgi, &t.g, sizeof g_wgi);
++        std::memcpy(s_sn_base, t.base, sizeof t.base);
++        std::memcpy(s_sn_stride, t.stride, sizeof t.stride);
++    };
++    St *orig = new St, *ra = new St, *rb = new St;
++    save(*orig);
++    struct Op { uint8_t kind, nolim; uint32_t v; };
++    std::vector<Op> ops;
++    std::vector<uint8_t> ca, cb;
++    const int kOps = 400000;
++    ops.reserve(kOps);
++    uint64_t rng = 0x9E3779B97F4A7C15ull;
++    auto rnd = [&rng]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return (uint32_t)(rng >> 16); };
++    static const uint8_t kB[] = {0x61, 0x61, 0x08, 0x20, 0x28, 0x30, 0x38, 0x40, 0x78,
++                                 0xAC, 0xAD, 0xBC, 0xBF, 0x90, 0x98, 0x00, 0xFF};
++    MemView mv(*g_mmu);
++    const uint32_t A = 0xCC008000u;
++    // (A) inline functions
++    s_x2_cap = &ca;
++    const uint32_t lim = g_wgi.lim;
++    for (int i = 0; i < kOps; ++i) {
++        Op o;
++        o.kind = rnd() % 4;  // 0 w8, 1 w16, 2 w32, 3 f32
++        o.nolim = (rnd() % 16) == 0;
++        uint32_t r = rnd();
++        o.v = (r & 1) ? kB[(r >> 1) % sizeof kB] : rnd();
++        if (o.kind == 2) {
++            if (g_wgi.sn_st >= 3 && g_wgi.sn_st <= 5) o.kind = 3;  // no LOAD_INDX / CALL_DL value
++            else {
++                o.v = (rnd() << 8) | (rnd() & 0xFF);
++                if (g_wgi.bp_armed) {
++                    uint8_t reg = rnd() & 0xFF;
++                    if (reg == 0x45 || reg == 0x47 || reg == 0x48 || reg == 0x52) reg = 0x49;
++                    o.v = (o.v & 0x00FFFFFFu) | ((uint32_t)reg << 24);
++                }
++            }
++        }
++        ops.push_back(o);
++        g_wgi.lim = o.nolim ? 0 : lim;
++        float f;
++        switch (o.kind) {
++        case 0: x2_w8(mv, A, (uint8_t)o.v); break;
++        case 1: x2_w16(mv, A + (rnd() & 0xFFC), (uint16_t)o.v); break;
++        case 2: x2_w32(mv, A, o.v); break;
++        default: std::memcpy(&f, &o.v, 4); x2_wf32(mv, A, f); break;
++        }
++    }
++    g_wgi.lim = lim;
++    if (s_wg_n) wg_flush_now();
++    save(*ra);
++    // (B) the R16w entry points
++    load(*orig);
++    s_x2_cap = &cb;
++    for (const Op &o : ops) {
++        float f;
++        switch (o.kind) {
++        case 0: GX_WGPIPE_Write8((uint8_t)o.v); break;
++        case 1: GX_WGPIPE_Write16((uint16_t)o.v); break;
++        case 2: GX_WGPIPE_Write32(o.v); break;
++        default: std::memcpy(&f, &o.v, 4); GX_WGPIPE_WriteF32(f); break;
++        }
++    }
++    if (s_wg_n) wg_flush_now();
++    save(*rb);
++    s_x2_cap = nullptr;
++    const bool st_eq = ra->g.sn_st == rb->g.sn_st && ra->g.sn_a == rb->g.sn_a &&
++                       ra->g.bp_armed == rb->g.bp_armed && ra->g.writes == rb->g.writes &&
++                       !std::memcmp(ra->base, rb->base, sizeof ra->base) &&
++                       !std::memcmp(ra->stride, rb->stride, sizeof ra->stride);
++    const bool eq = ca == cb && st_eq;
++    std::printf("[X2] selftest: %d writes, inline %zu B, entry points %zu B, streams %s, state %s -> %s\n",
++                kOps, ca.size(), cb.size(), ca == cb ? "equal" : "DIFFER", st_eq ? "equal" : "DIFFERS",
++                eq ? "PASS" : "FAIL");
++    load(*orig);
++    delete orig; delete ra; delete rb;
++}
++
+ // ", wgp N writes/s M flushes/s" for the NWII_FPS / fps_log stats line
+ // (R16w: + of them at a BP / by age).
+ int GX_WgpStatsLine(char *buf, int size, double dt) {
+-    static uint64_t w0 = 0, f0 = 0, b0 = 0, p0 = 0, a0 = 0;
++    static uint64_t w0 = 0, f0 = 0, b0 = 0, p0 = 0, a0 = 0, x0 = 0;
+     const uint64_t w = s_wg_writes.load(std::memory_order_relaxed);
++    const uint64_t x = s_x2_slow.load(std::memory_order_relaxed);
+     const uint64_t f = s_wg_flushes.load(std::memory_order_relaxed);
+     const uint64_t b = s_wg_bytes.load(std::memory_order_relaxed);
+     const uint64_t p = s_wg_bpf.load(std::memory_order_relaxed);
+@@ -2529,7 +2673,11 @@
+                           (w - w0) / dt / 1000, (f - f0) / dt / 1000,
+                           f > f0 ? double(b - b0) / double(f - f0) : 0.0,
+                           (p - p0) / dt / 1000, (a - a0) / dt / 1000);
+-    w0 = w; f0 = f; b0 = b; p0 = p; a0 = a;
++    // X2: share of the pipe writes made in line at the generated sites
++    if (r > 0 && r < size && w > w0)
++        r += std::snprintf(buf + r, size - r, ", x2 inline %.1f%%",
++                           100.0 * (1.0 - double(x > x0 ? x - x0 : 0) / double(w - w0)));
++    w0 = w; f0 = f; b0 = b; p0 = p; a0 = a; x0 = x;
+     return r;
+ }
+ 
+diff --color -ruN r22r7/nWiiRuntime/src/hw/hw_pi.cpp r27x2/nWiiRuntime/src/hw/hw_pi.cpp
+--- r22r7/nWiiRuntime/src/hw/hw_pi.cpp	2026-10-31 06:08:18.876644161 -0500
++++ r27x2/nWiiRuntime/src/hw/hw_pi.cpp	2026-11-10 02:27:21.375123208 -0500
+@@ -7,6 +7,8 @@
+ 
+ #include <atomic>
+ 
++namespace nwii::runtime { void GX_WgInlineUpdate(); }  // gx.cpp (X2)
++
+ namespace nwii::runtime::hw {
+ 
+ std::atomic<uint32_t> pi_intsr = 0;
+@@ -32,6 +34,7 @@
+     const uint32_t cp_base = cp_fifo_base_reg();
+     g_wgp_redirect_on = pi_fifo_base != 0 &&
+                         (pi_fifo_base & 0x03FFFFFF) != (cp_base & 0x03FFFFFF);
++    GX_WgInlineUpdate();  // X2: the generated sites' inline paths follow the flag
+ }
+ 
+ void register_pi(MMIODispatcher& dispatcher) {{
+diff --color -ruN r22r7/nWiiRuntime/src/platform/switch/switch_platform.cpp r27x2/nWiiRuntime/src/platform/switch/switch_platform.cpp
+--- r22r7/nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-11-09 05:53:25.642238604 -0500
++++ r27x2/nWiiRuntime/src/platform/switch/switch_platform.cpp	2026-11-10 02:27:26.964394422 -0500
+@@ -211,7 +211,9 @@
+                             key == "NWII_FIFO_MAX_FRAMES" || key == "NWII_SHADER_PREWARM_BAR" ||
+                             // R22 R7: on by default, "0" turns them off
+                             key == "NWII_DLMEMO" || key == "NWII_PINDEX" || key == "NWII_RENDER_FREE" ||
+-                            key == "NWII_DLMEMO_LIST" || key == "NWII_WPROF";
++                            key == "NWII_DLMEMO_LIST" || key == "NWII_WPROF" ||
++                            // X2 (r27x2): on by default, "0" turns them off
++                            key == "NWII_X2_INLINE" || key == "NWII_X2_NATIVE";
+     const bool off = lv.empty() || lv == "off" || lv == "false" || lv == "no" ||
+                      (lv == "0" && !keeps_zero);
+     if (off)

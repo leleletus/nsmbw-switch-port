@@ -1,0 +1,330 @@
+diff --color -ruN fuentes_fase2_final/nWiiRuntime/include/runtime/gx/fifo_parser.h nWiiRuntime_merge/include/runtime/gx/fifo_parser.h
+--- fuentes_fase2_final/nWiiRuntime/include/runtime/gx/fifo_parser.h	2026-11-15 17:06:18.996279774 -0500
++++ nWiiRuntime_merge/include/runtime/gx/fifo_parser.h	2026-11-15 17:32:10.691812392 -0500
+@@ -49,6 +49,8 @@
+     HostPtr<const DecodedVerts> decoded;
+     std::vector<std::pair<uint32_t, uint32_t>> ranges;  // guest addr, bytes
+     uint64_t ranges_hash = 0;
++    // r40d NWII_D_MERGE_CHECK: vertex counts of the FIFO draws merged into this one (test only).
++    std::vector<uint16_t> merge_counts;
+ };
+ 
+ // R11 render worker: the parser's register state that the renderer reads from
+@@ -110,6 +112,8 @@
+     // all parser state are as in a full parse. 0: off. LightSkipped(): draws skipped so far.
+     static void SetDoomedXfb(uint32_t n);
+     static bool RenderPrepOk(const GXCommand& c);  // r40d NWII_D_RENDERPREP (see fifo_parser.cpp)
++    static bool MergeCheckOn();                     // r40d NWII_D_MERGE_CHECK
++    static uint64_t Merged();                       // r40d: FIFO draws merged into the previous one so far
+     static uint64_t LightSkipped();
+     static void LightTime(uint64_t& ns, uint64_t& frames);  // parse time spent in doomed frames, their count
+     static void ReleaseRetired(uint64_t min_live_seq);
+diff --color -ruN fuentes_fase2_final/nWiiRuntime/src/hle/gx/fifo_parser.cpp nWiiRuntime_merge/src/hle/gx/fifo_parser.cpp
+--- fuentes_fase2_final/nWiiRuntime/src/hle/gx/fifo_parser.cpp	2026-11-15 17:06:18.994468869 -0500
++++ nWiiRuntime_merge/src/hle/gx/fifo_parser.cpp	2026-11-15 17:32:10.693915478 -0500
+@@ -779,6 +779,24 @@
+     return on;
+ }
+ static uint64_t s_eager_draws = 0;
++// r40d NWII_D_MERGE=1: a FIFO draw that comes right after another FIFO draw (no command between
++// them: the render state is the same), with the same primitive (quads or triangles: lists, so
++// the concatenation is the same primitives in the same order) and the same snapshot (VAT, arrays,
++// default matrices; no parse-time transform), is appended to it (bytes and count) instead of
++// becoming a draw of its own. The renderer then sees one draw with the same vertices in the same
++// order. Kept apart: display-list draws (the cache owns them), draws already decoded, a previous
++// draw whose count is not a whole number of primitives, more than kMergeMaxVerts vertices.
++static bool MergeOn() {
++    static const bool on = [] { const char* e = NWII_ENV("NWII_D_MERGE"); return e && e[0] && e[0] != '0'; }();
++    return on;
++}
++bool FifoParser::MergeCheckOn() {
++    static const bool on = NWII_ENV("NWII_D_MERGE_CHECK") != nullptr;
++    return on;
++}
++static uint64_t s_merged = 0;
++uint64_t FifoParser::Merged() { return s_merged; }
++static constexpr uint32_t kMergeMaxVerts = 4096;
+ static bool AllDirect(const VATSlot& v) {
+     auto ix = [](VtxAttrMask m) { return m == VtxAttrMask::Index8 || m == VtxAttrMask::Index16; };
+     if (ix(v.posMask) || ix(v.nrmMask) || ix(v.clrMask[0]) || ix(v.clrMask[1])) return false;
+@@ -2091,6 +2109,34 @@
+                 offset += need;
+                 continue;
+             }
++            if (depth == 0 && MergeOn() && !commands.empty() && !PreXf()) {  // r40d NWII_D_MERGE
++                GXCommand& p = commands.back();
++                const uint8_t prim = cmd & 0xF8;
++                const uint32_t unit = prim == 0x80 ? 4u : 3u;
++                if (p.type == GXCommandType::DrawPrimitive && p.prim_type == prim && (prim == 0x80 || prim == 0x90) &&
++                    p.raw && !p.raw->in_dl && p.vertices.empty() && !p.shared_vertices) {
++                    DrawRaw& r = *p.raw;
++                    if (r.count % unit == 0 && (uint32_t)r.count + vtx_count <= kMergeMaxVerts &&
++                        !r.have_snap_mtx && r.snap_pos_bank.empty() && !r.decoded &&
++                        std::memcmp(&r.vat, &vat, sizeof vat) == 0 && r.defPosMtxIdx == s_ps.defPosMtxIdx &&
++                        std::memcmp(r.defTexMtxIdx, s_ps.defTexMtxIdx, 8) == 0 &&
++                        std::memcmp(r.arrayBase, s_ps.arrayBase, sizeof r.arrayBase) == 0 &&
++                        std::memcmp(r.arrayStride, s_ps.arrayStride, sizeof r.arrayStride) == 0 &&
++                        r.bytes.size() == (size_t)r.count * vsize) {
++                        if (FifoParser::MergeCheckOn()) {
++                            if (r.merge_counts.empty()) r.merge_counts.push_back(r.count);
++                            r.merge_counts.push_back(vtx_count);
++                        }
++                        r.bytes.insert(r.bytes.end(), fifo.begin() + offset + 3, fifo.begin() + offset + need);
++                        r.count = (uint16_t)(r.count + vtx_count);
++                        ++s_merged;
++                        g_prof_draws++;
++                        g_prof_draw_bytes += need;
++                        offset += need;
++                        continue;
++                    }
++                }
++            }
+             if (depth == 0 && EagerDecodeOn() && !PreXf() && AllDirect(vat)) {
+                 // r40d NWII_D_EAGERDECODE=1: a FIFO draw whose attributes are all direct
+                 // decodes from its own bytes and the parser state of this moment only
+diff --color -ruN fuentes_fase2_final/nWiiRuntime/src/hle/gx/renderer_gl.cpp nWiiRuntime_merge/src/hle/gx/renderer_gl.cpp
+--- fuentes_fase2_final/nWiiRuntime/src/hle/gx/renderer_gl.cpp	2026-11-15 17:05:52.410244334 -0500
++++ nWiiRuntime_merge/src/hle/gx/renderer_gl.cpp	2026-11-15 17:32:58.270282991 -0500
+@@ -6276,6 +6276,8 @@
+ // r40d NWII_D_DROPFAST: first command of the frame to render (gx.cpp; the ones
+ // before it are the dropped part of the batch, whose kept writes are in the prefix).
+ size_t g_render_start = 0;
++// r40d NWII_D_MERGE_CHECK (gx.cpp): this frame with every merged FIFO draw split back into its parts.
++const std::vector<GXCommand> *g_d_merge_alt = nullptr;
+ 
+ // R14 R5, GPU XF: prefetch from the worker's entry list, without the
+ // dependent loads of the old prefetch (command -> DecodedVerts -> entry, each
+@@ -6557,7 +6559,54 @@
+   // frame's copy in a single pass but this frame's in a repeated one, so only
+   // repeated passes are compared ("pass1" counts how often the first one
+   // differs too, which includes that effect).
++  // r40d NWII_D_MERGE_CHECK: the frame is drawn as usual (presented pass first, as
++  // FRAMECHECK does, so the compared passes are both repeats), then from the split copy and
++  // again merged, both without the worker's draw lists (same emit path), and the XFB images
++  // of the last two are compared pixel by pixel ("[D40MERGE_CHECK]").
++  void MergeCheck(const std::vector<GXCommand> &commands) {
++    static GXState *saved = new GXState;
++    std::memcpy((void *)saved, (const void *)&g_state, sizeof(GXState));
++    const long copies0 = s_xfb_copies;
++    RenderOnce(commands);
++    if (s_xfb_copies == copies0 || !s_xfb_w) return;
++    const long copies1 = s_xfb_copies;
++    static std::vector<uint8_t> a, b;
++    const auto *dr = g_render_draws;
++    const auto *en = g_render_entries;
++    const size_t st = g_render_start;
++    auto pass = [&](const std::vector<GXCommand> &cmds, size_t start, std::vector<uint8_t> &out) {
++      std::memcpy((void *)&g_state, (const void *)saved, sizeof(GXState));
++      s_xfb_copies = copies0;
++      g_render_draws = nullptr;
++      g_render_entries = nullptr;
++      g_render_start = start;
++      RenderOnce(cmds);
++      ReadXfb(out);
++    };
++    pass(*g_d_merge_alt, 0, b);
++    pass(commands, st, a);
++    g_render_draws = dr;
++    g_render_entries = en;
++    g_render_start = st;
++    s_xfb_copies = copies1;
++    static uint64_t checks = 0, same = 0;
++    size_t diff = 0;
++    if (a.size() != b.size()) diff = std::max(a.size(), b.size()) / 4;
++    else
++      for (size_t i = 0; i < a.size(); i += 4)
++        if (std::memcmp(&a[i], &b[i], 4)) ++diff;
++    ++checks;
++    if (!diff) ++same;
++    static int logged = 0;
++    if ((diff && logged++ < 16) || checks % 20 == 0)
++      printf("[D40MERGE_CHECK] checks=%llu identical=%llu | xfb %ld: %zu pixels differ\n",
++             (unsigned long long)checks, (unsigned long long)same, s_xfb_copies, diff);
++  }
+   void Render(const std::vector<GXCommand> &commands) override {
++    if (g_d_merge_alt && s_xfb_fbo) {  // r40d
++      MergeCheck(commands);
++      return;
++    }
+     static const long every = [] {
+       const char *e = NWII_ENV("NWII_R9_FRAMECHECK");
+       return e ? std::max(1L, std::atol(e)) : 0L;
+diff --color -ruN fuentes_fase2_final/nWiiRuntime/src/hle/gx.cpp nWiiRuntime_merge/src/hle/gx.cpp
+--- fuentes_fase2_final/nWiiRuntime/src/hle/gx.cpp	2026-11-15 17:06:53.914063483 -0500
++++ nWiiRuntime_merge/src/hle/gx.cpp	2026-11-15 17:32:40.072788037 -0500
+@@ -803,6 +803,7 @@
+ extern const std::vector<uint32_t> *g_render_pack;         // renderer_gl.cpp (R14 R5)
+ extern const std::vector<GXCommand> *g_render_prefix;      // renderer_gl.cpp (r36r NWII_R_PREFIX)
+ extern size_t g_render_start;                              // renderer_gl.cpp (r40d NWII_D_DROPFAST)
++extern const std::vector<GXCommand> *g_d_merge_alt;        // renderer_gl.cpp (r40d NWII_D_MERGE_CHECK)
+ }
+ static uint64_t g_ph[8], g_ph_n;
+ static std::vector<nwii::runtime::gx::GXCommand*> s_draws;
+@@ -1027,6 +1028,8 @@
+     // r40d NWII_D_RENDERPREP: draws (indices into `draws`) the render thread decodes and
+     // packs itself just before rendering (their entries are null until then).
+     std::vector<uint32_t> rprep;
++    // r40d NWII_D_MERGE_CHECK: merged draws (index into `draws`) and the vertex counts of their parts.
++    std::vector<std::pair<uint32_t, std::vector<uint16_t>>> merges;
+     uint64_t seq = 0;          // R22 R7: frame number (s_prep_frames) of its frame
+     bool has_draws = false;    // R22 R7: its commands may point at retired vertices
+     bool render_frees = false; // R22 R7: no command shares a reference count with the worker
+@@ -1259,6 +1262,7 @@
+ static void RetractToPrefix(FramePacket &pkt) {
+     auto &v = pkt.frame;
+     pkt.rprep.clear();  // r40d (its draws are dropped)
++    pkt.merges.clear();
+     // r40d NWII_D_DROPFAST: frame[0, start) is the dropped part of the packet's
+     // batch (its kept writes are already in pkt.pre): never looked at again.
+     const size_t b = std::min(pkt.start, v.size());
+@@ -2042,6 +2046,9 @@
+     }();
+     static std::vector<uint32_t> s_rprep;
+     s_rprep.clear();
++    static const bool s_dmcheck = nwii::runtime::gx::FifoParser::MergeCheckOn();
++    static std::vector<std::pair<uint32_t, std::vector<uint16_t>>> s_dmerges;
++    s_dmerges.clear();
+     const bool rprep = s_rprep_on && !apply_now;
+     // r40d NWII_D_STATS=1 (diagnóstico): draws del fotograma por tipo ([D40S] cada ~2 s).
+     static const bool s_dstats = NWII_ENV("NWII_D_STATS") != nullptr;
+@@ -2104,6 +2111,42 @@
+             }
+         }
+         std::swap(prev, cur);
++        {
++            // r40d diagnostic: runs of FIFO draws back to back in the frame (no command between),
++            // same primitive and same snapshot (VAT, arrays, default matrices): mergeable candidates.
++            static uint64_t rf = 0, rdraws = 0, radj = 0, rsame = 0, runs = 0, rmax = 0, rcur = 0, between = 0;
++            const nwii::runtime::gx::GXCommand *prevd = nullptr;
++            ++rf;
++            for (size_t fi = fstart; fi < frame.size(); ++fi) {
++                const auto &c = frame[fi];
++                const bool imm = c.type == nwii::runtime::gx::GXCommandType::DrawPrimitive && c.raw && !c.raw->in_dl;
++                if (!imm) { if (prevd) ++between; prevd = nullptr; rcur = 0; continue; }
++                ++rdraws;
++                if (prevd) {
++                    ++radj;
++                    const auto &a = *prevd->raw, &b = *c.raw;
++                    if (prevd->prim_type == c.prim_type && !std::memcmp(&a.vat, &b.vat, sizeof a.vat) &&
++                        !std::memcmp(a.arrayBase, b.arrayBase, sizeof a.arrayBase) &&
++                        !std::memcmp(a.arrayStride, b.arrayStride, sizeof a.arrayStride) &&
++                        a.defPosMtxIdx == b.defPosMtxIdx && !std::memcmp(a.defTexMtxIdx, b.defTexMtxIdx, 8) &&
++                        a.have_snap_mtx == b.have_snap_mtx) {
++                        ++rsame;
++                        rmax = std::max(rmax, ++rcur);
++                    } else {
++                        rcur = 0;
++                    }
++                } else {
++                    ++runs;
++                }
++                prevd = &c;
++            }
++            if (rf >= 120) {
++                std::printf("[D40M] por fotograma: draws FIFO %.0f, pegados al anterior %.0f (mismo formato/estado %.0f),"
++                            " tramos %.0f, tramo max %llu\n", rdraws / (double)rf, radj / (double)rf, rsame / (double)rf,
++                            runs / (double)rf, (unsigned long long)rmax + 1);
++                rf = rdraws = radj = rsame = runs = rmax = rcur = between = 0;
++            }
++        }
+         const auto now = std::chrono::steady_clock::now();
+         if (now - last >= std::chrono::seconds(2)) {
+             last = now;
+@@ -2131,6 +2174,10 @@
+                 if (r->decoded) __builtin_prefetch(r->decoded.get());
+             }
+         }
++        if (s_dmcheck) {  // r40d NWII_D_MERGE_CHECK: the parts of a merged draw, before its DrawRaw goes
++            const auto *r = s_draws[i]->raw.get();
++            if (r && !r->merge_counts.empty()) s_dmerges.push_back({(uint32_t)i, r->merge_counts});
++        }
+         if (rprep && nwii::runtime::gx::FifoParser::RenderPrepOk(*s_draws[i])) {  // r40d
+             s_rprep.push_back((uint32_t)i);
+             s_draw_entries[i] = nullptr;
+@@ -2168,6 +2215,23 @@
+     pkt.pack.swap(s_draw_pack);
+     pkt.start = fstart;  // r40d
+     pkt.rprep.swap(s_rprep);  // r40d NWII_D_RENDERPREP
++    pkt.merges.swap(s_dmerges);  // r40d NWII_D_MERGE_CHECK
++    s_dmerges.clear();
++    {
++        static uint64_t m0 = 0, f = 0;  // r40d NWII_D_MERGE: [D40G] FIFO draws merged per prepared frame
++        static auto last = std::chrono::steady_clock::now();
++        ++f;
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last >= std::chrono::seconds(2)) {
++            last = now;
++            const uint64_t m = nwii::runtime::gx::FifoParser::Merged();
++            if (m != m0)
++                std::printf("[D40G] draws del FIFO fundidos con el anterior: %.0f por fotograma preparado\n",
++                            (m - m0) / (double)f);
++            m0 = m;
++            f = 0;
++        }
++    }
+     s_rprep.clear();
+     pkt.seq = s_prep_frames;
+     pkt.has_draws = !pkt.draws.empty();
+@@ -2428,6 +2492,54 @@
+             nwii::runtime::gx::g_render_pack = &pkt.pack;
+             nwii::runtime::gx::g_render_prefix = &pkt.pre;  // r36r (empty unless NWII_R_PREFIX)
+             nwii::runtime::gx::g_render_start = pkt.start;  // r40d (0 unless NWII_D_DROPFAST)
++            // r40d NWII_D_MERGE_CHECK=<n>: every n-th frame with merged draws, the renderer draws it
++            // also from a copy where each merged draw is split back into its parts, and compares.
++            static std::vector<nwii::runtime::gx::GXCommand> s_alt;
++            static long s_mc_every = [] {
++                const char *e = NWII_ENV("NWII_D_MERGE_CHECK");
++                return e ? std::max(1L, std::atol(e)) : 0L;
++            }();
++            static long s_mc_n = 0;
++            if (s_mc_every && !pkt.merges.empty() && (++s_mc_n % s_mc_every) == 0) {
++                using nwii::runtime::gx::GXCommand;
++                using nwii::runtime::gx::GXCommandType;
++                std::unordered_map<const GXCommand *, const std::vector<uint16_t> *> parts;
++                for (const auto &m : pkt.merges) parts[pkt.draws[m.first]] = &m.second;
++                s_alt.clear();
++                bool ok = true;
++                for (size_t fi = pkt.start; fi < pkt.frame.size() && ok; ++fi) {
++                    const GXCommand &c = pkt.frame[fi];
++                    if (c.type != GXCommandType::DrawPrimitive) {
++                        GXCommand &n = s_alt.emplace_back();
++                        n.type = c.type; n.prim_type = c.prim_type; n.stale_copy = c.stale_copy; n.reg = c.reg;
++                        n.length = c.length; n.val = c.val; n.bp_raw = c.bp_raw; n.payload = c.payload;
++                        continue;
++                    }
++                    if (c.raw) { ok = false; break; }  // not decoded: no comparison for this frame
++                    auto it = parts.find(&c);
++                    const std::vector<nwii::runtime::gx::VertexData> &v = c.verts();
++                    if (it == parts.end()) {
++                        GXCommand &n = s_alt.emplace_back();
++                        n.type = c.type; n.prim_type = c.prim_type; n.reg = c.reg; n.length = c.length; n.val = c.val;
++                        if (c.shared_vertices)  // aliasing, no count touched (render thread)
++                            n.shared_vertices = nwii::runtime::gx::HostPtr<const nwii::runtime::gx::DecodedVerts>(
++                                nwii::runtime::gx::HostPtr<const nwii::runtime::gx::DecodedVerts>(), c.shared_vertices.get());
++                        else
++                            n.vertices = c.vertices;
++                        continue;
++                    }
++                    size_t at = 0;
++                    for (const uint16_t k : *it->second) {
++                        if (at + k > v.size()) { ok = false; break; }
++                        GXCommand &n = s_alt.emplace_back();
++                        n.type = c.type; n.prim_type = c.prim_type; n.reg = c.reg; n.length = c.length; n.val = c.val;
++                        n.vertices.assign(v.begin() + (ptrdiff_t)at, v.begin() + (ptrdiff_t)(at + k));
++                        at += k;
++                    }
++                    if (at != v.size()) ok = false;
++                }
++                if (ok) nwii::runtime::gx::g_d_merge_alt = &s_alt;
++            }
+             // r31t (frente T), SOLO MEDIR: NWII_T_NORENDER=N dibuja 1 de cada N fotogramas
+             // (el hilo de render queda casi parado) para ver cuanto frena al hilo del juego
+             // el trabajo del render en los otros nucleos (cache L2 compartida, memoria).
+@@ -2443,6 +2555,7 @@
+             nwii::runtime::gx::g_render_pack = nullptr;
+             nwii::runtime::gx::g_render_prefix = nullptr;
+             nwii::runtime::gx::g_render_start = 0;
++            nwii::runtime::gx::g_d_merge_alt = nullptr;
+             if (gpuprof) g_gpu_timer.end();
+             g_prof_render_cpu_us += thread_cpu_us() - rc0;
+             auto r1 = std::chrono::steady_clock::now();

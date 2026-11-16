@@ -1,0 +1,302 @@
+diff --color -ruN r41m/nWiiRuntime_m6e/src/core/main.cpp r44w/nWiiRuntime/src/core/main.cpp
+--- r41m/nWiiRuntime_m6e/src/core/main.cpp	2026-11-15 16:52:39.282805467 -0500
++++ r44w/nWiiRuntime/src/core/main.cpp	2026-11-15 17:30:02.287597977 -0500
+@@ -44,6 +44,8 @@
+ 
+ void vtl_note(uint32_t kind, uint32_t arg);  // r37v (gx.cpp): NWII_V_TL
+ void vtl_init();
++// r44w (frente W): renderizador nativo de la superficie del agua (w_agua_gen.cpp, NWII_W_AGUA)
++extern "C" void w_agua_install(nwii::runtime::CPUContext *ctx);
+ namespace nwii::runtime {
+     namespace hw { extern uint32_t g_vi_top_field_base; }
+     // CPU-thread sleeps in the guest OS idle loop (os_hle_stubs.cpp idle_wait).
+@@ -744,6 +746,7 @@
+   }
+ 
+   ::vtl_init();  // r37v: NWII_V_TL=<ruta>
++  w_agua_install(ctx.get());  // r44w: NWII_W_AGUA (antes del primer bctrl: la tabla hash de g7 se monta después)
+   nwii::runtime::s2::init(ctx.get());  // r34s2 (NWII_S2=1): CPU de sonido
+ #ifndef __SWITCH__
+   nwii::runtime::s2::pc_sched(0);  // r38c: NWII_C_PCSCHED (solo PC): este hilo es el de render
+diff --color -ruN r41m/nWiiRuntime_m6e/src/hle/gx.cpp r44w/nWiiRuntime/src/hle/gx.cpp
+--- r41m/nWiiRuntime_m6e/src/hle/gx.cpp	2026-11-15 15:49:28.922677149 -0500
++++ r44w/nWiiRuntime/src/hle/gx.cpp	2026-11-15 17:50:48.037698442 -0500
+@@ -327,7 +327,8 @@
+ // the parser takes the copies in the same order, checks they belong to the
+ // command it is parsing (same array/address/size or same list), and reads
+ // live RAM as before when there is none. NWII_IDXSNAP=0 disables.
+-namespace hw { extern bool g_wgp_redirect_on; }  // hw_pi.cpp
++// [r44w] oculto: el código no pasa por la GOT para leerlo (una carga menos en cada escritura al pipe)
++namespace hw { extern bool g_wgp_redirect_on __attribute__((visibility("hidden"))); }  // hw_pi.cpp
+ static const bool s_idx_on = [] {
+     const char *e = NWII_ENV("NWII_IDXSNAP");
+     return !(e && e[0] == '0');
+@@ -2958,6 +2959,19 @@
+     }
+ }
+ 
++// [r44w] NWII_W_WGP="1": caminos cortos de Write8/16/32/F32 (mismo flujo y mismo estado que los de R16w):
++// una sola bandera decidida al arrancar (write-gather en línea, búfer de 4 KB, sniffer encendido) + la redirección,
++// el sniffer de Write8 por tabla cuando está en reposo (s_sn_st == 0, el caso de casi todos los bytes) y el límite
++// del búfer como constante. Fuera de esas condiciones, el camino de siempre.
++static bool s_w1_fast = false;
++static void w1_selftest();
++static constexpr uint8_t kSn8Of(unsigned b) {
++    return b == 0x08 ? 1 : (b & 0xE7) == 0x20 ? 3 : b == 0x40 ? 4 : b == 0x78 ? 6 : 0;
++}
++struct Sn8Tab { uint8_t v[256]; constexpr Sn8Tab() : v() { for (unsigned i = 0; i < 256; ++i) v[i] = kSn8Of(i); } };
++alignas(64) static constexpr Sn8Tab kSn8{};
++static inline bool w1_on() { return __builtin_expect(s_w1_fast & !hw::g_wgp_redirect_on, 1); }
++
+ static NWII_NOINLINE void wg_init_mode() {
+     static const bool sample = NWII_ENV("NWII_SAMPLE") != nullptr;
+     if (const char *e = NWII_ENV("NWII_WGP_CAP")) {
+@@ -2968,6 +2982,9 @@
+     s_wg_gather = wgp_gather();
+     s_wg_sample = sample;
+     s_wg_mode = wgp_gather() && !s_wcheck && !sample ? 1 : 0;
++    s_w1_fast = std::getenv("NWII_W_WGP") != nullptr && s_wg_mode == 1 && s_wg_cap == kWgCap && s_idx_on;
++    if (std::getenv("NWII_W_WGP")) std::printf("[WGP] r44w NWII_W_WGP: caminos cortos %s\n", s_w1_fast ? "SI" : "no (condiciones)");
++    if (s_w1_fast && std::getenv("NWII_W_WGP_SELFTEST")) w1_selftest();
+     std::printf("[WGP] write-gather: %s, buffer %u B, hand-over at full / BP 0x45 0x47 0x48 0x52%s"
+                 " / age / idle\n",
+                 !wgp_gather() ? "off (direct path)" : s_wg_mode ? "on (inline paths)" : "on (checked paths)",
+@@ -3009,7 +3026,16 @@
+     return __builtin_expect((s_wg_mode > 0) & !hw::g_wgp_redirect_on, 1);
+ }
+ 
++// [r44w] NWII_W_AGUA_CHECK (PC): mientras g_w_cap != nullptr (con s_wg_mode = 0, así todo va por los caminos
++// completos) cada escritura al pipe se apunta en la captura (tipo + valor) y NO llega al pipe ni cambia su
++// estado; w_agua_check la vuelve a hacer después, una a una, por las funciones de siempre.
++std::vector<uint8_t> *g_w_cap = nullptr;
++static NWII_NOINLINE void w_cap(uint8_t kind, uint64_t v, int n) {
++    g_w_cap->push_back(kind);
++    for (int i = n - 1; i >= 0; --i) g_w_cap->push_back((uint8_t)(v >> (i * 8)));
++}
+ static NWII_NOINLINE void wgp_write8_full(uint8_t val) {
++    if (__builtin_expect(g_w_cap != nullptr, 0)) { w_cap(1, val, 1); return; }
+     if (__builtin_expect(s_wg_mode < 0, 0)) wg_init_mode();
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     if (__builtin_expect(hw::g_wgp_redirect_on, 0) && wgp_redirect(val)) { s_bp_armed = false; return; }
+@@ -3027,6 +3053,17 @@
+ }
+ 
+ void GX_WGPIPE_Write8(uint8_t val) {
++    if (w1_on()) {
++        s_bp_armed = (val == 0x61);
++        if (__builtin_expect(s_sn_st == 0, 1)) { s_sn_st = kSn8.v[val]; s_sn_a = val; }
++        else idx_sniff8(val);
++        ++s_wg_writes_l;
++        uint32_t n = s_wg_n;
++        if (__builtin_expect(n >= kWgCap, 0)) { wg_flush_now(); n = 0; }
++        s_wg[n] = val;
++        s_wg_n = n + 1;
++        return;
++    }
+     if (wg_fast()) {
+         s_bp_armed = (val == 0x61);
+         idx_sniff8(val);
+@@ -3038,6 +3075,7 @@
+ }
+ 
+ static NWII_NOINLINE void wgp_write16_full(uint16_t val) {
++    if (__builtin_expect(g_w_cap != nullptr, 0)) { w_cap(2, val, 2); return; }
+     if (__builtin_expect(s_wg_mode < 0, 0)) wg_init_mode();
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     s_bp_armed = false;
+@@ -3055,7 +3093,25 @@
+     wgp_push(val & 0xFF);
+ }
+ 
++static inline void w1_put4(uint32_t v) {
++    uint32_t n = s_wg_n;
++    if (__builtin_expect(n > kWgCap - 4, 0)) { wg_flush_now(); n = 0; }
++    const uint32_t be = __builtin_bswap32(v);
++    std::memcpy(s_wg + n, &be, 4);
++    s_wg_n = n + 4;
++}
+ void GX_WGPIPE_Write16(uint16_t val) {
++    if (w1_on()) {
++        s_bp_armed = false;
++        s_sn_st = 0;
++        ++s_wg_writes_l;
++        uint32_t n = s_wg_n;
++        if (__builtin_expect(n > kWgCap - 2, 0)) { wg_flush_now(); n = 0; }
++        const uint16_t be = __builtin_bswap16(val);
++        std::memcpy(s_wg + n, &be, 2);
++        s_wg_n = n + 2;
++        return;
++    }
+     if (wg_fast()) {
+         s_bp_armed = false;
+         idx_sniff16(val);
+@@ -3071,6 +3127,7 @@
+ std::atomic<uint32_t> g_guest_xfb{0};
+ 
+ static NWII_NOINLINE void wgp_write32(uint32_t val, bool is_int) {
++    if (__builtin_expect(g_w_cap != nullptr, 0)) { w_cap(is_int ? 3 : 4, val, 4); return; }
+     if (__builtin_expect(s_wg_mode < 0, 0)) wg_init_mode();
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     bool bp = s_bp_armed && is_int;
+@@ -3149,6 +3206,11 @@
+ // hand-over (no XFB count, no PE signal; ~250 000/s in the title demo) and the
+ // value of a CP register write (array base/stride for the LOAD_INDX copies).
+ void GX_WGPIPE_Write32(uint32_t val) {
++    if (w1_on() && __builtin_expect(!s_bp_armed & (s_sn_st == 0), 1)) {
++        ++s_wg_writes_l;
++        w1_put4(val);
++        return;
++    }
+     if (wg_fast()) {
+         if (__builtin_expect(!s_bp_armed & (s_sn_st == 0), 1)) {
+             ++s_wg_writes_l;
+@@ -3177,6 +3239,13 @@
+ 
+ void GX_WGPIPE_WriteF32(float val) {
+     union { float f; uint32_t i; } u; u.f = val;
++    if (w1_on()) {
++        s_bp_armed = false;
++        s_sn_st = 0;
++        ++s_wg_writes_l;
++        w1_put4(u.i);
++        return;
++    }
+     if (wg_fast()) {
+         s_bp_armed = false;
+         s_sn_st = 0;  // idx_sniff32(v, false)
+@@ -3188,6 +3257,7 @@
+ }
+ 
+ static NWII_NOINLINE void wgp_write64_full(uint64_t v) {
++    if (__builtin_expect(g_w_cap != nullptr, 0)) { w_cap(5, v, 8); return; }
+     if (__builtin_expect(s_wg_mode < 0, 0)) wg_init_mode();
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     s_bp_armed = false;
+@@ -3222,6 +3292,127 @@
+     wgp_write64_full(u.i);
+ }
+ 
++// [r44w] frente W: entrega en bloque de la cola del renderizador nativo del agua (w_agua_cola.h).
++// bytes = las escrituras en orden, big endian; tape[i] = 1 (Write8), 2 (Write16) o 4 (WriteF32).
++// Camino rápido (el de las funciones en línea de R16w: write-gather, sin redirección, sin NWII_WGP_CHECK):
++// deja exactamente lo que dejarían esas llamadas una a una:
++//   - los bytes en el búfer (entregando al llenarse, como wg_room; solo cambia en qué byte se corta la entrega);
++//   - s_wg_writes_l += nwrites;
++//   - s_bp_armed = la última escritura es Write8(0x61);
++//   - sniffer: Write16/WriteF32 ponen s_sn_st = 0 (sin mirar s_idx_on) y no tocan s_sn_a; Write8 pasa por
++//     idx_sniff8. El estado final solo depende de la última racha de Write8 (desde s_sn_st = 0 si la precede otra
++//     escritura del bloque, o desde el estado de antes si empieza el bloque) y de si hay escrituras detrás.
++// Si no se puede usar el camino rápido, se repiten las llamadas una a una (idéntico por construcción).
++std::atomic<uint64_t> g_w_commits{0}, g_w_commit_writes{0}, g_w_commit_slow{0};
++// [r44w] comprobación: fuerza los caminos completos (0) mientras se captura; devuelve el modo anterior.
++// [r44w] NWII_W_WGP_SELFTEST=1 (PC, al arrancar, antes de que el juego escriba nada): las mismas secuencias
++// aleatorias de Write8/16/32/F32 (bytes sesgados a 0x61/0x08/0x20-0x38/0x40/0x78/0xAC/0xBC...) por los caminos
++// cortos y por los de siempre, comparando tras CADA escritura los bytes del búfer, s_sn_st, s_sn_a, s_bp_armed y
++// el contador. Evita lo que tiene efectos fuera del pipe (LOAD_INDX/CALL_DL completos, BP que entregan): esas
++// palabras van por el camino completo en las dos versiones igualmente.
++static void w1_selftest() {
++    uint64_t rs = 0x9E3779B97F4A7C15ull, nops = 0, nbad = 0;
++    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
++    static const uint8_t kSpecial[] = {0x61, 0x08, 0x20, 0x28, 0x30, 0x38, 0x40, 0x78, 0xAC, 0xBC, 0x10, 0x00};
++    const bool save = s_w1_fast;
++    for (int seq = 0; seq < 4000; ++seq) {
++        const uint64_t seed = rnd();
++        std::vector<uint64_t> trace[2];
++        for (int pass = 0; pass < 2; ++pass) {
++            s_w1_fast = pass == 1;
++            s_wg_n = 0; s_sn_st = 0; s_sn_a = 0; s_bp_armed = false;
++            uint64_t r2 = seed | 1;
++            auto rr = [&]() { r2 ^= r2 << 13; r2 ^= r2 >> 7; r2 ^= r2 << 17; return r2; };
++            for (int op = 0; op < 200; ++op) {
++                const uint64_t x = rr();
++                const int kind = (int)(x % 4);
++                const uint8_t sb = (x >> 8) % 3 ? kSpecial[(x >> 16) % sizeof kSpecial] : (uint8_t)(x >> 24);
++                if (kind == 0) GX_WGPIPE_Write8(sb);
++                else if (kind == 1) GX_WGPIPE_Write16((uint16_t)(sb << 8 | (x >> 32 & 0xFF)));
++                else if (kind == 2) {
++                    // sin efectos fuera del pipe: ni LOAD_INDX/CALL_DL pendientes ni BP que entregan
++                    if (s_sn_st == 3 || s_sn_st == 4 || s_sn_st == 5) { GX_WGPIPE_Write16(0x1234); }
++                    else {
++                        uint32_t v = (uint32_t)(x >> 32);
++                        const uint8_t top = v >> 24;
++                        if (top == 0x45 || top == 0x47 || top == 0x48 || top == 0x52) v ^= 0x01000000u;
++                        GX_WGPIPE_Write32(v);
++                    }
++                } else { union { uint32_t i; float f; } u; u.i = (uint32_t)(x >> 32); GX_WGPIPE_WriteF32(u.f); }
++                uint64_t h = s_wg_n;
++                h = h * 1000003u ^ (uint64_t)s_sn_st;
++                h = h * 1000003u ^ s_sn_a;
++                h = h * 1000003u ^ (uint64_t)s_bp_armed;
++                h = h * 1000003u ^ s_wg_writes_l;
++                for (uint32_t i = s_wg_n > 8 ? s_wg_n - 8 : 0; i < s_wg_n; ++i) h = h * 131u ^ s_wg[i];
++                trace[pass].push_back(h);
++                ++nops;
++            }
++            s_wg_writes_l -= 200;  // el contador debe sumar lo mismo en las dos pasadas; se deshace
++        }
++        if (trace[0] != trace[1]) ++nbad;
++    }
++    s_wg_n = 0; s_sn_st = 0; s_sn_a = 0; s_bp_armed = false;
++    s_w1_fast = save;
++    std::printf("[WGP] r44w selftest: %d secuencias, %llu escrituras por cada camino, %llu secuencias distintas -> %s\n",
++                4000, (unsigned long long)(nops / 2), (unsigned long long)nbad, nbad ? "FALLO" : "OK");
++}
++static bool s_w1_saved = false;
++int GX_W_ModeSwap(int m) {
++    const int o = s_wg_mode;
++    if (m <= 0) { s_w1_saved = s_w1_fast; s_w1_fast = false; }
++    else s_w1_fast = s_w1_saved;
++    s_wg_mode = m;
++    return o;
++}
++void GX_WGPIPE_CommitTape(const uint8_t *b, const uint8_t *t, uint32_t nw, uint32_t nb) {
++    if (!nw) return;
++    if (__builtin_expect(!wg_fast() || g_w_cap != nullptr, 0)) {
++        g_w_commit_slow.fetch_add(1, std::memory_order_relaxed);
++        uint32_t p = 0;
++        for (uint32_t i = 0; i < nw; ++i) {
++            if (t[i] == 1) { GX_WGPIPE_Write8(b[p]); p += 1; }
++            else if (t[i] == 2) { GX_WGPIPE_Write16((uint16_t)(b[p] << 8 | b[p + 1])); p += 2; }
++            else { union { uint32_t i; float f; } u; u.i = (uint32_t)b[p] << 24 | (uint32_t)b[p + 1] << 16 |
++                   (uint32_t)b[p + 2] << 8 | b[p + 3]; GX_WGPIPE_WriteF32(u.f); p += 4; }
++        }
++        return;
++    }
++    // estado final de BP/sniffer
++    const uint32_t last = nw - 1;
++    s_bp_armed = t[last] == 1 && b[nb - 1] == 0x61;
++    int32_t e = (int32_t)last;
++    uint32_t pe = nb;  // posición tras la escritura e
++    while (e >= 0 && t[e] != 1) { pe -= t[e]; --e; }
++    if (e < 0) {
++        s_sn_st = 0;
++    } else if (!s_idx_on) {
++        // alguna escritura no-Write8 en el bloque -> s_sn_st = 0 (Write8 no lo toca sin s_idx_on)
++        bool any = false;
++        for (uint32_t i = 0; i < nw; ++i) any |= t[i] != 1;
++        if (any) s_sn_st = 0;
++    } else {
++        int32_t s0 = e;
++        while (s0 > 0 && t[s0 - 1] == 1) --s0;
++        const uint32_t ps = pe - (uint32_t)(e - s0 + 1);
++        if (s0 > 0) s_sn_st = 0;
++        for (uint32_t p = ps; p < pe; ++p) idx_sniff8(b[p]);
++        if (e != (int32_t)last) s_sn_st = 0;
++    }
++    s_wg_writes_l += nw;
++    g_w_commits.fetch_add(1, std::memory_order_relaxed);
++    g_w_commit_writes.fetch_add(nw, std::memory_order_relaxed);
++    uint32_t p = 0;
++    while (p < nb) {
++        uint32_t room = s_wg_cap - s_wg_n;
++        if (!room) { wg_flush_now(); room = s_wg_cap; }
++        const uint32_t k = nb - p < room ? nb - p : room;
++        std::memcpy(s_wg + s_wg_n, b + p, k);
++        s_wg_n += k;
++        p += k;
++    }
++}
++
+ // ", wgp N writes/s M flushes/s" for the NWII_FPS / fps_log stats line
+ // (R16w: + of them at a BP / by age).
+ int GX_WgpStatsLine(char *buf, int size, double dt) {

@@ -1,0 +1,202 @@
+diff --color -ruN base/nWiiRuntime/include/runtime/cpu_context.h cpucode/nWiiRuntime/include/runtime/cpu_context.h
+--- a/nWiiRuntime/include/runtime/cpu_context.h	2026-10-31 03:38:55.954975995 -0500
++++ b/nWiiRuntime/include/runtime/cpu_context.h	2026-10-31 07:32:50.522920292 -0500
+@@ -66,7 +66,14 @@
+ 
+ 
+ void watch_hit(uint32_t addr, uint32_t value, int width);
+-extern uint32_t g_watch_addr;
++// R9 cpucode: hidden (the NRO / PC binary is one statically linked module), so
++// the generated code reads it PC-relative instead of through the GOT.
++#if defined(__GNUC__)
++#define NWII_HIDDEN __attribute__((visibility("hidden")))
++#else
++#define NWII_HIDDEN
++#endif
++extern uint32_t g_watch_addr NWII_HIDDEN;
+ 
+ // Strict Dolphin-accurate MMU
+ struct MMU {
+@@ -341,79 +348,110 @@
+   uint8_t *const b1;
+   uint8_t *const b2;
+   const bool watch;
++  // R9 cpucode: the bound of the MEM1 test (kMem1Size - 0x10) and, for stores,
++  // the same bound folded with the watch flag (0 while a NWII_WATCH watchpoint
++  // is set, so every store takes the slow path as before). On AArch64 the
++  // constant 0x017FFFF0 is not a compare immediate: GCC rebuilt it with
++  // mov+movk before every guest access (~660 000 sites); passed through an
++  // empty asm it is a value GCC keeps in a register for the whole function.
++  // Each width also has its own MEM1/MEM2 load/store (no pointer phi), so the
++  // base + offset folds into the load/store ([x, w, uxtw]). Same tests, same
++  // fast/slow split, same order of accesses as R8. MEM2 (paddr 0x10000000 to
++  // 0x13FFFFFF, i.e. paddr >> 26 == 4) is tested with encodable immediates.
++  uint32_t lim1;
++  uint32_t wlim1;
+   NWII_FORCEINLINE explicit MemView(MMU &mm)
+-      : m(mm), b1(mm.mem1.data()), b2(mm.mem2.data()), watch(g_watch_addr != 0) {}
++      : m(mm), b1(mm.mem1.data()), b2(mm.mem2.data()), watch(g_watch_addr != 0) {
++    uint32_t l = MMU::kMem1Size - 0x10u;
++    uint32_t w = watch ? 0u : l;
++#if defined(__aarch64__) && defined(__GNUC__)
++    __asm__("" : "+r"(l));
++    __asm__("" : "+r"(w));
++#endif
++    lim1 = l;
++    wlim1 = w;
++  }
+   NWII_FORCEINLINE uint8_t *fast_ptr(uint32_t addr) const {
+     const uint32_t paddr = addr & 0x3FFFFFFF;
+     if (NWII_LIKELY(paddr - 0x10u < MMU::kMem1Size - 0x10u)) return b1 + paddr;
+     if (paddr - 0x10000000u < MMU::kMem2Size) return b2 + (paddr - 0x10000000u);
+     return nullptr;
+   }
+-  NWII_FORCEINLINE uint8_t read8(uint32_t addr) {
+-    if (uint8_t *p = fast_ptr(addr)) return *p;
+-    return m.read8_slow(addr);
+-  }
+-  NWII_FORCEINLINE uint16_t read16(uint32_t addr) {
+-    if (uint8_t *p = fast_ptr(addr)) { uint16_t v; std::memcpy(&v, p, 2); return __builtin_bswap16(v); }
+-    return m.read16_slow(addr);
+-  }
+-  NWII_FORCEINLINE uint32_t read32(uint32_t addr) {
+-    if (uint8_t *p = fast_ptr(addr)) { uint32_t v; std::memcpy(&v, p, 4); return __builtin_bswap32(v); }
+-    return m.read32_slow(addr);
+-  }
+-  NWII_FORCEINLINE uint64_t read64(uint32_t addr) {
+-    if (uint8_t *p = fast_ptr(addr)) { uint64_t v; std::memcpy(&v, p, 8); return __builtin_bswap64(v); }
+-    return m.read64_slow(addr);
+-  }
++#define NWII_MV_LOAD(T, N, SWAP, SLOW)                                               \
++  const uint32_t paddr = addr & 0x3FFFFFFF;                                          \
++  T v;                                                                               \
++  if (NWII_LIKELY(paddr - 0x10u < lim1)) {                                           \
++    std::memcpy(&v, b1 + paddr, N);                                                  \
++    return SWAP(v);                                                                  \
++  }                                                                                  \
++  if ((paddr >> 26) == 4) { /* paddr - 0x10000000 < kMem2Size */                    \
++    std::memcpy(&v, b2 + (paddr & (MMU::kMem2Size - 1)), N);                         \
++    return SWAP(v);                                                                  \
++  }                                                                                  \
++  return m.SLOW(addr);
++#define NWII_MV_STORE(T, N, SWAPPED, SLOW)                                           \
++  const uint32_t paddr = addr & 0x3FFFFFFF;                                          \
++  const T v = SWAPPED;                                                               \
++  if (NWII_LIKELY(paddr - 0x10u < wlim1)) {                                          \
++    std::memcpy(b1 + paddr, &v, N);                                                  \
++    return;                                                                          \
++  }                                                                                  \
++  if (!watch && (paddr >> 26) == 4) {                                               \
++    std::memcpy(b2 + (paddr & (MMU::kMem2Size - 1)), &v, N);                         \
++    return;                                                                          \
++  }                                                                                  \
++  m.SLOW(addr, value);
++#define NWII_MV_ID(x) (x)
++  NWII_FORCEINLINE uint8_t read8(uint32_t addr) { NWII_MV_LOAD(uint8_t, 1, NWII_MV_ID, read8_slow) }
++  NWII_FORCEINLINE uint16_t read16(uint32_t addr) { NWII_MV_LOAD(uint16_t, 2, __builtin_bswap16, read16_slow) }
++  NWII_FORCEINLINE uint32_t read32(uint32_t addr) { NWII_MV_LOAD(uint32_t, 4, __builtin_bswap32, read32_slow) }
++  NWII_FORCEINLINE uint64_t read64(uint32_t addr) { NWII_MV_LOAD(uint64_t, 8, __builtin_bswap64, read64_slow) }
+   NWII_FORCEINLINE float read_f32(uint32_t addr) { uint32_t val = read32(addr); float f; std::memcpy(&f, &val, 4); return f; }
+   NWII_FORCEINLINE double read_f64(uint32_t addr) {
+-    if (uint8_t *p = fast_ptr(addr)) {
+-      uint64_t v; std::memcpy(&v, p, 8); v = __builtin_bswap64(v);
+-      double f; std::memcpy(&f, &v, 8); return f;
++    const uint32_t paddr = addr & 0x3FFFFFFF;
++    uint64_t v;
++    double f;
++    if (NWII_LIKELY(paddr - 0x10u < lim1)) {
++      std::memcpy(&v, b1 + paddr, 8);
++      v = __builtin_bswap64(v);
++      std::memcpy(&f, &v, 8);
++      return f;
++    }
++    if ((paddr >> 26) == 4) {
++      std::memcpy(&v, b2 + (paddr & (MMU::kMem2Size - 1)), 8);
++      v = __builtin_bswap64(v);
++      std::memcpy(&f, &v, 8);
++      return f;
+     }
+     return m.read_f64_slow(addr);
+   }
+-  NWII_FORCEINLINE void write8(uint32_t addr, uint8_t value) {
+-    if (NWII_LIKELY(!watch)) if (uint8_t *p = fast_ptr(addr)) { *p = value; return; }
+-    m.write8_slow(addr, value);
+-  }
+-  NWII_FORCEINLINE void write16(uint32_t addr, uint16_t value) {
+-    if (NWII_LIKELY(!watch)) if (uint8_t *p = fast_ptr(addr)) {
+-      const uint16_t v = __builtin_bswap16(value); std::memcpy(p, &v, 2); return;
+-    }
+-    m.write16_slow(addr, value);
+-  }
+-  NWII_FORCEINLINE void write32(uint32_t addr, uint32_t value) {
+-    if (NWII_LIKELY(!watch)) if (uint8_t *p = fast_ptr(addr)) {
+-      const uint32_t v = __builtin_bswap32(value); std::memcpy(p, &v, 4); return;
+-    }
+-    m.write32_slow(addr, value);
+-  }
+-  NWII_FORCEINLINE void write64(uint32_t addr, uint64_t value) {
+-    if (NWII_LIKELY(!watch)) if (uint8_t *p = fast_ptr(addr)) {
+-      const uint64_t v = __builtin_bswap64(value); std::memcpy(p, &v, 8); return;
+-    }
+-    m.write64_slow(addr, value);
+-  }
++  NWII_FORCEINLINE void write8(uint32_t addr, uint8_t value) { NWII_MV_STORE(uint8_t, 1, value, write8_slow) }
++  NWII_FORCEINLINE void write16(uint32_t addr, uint16_t value) { NWII_MV_STORE(uint16_t, 2, __builtin_bswap16(value), write16_slow) }
++  NWII_FORCEINLINE void write32(uint32_t addr, uint32_t value) { NWII_MV_STORE(uint32_t, 4, __builtin_bswap32(value), write32_slow) }
++  NWII_FORCEINLINE void write64(uint32_t addr, uint64_t value) { NWII_MV_STORE(uint64_t, 8, __builtin_bswap64(value), write64_slow) }
+   NWII_FORCEINLINE void write_f32(uint32_t addr, float value) {
+-    if (NWII_LIKELY(!watch)) if (uint8_t *p = fast_ptr(addr)) {
+-      uint32_t v; std::memcpy(&v, &value, 4); v = __builtin_bswap32(v); std::memcpy(p, &v, 4); return;
+-    }
+-    m.write_f32_slow(addr, value);
++    uint32_t bits;
++    std::memcpy(&bits, &value, 4);
++    NWII_MV_STORE(uint32_t, 4, __builtin_bswap32(bits), write_f32_slow)
+   }
+   NWII_FORCEINLINE void write_f64(uint32_t addr, double value) {
+-    if (NWII_LIKELY(!watch)) if (uint8_t *p = fast_ptr(addr)) {
+-      uint64_t v; std::memcpy(&v, &value, 8); v = __builtin_bswap64(v); std::memcpy(p, &v, 8); return;
+-    }
+-    m.write_f64_slow(addr, value);
++    uint64_t bits;
++    std::memcpy(&bits, &value, 8);
++    NWII_MV_STORE(uint64_t, 8, __builtin_bswap64(bits), write_f64_slow)
+   }
++#undef NWII_MV_LOAD
++#undef NWII_MV_STORE
++#undef NWII_MV_ID
+ };
+ 
++
+ // Guest calls, including indirect calls and tail calls, run as native calls,
+ // so the host stack grows with the guest's call chain. Generated code checks
+ // this before a call that could recurse without bound and falls back to
+ // returning to run_game (which unwinds the host stack) when it is low.
+-extern thread_local uintptr_t g_native_stack_limit;
++// R9 cpucode: constinit (it has a constant initializer), so the generated code
++// reads it directly instead of first testing the weak TLS init hook through the GOT.
++extern constinit thread_local uintptr_t g_native_stack_limit;
+ inline bool native_stack_ok() {
+   char probe;
+   return (uintptr_t)&probe > g_native_stack_limit;
+@@ -1146,7 +1184,7 @@
+ void add_recompiled_range(uint32_t start, uint32_t end);
+ bool in_recompiled_code(uint32_t pc);
+ 
+-extern bool g_trace_calls;
++extern bool g_trace_calls NWII_HIDDEN;
+ void trace_call(uint32_t func_addr, CPUContext& ctx);
+ 
+ 
+diff --color -ruN base/nWiiRuntime/src/core/os_hle_stubs.cpp cpucode/nWiiRuntime/src/core/os_hle_stubs.cpp
+--- a/nWiiRuntime/src/core/os_hle_stubs.cpp	2026-10-29 13:19:23.550849010 -0500
++++ b/nWiiRuntime/src/core/os_hle_stubs.cpp	2026-10-31 07:32:50.523320435 -0500
+@@ -232,7 +232,7 @@
+ }
+ namespace nwii::runtime {
+ 
+-thread_local uintptr_t g_native_stack_limit = 0;
++constinit thread_local uintptr_t g_native_stack_limit = 0;
+ 
+ extern int g_ipc_interrupt_delay;
+ 

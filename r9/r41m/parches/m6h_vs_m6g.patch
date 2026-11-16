@@ -1,0 +1,1102 @@
+diff --color -ruN r41m/nWiiRuntime_m6g/include/runtime/gx/fifo_parser.h r41m/nWiiRuntime_m6h/include/runtime/gx/fifo_parser.h
+--- r41m/nWiiRuntime_m6g/include/runtime/gx/fifo_parser.h	2026-11-15 17:38:10.407308703 -0500
++++ r41m/nWiiRuntime_m6h/include/runtime/gx/fifo_parser.h	2026-11-15 19:04:30.978708381 -0500
+@@ -49,6 +49,8 @@
+     HostPtr<const DecodedVerts> decoded;
+     std::vector<std::pair<uint32_t, uint32_t>> ranges;  // guest addr, bytes
+     uint64_t ranges_hash = 0;
++    // r40d NWII_D_MERGE_CHECK: vertex counts of the FIFO draws merged into this one (test only).
++    std::vector<uint16_t> merge_counts;
+ };
+ 
+ // R11 render worker: the parser's register state that the renderer reads from
+@@ -110,6 +112,8 @@
+     // all parser state are as in a full parse. 0: off. LightSkipped(): draws skipped so far.
+     static void SetDoomedXfb(uint32_t n);
+     static bool RenderPrepOk(const GXCommand& c);  // r40d NWII_D_RENDERPREP (see fifo_parser.cpp)
++    static bool MergeCheckOn();                     // r40d NWII_D_MERGE_CHECK
++    static uint64_t Merged();                       // r40d: FIFO draws merged into the previous one so far
+     static uint64_t LightSkipped();
+     static void LightTime(uint64_t& ns, uint64_t& frames);  // parse time spent in doomed frames, their count
+     static void ReleaseRetired(uint64_t min_live_seq);
+diff --color -ruN r41m/nWiiRuntime_m6g/src/core/main.cpp r41m/nWiiRuntime_m6h/src/core/main.cpp
+--- r41m/nWiiRuntime_m6g/src/core/main.cpp	2026-11-15 17:51:58.106796803 -0500
++++ r41m/nWiiRuntime_m6h/src/core/main.cpp	2026-11-15 19:05:07.868667246 -0500
+@@ -44,6 +44,8 @@
+ 
+ void vtl_note(uint32_t kind, uint32_t arg);  // r37v (gx.cpp): NWII_V_TL
+ void vtl_init();
++// r44w (frente W): renderizador nativo de la superficie del agua (w_agua_gen.cpp, NWII_W_AGUA)
++extern "C" void w_agua_install(nwii::runtime::CPUContext *ctx);
+ namespace nwii::runtime {
+     namespace hw { extern uint32_t g_vi_top_field_base; }
+     // CPU-thread sleeps in the guest OS idle loop (os_hle_stubs.cpp idle_wait).
+@@ -212,14 +214,22 @@
+       {"NWII_D_PARSESTOP", "1", "NWII_D_OFF"},  {"NWII_D_LIGHTPARSE", "1", "NWII_D_OFF"},
+       {"NWII_D_FASTDECODE", "1", "NWII_D_OFF"}, {"NWII_D_FASTPREP", "1", "NWII_D_OFF"},
+       {"NWII_D_RENDERPREP", "1", "NWII_D_OFF", false},  // preparado: hasta ver D11/D12
++      {"NWII_D_MERGE", "1", "NWII_D_OFF", false},       // m6h: preparado (D: FC 5/5, MERGE_CHECK 0 px)
+       {"NWII_R2_LATEFREE", "1", "NWII_R2_OFF"}, {"NWII_R2_CLEARTEX", "1", "NWII_R2_OFF"},
+       {"NWII_R2_COPYFBO", "1", "NWII_R2_OFF"},  {"NWII_R2_LAZYNAT", "1", "NWII_R2_OFF"},
+       {"NWII_R2_COPYUNI", "1", "NWII_R2_OFF"},  {"NWII_R2_COPYST", "1", "NWII_R2_OFF"},
+-      {"NWII_R2_LAZYEFB", "1", "NWII_R2_OFF"},  {"NWII_R2_PREHASH", "1", "NWII_R2_OFF"},
++      {"NWII_R2_LAZYEFB", "1", "NWII_R2_OFF"},  {"NWII_R2_PREHASH", "1", "NWII_R2_OFF", false},  // m6h: preparado (M17: +1 ms render, 0 fps; exactitud)
+       {"NWII_R2_TEXMEMO", "1", "NWII_R2_OFF"},  {"NWII_R2_XDUBO", "1", "NWII_R2_OFF"},
+       {"NWII_R_CULL", "2", "NWII_R_OFF"},
+       // m6g: frente K (sondeo lento cada 128; consola K02: -0,4 a -0,9 ms juego, FC 5/5 en PC). Encendido.
+       {"NWII_POLL_EVERY", "128", "NWII_K_OFF"},
++      // m6h: preparados (apagados) hasta medirlos en consola
++      {"NWII_W_AGUA", "1", "NWII_W_OFF", false},        // frente W: renderizador del agua nativo
++      {"NWII_W_WGP", "1", "NWII_W_OFF", false},         // frente W: escritura al pipe ligera
++      {"NWII_A_MIX", "1", "NWII_A_OFF", false},         // frente A: mezclador AX nativo
++      {"NWII_A_NOSPIN", "1", "NWII_A_OFF", false},      // frente A: esperas cortas duermen
++      {"NWII_A_REQSPIN", "200", "NWII_A_OFF", false},   // frente A: giro de peticiones
++      {"NWII_M_LOGBG", "1", "NWII_M_OFF", false},       // frente M: registro en hilo de fondo
+   };
+   if (std::getenv("NWII_M6_OFF")) {
+     std::printf("[M6] NWII_M6_OFF: sin valores por defecto de m6\n");
+@@ -748,6 +758,7 @@
+   }
+ 
+   ::vtl_init();  // r37v: NWII_V_TL=<ruta>
++  w_agua_install(ctx.get());  // r44w: NWII_W_AGUA (antes del primer bctrl: la tabla hash de g7 se monta después)
+   nwii::runtime::s2::init(ctx.get());  // r34s2 (NWII_S2=1): CPU de sonido
+ #ifndef __SWITCH__
+   nwii::runtime::s2::pc_sched(0);  // r38c: NWII_C_PCSCHED (solo PC): este hilo es el de render
+@@ -1012,7 +1023,7 @@
+       std::printf(", idle sleeps %.0f/s (%.0f%% of the time)%s\n",
+                   (sleeps - sleeps0) / dt, (sleep_us - sleep_us0) / dt / 1e4, gov);
+       if (nwii::runtime::s2::g_enabled) {  // r34s2
+-        char s2l[1400];  // r38c: + linea [C38]
++        char s2l[2048];  // r38c: + linea [C38]; r41m m6h: + [A43]
+         nwii::runtime::s2::stats_line(s2l, sizeof s2l, dt);
+         std::printf("%s\n", s2l);
+       }
+diff --color -ruN r41m/nWiiRuntime_m6g/src/core/s2.cpp r41m/nWiiRuntime_m6h/src/core/s2.cpp
+--- r41m/nWiiRuntime_m6g/src/core/s2.cpp	2026-11-15 16:52:21.980222795 -0500
++++ r41m/nWiiRuntime_m6h/src/core/s2.cpp	2026-11-15 19:04:46.903097525 -0500
+@@ -114,6 +114,15 @@
+ } st;
+ inline void add(std::atomic<uint64_t> &c, uint64_t v = 1) { c.store(c.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); }
+ 
++// ---- r43a (frente A): coste del hilo de sonido. Contadores (linea [A43]) e interruptores (valor != "0"):
++//   NWII_A_NOSPIN=1   esperas cortas (< 50 us hasta el siguiente evento) DURMIENDO (svcSleepThread) en vez de
++//                     ceder en bucle (en Horizon ceder no suelta el nucleo a los de menos prioridad: el trabajador)
++//   NWII_A_REQSPIN=n  vueltas de giro de una peticion al juego antes de empezar a dormir (por defecto 1500)
++std::atomic<uint64_t> st_a_os{0};
++std::atomic<uint64_t> st_a_cvwait{0}, st_a_yield{0}, st_a_nap{0}, st_a_polls{0}, st_a_dsp_ns{0}, st_a_req_spin{0}, st_a_req_sleep{0};
++bool g_a_nospin = false;
++uint32_t g_a_reqspin = 1500;
++
+ void check_fail(const char *what, uint32_t a = 0, uint32_t b = 0) {
+   const uint64_t n = st.checks_bad.fetch_add(1, std::memory_order_relaxed);
+   if (n < 40) std::printf("[S2] ASSERT: %s (0x%08x, 0x%08x)%s\n", what, a, b, t_snd ? " [hilo de sonido]" : " [hilo del juego]");
+@@ -545,7 +554,13 @@
+   if (due <= now) return;
+   uint64_t us = (due - now) * 1000000 / ctx.tb_freq;
+   if (us > 2000) us = 2000;
+-  if (us < 50) { std::this_thread::yield(); return; }
++  if (us < 50) {
++    if (g_a_nospin) { add(st_a_nap); sleep_us((uint32_t)us); return; }  // r43a
++    add(st_a_yield);
++    std::this_thread::yield();
++    return;
++  }
++  add(st_a_cvwait);
+   std::unique_lock<std::mutex> lk(snd_mx);
+   if (hb_req.load(std::memory_order_relaxed) || snd_state.load(std::memory_order_relaxed) == kQuit) return;
+   snd_cv.wait_for(lk, std::chrono::microseconds(us - 30));
+@@ -614,7 +629,9 @@
+     deferred_wakes.clear();
+   }
+   add(n == 5 ? st.irq_aid : st.irq_dsp);
+-  add(st.irq_ns, now_ns() - t0);
++  const uint64_t dt_irq = now_ns() - t0;
++  add(st.irq_ns, dt_irq);
++  if (n != 5) add(st_a_dsp_ns, dt_irq);
+ }
+ 
+ // Espera de la CPU de sonido a nivel de hilo (equivale a "el hilo duerme y corren otros"): mientras
+@@ -657,13 +674,14 @@
+       g_park.store(1, std::memory_order_release);
+       if (g_req.load(std::memory_order_acquire) == 2) break;
+     }
+-    if ((spins & 63) == 0 || spins > 1500) g_main->poll_kick();
++    if ((spins & 63) == 0 || spins > g_a_reqspin) g_main->poll_kick();
+     cpu_relax();
+     // Espera corta girando (el hilo del juego atiende en su siguiente sondeo: microsegundos); si no llega
+     // es que esta parado en el anfitrion (carga de disco, GPU): se duerme cada vez mas para no quitarle
+     // el nucleo al trabajador de render (misma prioridad o menor, mismo nucleo).
+-    if (++spins > 1500) {
+-      const uint32_t k = spins - 1500;
++    if (++spins > g_a_reqspin) {
++      const uint32_t k = spins - g_a_reqspin;
++      add(st_a_req_sleep);
+       std::this_thread::sleep_for(std::chrono::microseconds(k < 20 ? 20 : k < 60 ? 100 : 500));
+     }
+     if (snd_state.load(std::memory_order_relaxed) == kQuit) break;
+@@ -671,6 +689,7 @@
+   g_req.store(0, std::memory_order_release);
+   g_snd_wait.store(0, std::memory_order_relaxed);
+   add(st.req_wait_ns, now_ns() - t0);
++  add(st_a_req_spin, spins);
+   if (!(msr0 & 0x8000)) { ctx.msr = msr0; snd_ee_sync(ctx); }
+   return rq.result;
+ }
+@@ -736,6 +755,7 @@
+ 
+ // Ganchos de entrada (E2) en el contexto de sonido. true = resuelto aqui (la funcion invitada no corre).
+ S2_NO_TSAN bool snd_os(CPUContext &ctx, uint32_t fn, uint32_t lr) {
++  add(st_a_os);
+   switch (fn) {
+     case F_OSLockMutex:
+       if (lr == kRegLockLr || lr == kUnregLockLr) axl_note(ctx.gpr[30], snd_cur_thread(), lr, 1, snd_holds, (uint8_t)in_irq);
+@@ -1228,6 +1248,7 @@
+   const bool in_axloop = s_irq_stress0 > 0 && in_irq && ctx.pc - 0x8027B91Cu <= 0x1Cu;
+   ctx.poll_left.store(in_axloop ? 1 : 64, std::memory_order_relaxed);
+   ctx.note_idle();
++  add(st_a_polls);
+   if (snd_state.load(std::memory_order_relaxed) == kQuit) longjmp(snd_exit_jb, 2);
+   // r38c NWII_C_STRESS_IRQ_US (solo pruebas): la CPU de sonido se entretiene dentro de sus interrupciones (agranda la
+   // ventana en que recorre la lista AX).
+@@ -1342,6 +1363,8 @@
+ 
+ void init(CPUContext *main_ctx) {
+   { const char *e = NWII_ENV("NWII_C_SPIN_OFF"); g_spin_old = e && *e; }
++  { const char *e = NWII_ENV("NWII_A_NOSPIN"); g_a_nospin = e && *e && *e != '0'; }  // r43a
++  { const char *e = NWII_ENV("NWII_A_REQSPIN"); if (e && *e) g_a_reqspin = (uint32_t)std::max(1L, std::atol(e)); }
+   { const char *e = NWII_ENV("NWII_C_AXLIST_OFF"); g_axl_fix = !(e && *e); }      // r38c
+   { const char *e = NWII_ENV("NWII_C_AXLIST_CHECK"); g_axl_check = e && *e && *e != '0'; }
+   { const char *e = NWII_ENV("NWII_C_AXLIST_MUTEX"); g_axl_mutex = g_axl_fix && e && *e && *e != '0'; }
+@@ -1455,6 +1478,19 @@
+                 g_axl_fix ? (g_axl_mutex ? " (regla del mutex)" : "") : " (SIN arreglo)", dq(7, st_axl_calls.load()) * k, (unsigned long long)st_axl_overlap.load(),
+                 (unsigned long long)st_axl_fallback.load(), axw_ns * k / 1e6, (unsigned long long)st_axl_bad.load(),
+                 dq(8, st_axl_hold_ns.load()) * k / 1e6, (unsigned long long)st_axl_hold_max_us.exchange(0));
++  // r43a: tercera linea [A43]
++  static uint64_t a[8] = {0};
++  auto da = [&](int i, uint64_t v) { const uint64_t r = v - a[i]; a[i] = v; return r; };
++  const uint64_t cvw = da(0, st_a_cvwait.load()), yl = da(1, st_a_yield.load()), np = da(2, st_a_nap.load());
++  const uint64_t pl = da(3, st_a_polls.load()), dns = da(4, st_a_dsp_ns.load()), rsp = da(5, st_a_req_spin.load());
++  const uint64_t rsl = da(6, st_a_req_sleep.load()), nreq = lk + d(18, st.req_unlock) + d(19, st.req_wake);
++  const uint64_t sacq = da(7, st.s_acq.load()), nos = dq(9, st_a_os.load());
++  const size_t used2 = std::strlen(buf);
++  std::snprintf(buf + used2, n - (int)used2,
++                "\n[A43] sonido: esperas cv %.0f/s, cesiones %.0f/s, siestas cortas %.0f/s | sondeos %.0f/s | irq DSP %.1f ms/s (AID %.1f) | "
++                "peticiones %.0f/s, giro %.0f vueltas/pet, siestas %.0f/s | S tomado %.0f/s, ganchos SO %.0f/s | nospin %d reqspin %u",
++                cvw * k, yl * k, np * k, pl * k, dns * k / 1e6, (irqns - dns) * k / 1e6, nreq * k,
++                nreq ? (double)rsp / nreq : 0.0, rsl * k, sacq * k, nos * k, (int)g_a_nospin, g_a_reqspin);
+ }
+ 
+ }  // namespace s2
+diff --color -ruN r41m/nWiiRuntime_m6g/src/hle/ax/ax_hle.cpp r41m/nWiiRuntime_m6h/src/hle/ax/ax_hle.cpp
+--- r41m/nWiiRuntime_m6g/src/hle/ax/ax_hle.cpp	2026-10-31 06:08:18.875515730 -0500
++++ r41m/nWiiRuntime_m6h/src/hle/ax/ax_hle.cpp	2026-11-15 19:04:46.904611374 -0500
+@@ -4,6 +4,7 @@
+ #include "runtime/nwii_env.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ 
+@@ -485,7 +486,277 @@
+   // Wii Remote speaker output (pb remote fields) is not emulated.
+ }
+ 
++// ---- r43a (frente A): mezclador rapido, NWII_A_MIX=1 ----------------------------------------
++// Mismo algoritmo bit a bit que process_voice (lo comprueba NWII_AX_VERIFY=1 contra ref::). En la Switch
++// (-O2, cortex-a57) Accelerator::read_sample y aram8 no se integraban: dos llamadas con marco por muestra,
++// g_m1/g_m2/g_read_log recargados en cada una y el registro de lecturas (vector) dentro de aram8 (664
++// bytes). Aqui todo va integrado, con MEM1/MEM2 en locales y el formato de muestra fijado por plantilla
++// (ADPCM, PCM16, PCM8; el resto, generico). Solo sin registro de lecturas (g_read_log: NWII_AX_HAZARD).
++// Voces paradas: solo se leen NEXT y RUNNING (antes, las 150 palabras; no se escribia nada igual).
++#define A43_INL inline __attribute__((always_inline))
++struct FastAcc {
++  const uint8_t *m1, *m2;
++  uint16_t *pb;
++  uint32_t start, end, cur;
++  uint16_t format, pred_scale;
++  int16_t yn1, yn2, gain;
++  bool stopped;
++
++  A43_INL uint8_t a8(uint32_t a) const {
++    if (a & 0x10000000) return m2[a & 0x03FFFFFF];
++    const uint32_t o = a & 0x01FFFFFF;
++    return o < kMem1Bytes ? m1[o] : 0;
++  }
++  template <int F3> A43_INL uint16_t cur_sample() const {
++    const int f3 = F3 >= 0 ? F3 : (int)(format & 3);
++    if (f3 == 0) {
++      const uint16_t v = a8(cur >> 1);
++      return (cur & 1) ? (v & 0xF) : (v >> 4);
++    }
++    if (f3 == 1) return a8(cur);
++    if (f3 == 2) return (uint16_t)((a8(cur * 2) << 8) | a8(cur * 2 + 1));
++    return 0;
++  }
++  A43_INL void on_end() {  // = Accelerator::on_end
++    if (pb[LOOPING]) {
++      pred_scale = pb[LOOP_PRED_SCALE] & 0x7F;
++      if (pb[IS_STREAM] != 1) {
++        yn1 = (int16_t)pb[LOOP_YN1];
++        yn2 = (int16_t)pb[LOOP_YN2];
++      }
++      stopped = false;  // set_yn2
++    } else {
++      pb[RUNNING] = 0;
++    }
++  }
++  // = Accelerator::read_sample
++  template <int F3, int DEC> A43_INL int16_t read(const int16_t *coefs) {
++    if (stopped) return 0;
++    const unsigned decode = DEC >= 0 ? (unsigned)DEC : (format >> 2) & 3;
++    int16_t raw = (int16_t)cur_sample<F3>();
++    const int ci = (pred_scale >> 4) & 7;
++    const int32_t c1 = coefs[ci * 2], c2 = coefs[ci * 2 + 1];
++    int16_t val;
++    uint32_t step;
++    if (decode == 0) {
++      raw &= 0xF;
++      const int32_t scale = 1 << (pred_scale & 0xF);
++      if (raw >= 8) raw -= 16;
++      const int32_t v = scale * raw + ((0x400 + c1 * yn1 + c2 * yn2) >> 11);
++      val = clamp16(v);
++      step = 2;
++      yn2 = yn1;
++      yn1 = val;
++      cur += 1;
++      if ((end & 0xF) == 0 && cur == end) {
++        cur = start + 1;
++      } else if ((end & 0xF) == 1 && cur == end - 1) {
++        cur = start;
++      } else if ((cur & 15) == 0) {
++        pred_scale = a8((cur & ~15u) >> 1);
++        cur += 2;
++        step += 2;
++      }
++    } else {
++      const unsigned gain_scale = (format >> 4) & 3;
++      const int shift = gain_scale == 0 ? 11 : gain_scale == 2 ? 16 : 0;
++      const int32_t v = ((int32_t)gain * raw >> shift) + ((c1 * yn1) >> shift) + ((c2 * yn2) >> shift);
++      val = (int16_t)v;
++      yn2 = yn1;
++      yn1 = val;
++      step = 2;
++      if (decode != 1) cur += 1;
++    }
++    if (cur == end + step - 1) {
++      cur = start;
++      stopped = true;
++      on_end();
++    }
++    cur &= 0xBFFFFFFF;
++    return val;
++  }
++  // NWII_A_MIX=2: `cnt` muestras DSP-ADPCM, exactamente como cnt llamadas a read<0, 0>(coefs). Dentro de una trama
++  // de 8 bytes (cur & 15 en [2, 15)) y lejos del final, solo hay que decodificar el nibble y avanzar: ese tramo va
++  // en un bucle corto (coeficientes y escala fijos, puntero de la trama fijo); el nibble que cierra la trama, el
++  // final de la muestra y lo raro van por read<0, 0>.
++  A43_INL void adpcm_batch(int16_t *out, uint32_t cnt, const int16_t *coefs) {
++    uint32_t k = 0;
++    while (k < cnt) {
++      if (stopped) {  // read devuelve 0 sin tocar nada mientras la voz esta parada
++        for (; k < cnt; ++k) out[k] = 0;
++        return;
++      }
++      const uint32_t in_fr = cur & 15;
++      uint32_t m = 0;
++      const uint8_t *hb = nullptr;
++      const uint32_t ba = cur >> 1;
++      if (in_fr >= 2 && in_fr < 15) {
++        m = 15 - in_fr;
++        if (end >= cur && end - cur < m) m = end - cur;
++        if (m > cnt - k) m = cnt - k;
++        if (ba & 0x10000000) hb = m2 + (ba & 0x03FFFFFF);
++        else if ((ba & 0x01FFFFFF) < kMem1Bytes) hb = m1 + (ba & 0x01FFFFFF);
++        else m = 0;
++      }
++      if (m) {
++        const int ci = (pred_scale >> 4) & 7;
++        const int32_t c1 = coefs[ci * 2], c2 = coefs[ci * 2 + 1];
++        const int32_t scale = 1 << (pred_scale & 0xF);
++        int32_t y1 = yn1, y2 = yn2;
++        uint32_t c = cur;
++        for (uint32_t j = 0; j < m; ++j, ++c) {
++          const uint8_t b = hb[(c >> 1) - ba];
++          int32_t raw = (c & 1) ? (b & 0xF) : (b >> 4);
++          if (raw >= 8) raw -= 16;
++          const int16_t val = clamp16(scale * raw + ((0x400 + c1 * y1 + c2 * y2) >> 11));
++          y2 = y1;
++          y1 = val;
++          out[k + j] = val;
++        }
++        yn1 = (int16_t)y1;
++        yn2 = (int16_t)y2;
++        cur = c;
++        k += m;
++        continue;
++      }
++      out[k++] = read<0, 0>(coefs);
++    }
++  }
++};
++
++int a43_mix_mode() {
++  static const int m = [] {
++    const char *e = std::getenv("NWII_A_MIX");
++    return (e && *e && *e != '0') ? (*e == '2' ? 2 : 1) : 0;
++  }();
++  return m;
++}
++
++template <int F3, int DEC>
++void process_voice_fast(uint16_t *pb) {
++  FastAcc acc;
++  acc.m1 = g_m1;
++  acc.m2 = g_m2;
++  acc.pb = pb;
++  acc.start = hilo(pb, LOOP_HI) & 0x3FFFFFFF;
++  acc.end = hilo(pb, END_HI) & 0x3FFFFFFF;
++  acc.cur = hilo(pb, CUR_HI) & 0xBFFFFFFF;
++  acc.format = pb[SAMPLE_FORMAT];
++  acc.yn1 = (int16_t)pb[ADPCM_YN1];
++  acc.yn2 = (int16_t)pb[ADPCM_YN2];
++  acc.stopped = false;
++  acc.gain = (int16_t)pb[ADPCM_GAIN];
++  acc.pred_scale = pb[ADPCM_PRED_SCALE] & 0x7F;
++  int16_t coefs[16];
++  for (int i = 0; i < 16; ++i) coefs[i] = (int16_t)pb[ADPCM_COEFS + i];
++  alignas(16) int16_t s[kFrame];
++  uint32_t pos;
++  // NWII_A_MIX=2 (ADPCM): primero las muestras de entrada que pedira el remuestreo (cuantas: solo depende de la
++  // fraccion, la razon y el tipo), en lote; luego el remuestreo de siempre leyendolas del bufer.
++  constexpr uint32_t kMaxBatch = 2048;
++  uint32_t total = kMaxBatch + 1;
++  if constexpr (F3 == 0 && DEC == 0) {
++    if (a43_mix_mode() == 2) {
++      const uint32_t ratio = hilo(pb, SRC_RATIO_HI);
++      if (pb[SRC_TYPE] == SRC_NEAREST) {
++        total = kFrame;
++      } else if (ratio < 0x01000000u) {
++        uint32_t p = pb[SRC_FRAC];
++        total = 0;
++        for (int i = 0; i < kFrame; ++i) {
++          p += ratio;
++          total += p >> 16;
++          p &= 0xFFFF;
++        }
++      }
++    }
++  }
++  if (total <= kMaxBatch) {
++    alignas(16) int16_t in[kMaxBatch];
++    acc.adpcm_batch(in, total, coefs);
++    uint32_t k = 0;
++    pos = resample([&]() __attribute__((always_inline)) { return in[k++]; }, s, kFrame, &pb[SRC_LAST], pb[SRC_FRAC],
++                   hilo(pb, SRC_RATIO_HI), pb[SRC_TYPE]);
++  } else {
++    pos = resample([&]() __attribute__((always_inline)) { return acc.read<F3, DEC>(coefs); }, s, kFrame,
++                   &pb[SRC_LAST], pb[SRC_FRAC], hilo(pb, SRC_RATIO_HI), pb[SRC_TYPE]);
++  }
++  pb[SRC_FRAC] = (uint16_t)pos;
++  pb[CUR_HI] = (uint16_t)(acc.cur >> 16);
++  pb[CUR_LO] = (uint16_t)acc.cur;
++  pb[ADPCM_YN1] = (uint16_t)acc.yn1;
++  pb[ADPCM_YN2] = (uint16_t)acc.yn2;
++  pb[ADPCM_PRED_SCALE] = acc.pred_scale;
++  envelope(s, pb);
++  if (pb[LPF_ON]) low_pass(s, pb);
++  if (pb[BQ_ON]) biquad(s, pb);
++  const uint32_t mc = hilo(pb, MIX_CTRL_HI);
++  struct Route {
++    int32_t *bus;
++    int vol, dpop;
++    uint32_t on, ramp;
++  };
++  static const Route routes[] = {
++      {g_bus.main_l, MIX_MAIN_L, DPOP_MAIN_L, 0x00000001 | 0x00000004, 0x00000004},
++      {g_bus.main_r, MIX_MAIN_R, DPOP_MAIN_R, 0x00000002 | 0x00000004, 0x00000004},
++      {g_bus.main_s, MIX_MAIN_S, DPOP_MAIN_S, 0x00000008 | 0x00000010, 0x00000010},
++      {g_bus.auxa_l, MIX_AUXA_L, DPOP_AUXA_L, 0x00010000 | 0x00040000, 0x00040000},
++      {g_bus.auxa_r, MIX_AUXA_R, DPOP_AUXA_R, 0x00020000 | 0x00040000, 0x00040000},
++      {g_bus.auxa_s, MIX_AUXA_S, DPOP_AUXA_S, 0x00080000 | 0x00100000, 0x00100000},
++      {g_bus.auxb_l, MIX_AUXB_L, DPOP_AUXB_L, 0x00200000 | 0x00800000, 0x00800000},
++      {g_bus.auxb_r, MIX_AUXB_R, DPOP_AUXB_R, 0x00400000 | 0x00800000, 0x00800000},
++      {g_bus.auxb_s, MIX_AUXB_S, DPOP_AUXB_S, 0x01000000 | 0x02000000, 0x02000000},
++      {g_bus.auxc_l, MIX_AUXC_L, DPOP_AUXC_L, 0x04000000 | 0x10000000, 0x10000000},
++      {g_bus.auxc_r, MIX_AUXC_R, DPOP_AUXC_R, 0x08000000 | 0x10000000, 0x10000000},
++      {g_bus.auxc_s, MIX_AUXC_S, DPOP_AUXC_S, 0x20000000 | 0x40000000, 0x40000000},
++  };
++  for (const Route &r : routes)
++    if (mc & r.on) mix_add(r.bus, s, pb, r.vol, r.dpop, (mc & r.ramp) != 0);
++}
++
++void process_voice_a43(uint16_t *pb) {
++  switch (pb[SAMPLE_FORMAT] & 0xF) {  // (format & 3) | decode << 2
++    case 0x0: process_voice_fast<0, 0>(pb); break;   // DSP-ADPCM
++    case 0xA: process_voice_fast<2, 2>(pb); break;   // PCM16
++    case 0x9: process_voice_fast<1, 2>(pb); break;   // PCM8
++    default: process_voice_fast<-1, -1>(pb); break;
++  }
++}
++
++bool a43_mix_on() { return a43_mix_mode() != 0; }
++
+ void process_pb_list(uint32_t pb_addr) {
++  if (a43_mix_on() && g_read_log == nullptr) {
++    uint16_t pb[PB_WORDS], orig[PB_WORDS];
++    for (int n = 0; pb_addr && n < kMaxVoices; ++n) {
++      uint8_t *p = span(pb_addr, PB_WORDS * 2);
++      if (!p) {  // no contiguo: camino de siempre para este bloque
++        for (int i = 0; i < PB_WORDS; ++i) pb[i] = rd16(pb_addr + i * 2);
++        if (pb[RUNNING] == 1) {
++          std::memcpy(orig, pb, sizeof pb);
++          process_voice_a43(pb);
++          for (int i = 0; i < PB_WORDS; ++i)
++            if (pb[i] != orig[i]) wr16(pb_addr + i * 2, pb[i]);
++        }
++        pb_addr = hilo(pb, NEXT_HI);
++        continue;
++      }
++      if (be16(p + RUNNING * 2) != 1) {
++        pb_addr = ((uint32_t)be16(p) << 16) | be16(p + 2);
++        continue;
++      }
++      for (int i = 0; i < PB_WORDS; ++i) pb[i] = be16(p + i * 2);
++      std::memcpy(orig, pb, sizeof pb);
++      process_voice_a43(pb);
++      for (int i = 0; i < PB_WORDS; ++i) {
++        if (pb[i] == orig[i]) continue;
++        put16(p + i * 2, pb[i]);
++        log_w(p + i * 2, 2);
++      }
++      pb_addr = hilo(pb, NEXT_HI);
++    }
++    return;
++  }
+   uint16_t pb[PB_WORDS], orig[PB_WORDS];
+   for (int n = 0; pb_addr && n < kMaxVoices; ++n) {
+     uint8_t *p = span(pb_addr, PB_WORDS * 2);
+diff --color -ruN r41m/nWiiRuntime_m6g/src/hle/gx/fifo_parser.cpp r41m/nWiiRuntime_m6h/src/hle/gx/fifo_parser.cpp
+--- r41m/nWiiRuntime_m6g/src/hle/gx/fifo_parser.cpp	2026-11-15 17:38:10.408926900 -0500
++++ r41m/nWiiRuntime_m6h/src/hle/gx/fifo_parser.cpp	2026-11-15 19:04:30.980293639 -0500
+@@ -779,6 +779,24 @@
+     return on;
+ }
+ static uint64_t s_eager_draws = 0;
++// r40d NWII_D_MERGE=1: a FIFO draw that comes right after another FIFO draw (no command between
++// them: the render state is the same), with the same primitive (quads or triangles: lists, so
++// the concatenation is the same primitives in the same order) and the same snapshot (VAT, arrays,
++// default matrices; no parse-time transform), is appended to it (bytes and count) instead of
++// becoming a draw of its own. The renderer then sees one draw with the same vertices in the same
++// order. Kept apart: display-list draws (the cache owns them), draws already decoded, a previous
++// draw whose count is not a whole number of primitives, more than kMergeMaxVerts vertices.
++static bool MergeOn() {
++    static const bool on = [] { const char* e = NWII_ENV("NWII_D_MERGE"); return e && e[0] && e[0] != '0'; }();
++    return on;
++}
++bool FifoParser::MergeCheckOn() {
++    static const bool on = NWII_ENV("NWII_D_MERGE_CHECK") != nullptr;
++    return on;
++}
++static uint64_t s_merged = 0;
++uint64_t FifoParser::Merged() { return s_merged; }
++static constexpr uint32_t kMergeMaxVerts = 4096;
+ static bool AllDirect(const VATSlot& v) {
+     auto ix = [](VtxAttrMask m) { return m == VtxAttrMask::Index8 || m == VtxAttrMask::Index16; };
+     if (ix(v.posMask) || ix(v.nrmMask) || ix(v.clrMask[0]) || ix(v.clrMask[1])) return false;
+@@ -2091,6 +2109,34 @@
+                 offset += need;
+                 continue;
+             }
++            if (depth == 0 && MergeOn() && !commands.empty() && !PreXf()) {  // r40d NWII_D_MERGE
++                GXCommand& p = commands.back();
++                const uint8_t prim = cmd & 0xF8;
++                const uint32_t unit = prim == 0x80 ? 4u : 3u;
++                if (p.type == GXCommandType::DrawPrimitive && p.prim_type == prim && (prim == 0x80 || prim == 0x90) &&
++                    p.raw && !p.raw->in_dl && p.vertices.empty() && !p.shared_vertices) {
++                    DrawRaw& r = *p.raw;
++                    if (r.count % unit == 0 && (uint32_t)r.count + vtx_count <= kMergeMaxVerts &&
++                        !r.have_snap_mtx && r.snap_pos_bank.empty() && !r.decoded &&
++                        std::memcmp(&r.vat, &vat, sizeof vat) == 0 && r.defPosMtxIdx == s_ps.defPosMtxIdx &&
++                        std::memcmp(r.defTexMtxIdx, s_ps.defTexMtxIdx, 8) == 0 &&
++                        std::memcmp(r.arrayBase, s_ps.arrayBase, sizeof r.arrayBase) == 0 &&
++                        std::memcmp(r.arrayStride, s_ps.arrayStride, sizeof r.arrayStride) == 0 &&
++                        r.bytes.size() == (size_t)r.count * vsize) {
++                        if (FifoParser::MergeCheckOn()) {
++                            if (r.merge_counts.empty()) r.merge_counts.push_back(r.count);
++                            r.merge_counts.push_back(vtx_count);
++                        }
++                        r.bytes.insert(r.bytes.end(), fifo.begin() + offset + 3, fifo.begin() + offset + need);
++                        r.count = (uint16_t)(r.count + vtx_count);
++                        ++s_merged;
++                        g_prof_draws++;
++                        g_prof_draw_bytes += need;
++                        offset += need;
++                        continue;
++                    }
++                }
++            }
+             if (depth == 0 && EagerDecodeOn() && !PreXf() && AllDirect(vat)) {
+                 // r40d NWII_D_EAGERDECODE=1: a FIFO draw whose attributes are all direct
+                 // decodes from its own bytes and the parser state of this moment only
+diff --color -ruN r41m/nWiiRuntime_m6g/src/hle/gx/renderer_gl.cpp r41m/nWiiRuntime_m6h/src/hle/gx/renderer_gl.cpp
+--- r41m/nWiiRuntime_m6g/src/hle/gx/renderer_gl.cpp	2026-11-15 17:38:10.411796014 -0500
++++ r41m/nWiiRuntime_m6h/src/hle/gx/renderer_gl.cpp	2026-11-15 19:04:30.985338206 -0500
+@@ -6276,6 +6276,8 @@
+ // r40d NWII_D_DROPFAST: first command of the frame to render (gx.cpp; the ones
+ // before it are the dropped part of the batch, whose kept writes are in the prefix).
+ size_t g_render_start = 0;
++// r40d NWII_D_MERGE_CHECK (gx.cpp): this frame with every merged FIFO draw split back into its parts.
++const std::vector<GXCommand> *g_d_merge_alt = nullptr;
+ 
+ // R14 R5, GPU XF: prefetch from the worker's entry list, without the
+ // dependent loads of the old prefetch (command -> DecodedVerts -> entry, each
+@@ -6557,7 +6559,54 @@
+   // frame's copy in a single pass but this frame's in a repeated one, so only
+   // repeated passes are compared ("pass1" counts how often the first one
+   // differs too, which includes that effect).
++  // r40d NWII_D_MERGE_CHECK: the frame is drawn as usual (presented pass first, as
++  // FRAMECHECK does, so the compared passes are both repeats), then from the split copy and
++  // again merged, both without the worker's draw lists (same emit path), and the XFB images
++  // of the last two are compared pixel by pixel ("[D40MERGE_CHECK]").
++  void MergeCheck(const std::vector<GXCommand> &commands) {
++    static GXState *saved = new GXState;
++    std::memcpy((void *)saved, (const void *)&g_state, sizeof(GXState));
++    const long copies0 = s_xfb_copies;
++    RenderOnce(commands);
++    if (s_xfb_copies == copies0 || !s_xfb_w) return;
++    const long copies1 = s_xfb_copies;
++    static std::vector<uint8_t> a, b;
++    const auto *dr = g_render_draws;
++    const auto *en = g_render_entries;
++    const size_t st = g_render_start;
++    auto pass = [&](const std::vector<GXCommand> &cmds, size_t start, std::vector<uint8_t> &out) {
++      std::memcpy((void *)&g_state, (const void *)saved, sizeof(GXState));
++      s_xfb_copies = copies0;
++      g_render_draws = nullptr;
++      g_render_entries = nullptr;
++      g_render_start = start;
++      RenderOnce(cmds);
++      ReadXfb(out);
++    };
++    pass(*g_d_merge_alt, 0, b);
++    pass(commands, st, a);
++    g_render_draws = dr;
++    g_render_entries = en;
++    g_render_start = st;
++    s_xfb_copies = copies1;
++    static uint64_t checks = 0, same = 0;
++    size_t diff = 0;
++    if (a.size() != b.size()) diff = std::max(a.size(), b.size()) / 4;
++    else
++      for (size_t i = 0; i < a.size(); i += 4)
++        if (std::memcmp(&a[i], &b[i], 4)) ++diff;
++    ++checks;
++    if (!diff) ++same;
++    static int logged = 0;
++    if ((diff && logged++ < 16) || checks % 20 == 0)
++      printf("[D40MERGE_CHECK] checks=%llu identical=%llu | xfb %ld: %zu pixels differ\n",
++             (unsigned long long)checks, (unsigned long long)same, s_xfb_copies, diff);
++  }
+   void Render(const std::vector<GXCommand> &commands) override {
++    if (g_d_merge_alt && s_xfb_fbo) {  // r40d
++      MergeCheck(commands);
++      return;
++    }
+     static const long every = [] {
+       const char *e = NWII_ENV("NWII_R9_FRAMECHECK");
+       return e ? std::max(1L, std::atol(e)) : 0L;
+diff --color -ruN r41m/nWiiRuntime_m6g/src/hle/gx.cpp r41m/nWiiRuntime_m6h/src/hle/gx.cpp
+--- r41m/nWiiRuntime_m6g/src/hle/gx.cpp	2026-11-15 17:38:10.415115793 -0500
++++ r41m/nWiiRuntime_m6h/src/hle/gx.cpp	2026-11-15 19:04:41.090145353 -0500
+@@ -328,7 +328,8 @@
+ // the parser takes the copies in the same order, checks they belong to the
+ // command it is parsing (same array/address/size or same list), and reads
+ // live RAM as before when there is none. NWII_IDXSNAP=0 disables.
+-namespace hw { extern bool g_wgp_redirect_on; }  // hw_pi.cpp
++// [r44w] oculto: el código no pasa por la GOT para leerlo (una carga menos en cada escritura al pipe)
++namespace hw { extern bool g_wgp_redirect_on __attribute__((visibility("hidden"))); }  // hw_pi.cpp
+ static const bool s_idx_on = [] {
+     const char *e = NWII_ENV("NWII_IDXSNAP");
+     return !(e && e[0] == '0');
+@@ -803,6 +804,7 @@
+ extern const std::vector<uint32_t> *g_render_pack;         // renderer_gl.cpp (R14 R5)
+ extern const std::vector<GXCommand> *g_render_prefix;      // renderer_gl.cpp (r36r NWII_R_PREFIX)
+ extern size_t g_render_start;                              // renderer_gl.cpp (r40d NWII_D_DROPFAST)
++extern const std::vector<GXCommand> *g_d_merge_alt;        // renderer_gl.cpp (r40d NWII_D_MERGE_CHECK)
+ }
+ static uint64_t g_ph[8], g_ph_n;
+ static std::vector<nwii::runtime::gx::GXCommand*> s_draws;
+@@ -1027,6 +1029,8 @@
+     // r40d NWII_D_RENDERPREP: draws (indices into `draws`) the render thread decodes and
+     // packs itself just before rendering (their entries are null until then).
+     std::vector<uint32_t> rprep;
++    // r40d NWII_D_MERGE_CHECK: merged draws (index into `draws`) and the vertex counts of their parts.
++    std::vector<std::pair<uint32_t, std::vector<uint16_t>>> merges;
+     uint64_t seq = 0;          // R22 R7: frame number (s_prep_frames) of its frame
+     bool has_draws = false;    // R22 R7: its commands may point at retired vertices
+     bool render_frees = false; // R22 R7: no command shares a reference count with the worker
+@@ -1259,6 +1263,7 @@
+ static void RetractToPrefix(FramePacket &pkt) {
+     auto &v = pkt.frame;
+     pkt.rprep.clear();  // r40d (its draws are dropped)
++    pkt.merges.clear();
+     // r40d NWII_D_DROPFAST: frame[0, start) is the dropped part of the packet's
+     // batch (its kept writes are already in pkt.pre): never looked at again.
+     const size_t b = std::min(pkt.start, v.size());
+@@ -2042,6 +2047,9 @@
+     }();
+     static std::vector<uint32_t> s_rprep;
+     s_rprep.clear();
++    static const bool s_dmcheck = nwii::runtime::gx::FifoParser::MergeCheckOn();
++    static std::vector<std::pair<uint32_t, std::vector<uint16_t>>> s_dmerges;
++    s_dmerges.clear();
+     const bool rprep = s_rprep_on && !apply_now;
+     // r40d NWII_D_STATS=1 (diagnóstico): draws del fotograma por tipo ([D40S] cada ~2 s).
+     static const bool s_dstats = NWII_ENV("NWII_D_STATS") != nullptr;
+@@ -2167,6 +2175,10 @@
+                 if (r->decoded) __builtin_prefetch(r->decoded.get());
+             }
+         }
++        if (s_dmcheck) {  // r40d NWII_D_MERGE_CHECK: the parts of a merged draw, before its DrawRaw goes
++            const auto *r = s_draws[i]->raw.get();
++            if (r && !r->merge_counts.empty()) s_dmerges.push_back({(uint32_t)i, r->merge_counts});
++        }
+         if (rprep && nwii::runtime::gx::FifoParser::RenderPrepOk(*s_draws[i])) {  // r40d
+             s_rprep.push_back((uint32_t)i);
+             s_draw_entries[i] = nullptr;
+@@ -2204,6 +2216,23 @@
+     pkt.pack.swap(s_draw_pack);
+     pkt.start = fstart;  // r40d
+     pkt.rprep.swap(s_rprep);  // r40d NWII_D_RENDERPREP
++    pkt.merges.swap(s_dmerges);  // r40d NWII_D_MERGE_CHECK
++    s_dmerges.clear();
++    {
++        static uint64_t m0 = 0, f = 0;  // r40d NWII_D_MERGE: [D40G] FIFO draws merged per prepared frame
++        static auto last = std::chrono::steady_clock::now();
++        ++f;
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last >= std::chrono::seconds(2)) {
++            last = now;
++            const uint64_t m = nwii::runtime::gx::FifoParser::Merged();
++            if (m != m0)
++                std::printf("[D40G] draws del FIFO fundidos con el anterior: %.0f por fotograma preparado\n",
++                            (m - m0) / (double)f);
++            m0 = m;
++            f = 0;
++        }
++    }
+     s_rprep.clear();
+     pkt.seq = s_prep_frames;
+     pkt.has_draws = !pkt.draws.empty();
+@@ -2464,6 +2493,54 @@
+             nwii::runtime::gx::g_render_pack = &pkt.pack;
+             nwii::runtime::gx::g_render_prefix = &pkt.pre;  // r36r (empty unless NWII_R_PREFIX)
+             nwii::runtime::gx::g_render_start = pkt.start;  // r40d (0 unless NWII_D_DROPFAST)
++            // r40d NWII_D_MERGE_CHECK=<n>: every n-th frame with merged draws, the renderer draws it
++            // also from a copy where each merged draw is split back into its parts, and compares.
++            static std::vector<nwii::runtime::gx::GXCommand> s_alt;
++            static long s_mc_every = [] {
++                const char *e = NWII_ENV("NWII_D_MERGE_CHECK");
++                return e ? std::max(1L, std::atol(e)) : 0L;
++            }();
++            static long s_mc_n = 0;
++            if (s_mc_every && !pkt.merges.empty() && (++s_mc_n % s_mc_every) == 0) {
++                using nwii::runtime::gx::GXCommand;
++                using nwii::runtime::gx::GXCommandType;
++                std::unordered_map<const GXCommand *, const std::vector<uint16_t> *> parts;
++                for (const auto &m : pkt.merges) parts[pkt.draws[m.first]] = &m.second;
++                s_alt.clear();
++                bool ok = true;
++                for (size_t fi = pkt.start; fi < pkt.frame.size() && ok; ++fi) {
++                    const GXCommand &c = pkt.frame[fi];
++                    if (c.type != GXCommandType::DrawPrimitive) {
++                        GXCommand &n = s_alt.emplace_back();
++                        n.type = c.type; n.prim_type = c.prim_type; n.stale_copy = c.stale_copy; n.reg = c.reg;
++                        n.length = c.length; n.val = c.val; n.bp_raw = c.bp_raw; n.payload = c.payload;
++                        continue;
++                    }
++                    if (c.raw) { ok = false; break; }  // not decoded: no comparison for this frame
++                    auto it = parts.find(&c);
++                    const std::vector<nwii::runtime::gx::VertexData> &v = c.verts();
++                    if (it == parts.end()) {
++                        GXCommand &n = s_alt.emplace_back();
++                        n.type = c.type; n.prim_type = c.prim_type; n.reg = c.reg; n.length = c.length; n.val = c.val;
++                        if (c.shared_vertices)  // aliasing, no count touched (render thread)
++                            n.shared_vertices = nwii::runtime::gx::HostPtr<const nwii::runtime::gx::DecodedVerts>(
++                                nwii::runtime::gx::HostPtr<const nwii::runtime::gx::DecodedVerts>(), c.shared_vertices.get());
++                        else
++                            n.vertices = c.vertices;
++                        continue;
++                    }
++                    size_t at = 0;
++                    for (const uint16_t k : *it->second) {
++                        if (at + k > v.size()) { ok = false; break; }
++                        GXCommand &n = s_alt.emplace_back();
++                        n.type = c.type; n.prim_type = c.prim_type; n.reg = c.reg; n.length = c.length; n.val = c.val;
++                        n.vertices.assign(v.begin() + (ptrdiff_t)at, v.begin() + (ptrdiff_t)(at + k));
++                        at += k;
++                    }
++                    if (at != v.size()) ok = false;
++                }
++                if (ok) nwii::runtime::gx::g_d_merge_alt = &s_alt;
++            }
+             // r31t (frente T), SOLO MEDIR: NWII_T_NORENDER=N dibuja 1 de cada N fotogramas
+             // (el hilo de render queda casi parado) para ver cuanto frena al hilo del juego
+             // el trabajo del render en los otros nucleos (cache L2 compartida, memoria).
+@@ -2479,6 +2556,7 @@
+             nwii::runtime::gx::g_render_pack = nullptr;
+             nwii::runtime::gx::g_render_prefix = nullptr;
+             nwii::runtime::gx::g_render_start = 0;
++            nwii::runtime::gx::g_d_merge_alt = nullptr;
+             if (gpuprof) g_gpu_timer.end();
+             g_prof_render_cpu_us += thread_cpu_us() - rc0;
+             auto r1 = std::chrono::steady_clock::now();
+@@ -3259,6 +3337,19 @@
+     }
+ }
+ 
++// [r44w] NWII_W_WGP="1": caminos cortos de Write8/16/32/F32 (mismo flujo y mismo estado que los de R16w):
++// una sola bandera decidida al arrancar (write-gather en línea, búfer de 4 KB, sniffer encendido) + la redirección,
++// el sniffer de Write8 por tabla cuando está en reposo (s_sn_st == 0, el caso de casi todos los bytes) y el límite
++// del búfer como constante. Fuera de esas condiciones, el camino de siempre.
++static bool s_w1_fast = false;
++static void w1_selftest();
++static constexpr uint8_t kSn8Of(unsigned b) {
++    return b == 0x08 ? 1 : (b & 0xE7) == 0x20 ? 3 : b == 0x40 ? 4 : b == 0x78 ? 6 : 0;
++}
++struct Sn8Tab { uint8_t v[256]; constexpr Sn8Tab() : v() { for (unsigned i = 0; i < 256; ++i) v[i] = kSn8Of(i); } };
++alignas(64) static constexpr Sn8Tab kSn8{};
++static inline bool w1_on() { return __builtin_expect(s_w1_fast & !hw::g_wgp_redirect_on, 1); }
++
+ static NWII_NOINLINE void wg_init_mode() {
+     static const bool sample = NWII_ENV("NWII_SAMPLE") != nullptr;
+     if (const char *e = NWII_ENV("NWII_WGP_CAP")) {
+@@ -3269,6 +3360,9 @@
+     s_wg_gather = wgp_gather();
+     s_wg_sample = sample;
+     s_wg_mode = wgp_gather() && !s_wcheck && !sample ? 1 : 0;
++    s_w1_fast = std::getenv("NWII_W_WGP") != nullptr && s_wg_mode == 1 && s_wg_cap == kWgCap && s_idx_on;
++    if (std::getenv("NWII_W_WGP")) std::printf("[WGP] r44w NWII_W_WGP: caminos cortos %s\n", s_w1_fast ? "SI" : "no (condiciones)");
++    if (s_w1_fast && std::getenv("NWII_W_WGP_SELFTEST")) w1_selftest();
+     std::printf("[WGP] write-gather: %s, buffer %u B, hand-over at full / BP 0x45 0x47 0x48 0x52%s"
+                 " / age / idle\n",
+                 !wgp_gather() ? "off (direct path)" : s_wg_mode ? "on (inline paths)" : "on (checked paths)",
+@@ -3310,7 +3404,16 @@
+     return __builtin_expect((s_wg_mode > 0) & !hw::g_wgp_redirect_on, 1);
+ }
+ 
++// [r44w] NWII_W_AGUA_CHECK (PC): mientras g_w_cap != nullptr (con s_wg_mode = 0, así todo va por los caminos
++// completos) cada escritura al pipe se apunta en la captura (tipo + valor) y NO llega al pipe ni cambia su
++// estado; w_agua_check la vuelve a hacer después, una a una, por las funciones de siempre.
++std::vector<uint8_t> *g_w_cap = nullptr;
++static NWII_NOINLINE void w_cap(uint8_t kind, uint64_t v, int n) {
++    g_w_cap->push_back(kind);
++    for (int i = n - 1; i >= 0; --i) g_w_cap->push_back((uint8_t)(v >> (i * 8)));
++}
+ static NWII_NOINLINE void wgp_write8_full(uint8_t val) {
++    if (__builtin_expect(g_w_cap != nullptr, 0)) { w_cap(1, val, 1); return; }
+     if (__builtin_expect(s_wg_mode < 0, 0)) wg_init_mode();
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     if (__builtin_expect(hw::g_wgp_redirect_on, 0) && wgp_redirect(val)) { s_bp_armed = false; return; }
+@@ -3328,6 +3431,17 @@
+ }
+ 
+ void GX_WGPIPE_Write8(uint8_t val) {
++    if (w1_on()) {
++        s_bp_armed = (val == 0x61);
++        if (__builtin_expect(s_sn_st == 0, 1)) { s_sn_st = kSn8.v[val]; s_sn_a = val; }
++        else idx_sniff8(val);
++        ++s_wg_writes_l;
++        uint32_t n = s_wg_n;
++        if (__builtin_expect(n >= kWgCap, 0)) { wg_flush_now(); n = 0; }
++        s_wg[n] = val;
++        s_wg_n = n + 1;
++        return;
++    }
+     if (wg_fast()) {
+         s_bp_armed = (val == 0x61);
+         idx_sniff8(val);
+@@ -3339,6 +3453,7 @@
+ }
+ 
+ static NWII_NOINLINE void wgp_write16_full(uint16_t val) {
++    if (__builtin_expect(g_w_cap != nullptr, 0)) { w_cap(2, val, 2); return; }
+     if (__builtin_expect(s_wg_mode < 0, 0)) wg_init_mode();
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     s_bp_armed = false;
+@@ -3356,7 +3471,25 @@
+     wgp_push(val & 0xFF);
+ }
+ 
++static inline void w1_put4(uint32_t v) {
++    uint32_t n = s_wg_n;
++    if (__builtin_expect(n > kWgCap - 4, 0)) { wg_flush_now(); n = 0; }
++    const uint32_t be = __builtin_bswap32(v);
++    std::memcpy(s_wg + n, &be, 4);
++    s_wg_n = n + 4;
++}
+ void GX_WGPIPE_Write16(uint16_t val) {
++    if (w1_on()) {
++        s_bp_armed = false;
++        s_sn_st = 0;
++        ++s_wg_writes_l;
++        uint32_t n = s_wg_n;
++        if (__builtin_expect(n > kWgCap - 2, 0)) { wg_flush_now(); n = 0; }
++        const uint16_t be = __builtin_bswap16(val);
++        std::memcpy(s_wg + n, &be, 2);
++        s_wg_n = n + 2;
++        return;
++    }
+     if (wg_fast()) {
+         s_bp_armed = false;
+         idx_sniff16(val);
+@@ -3372,6 +3505,7 @@
+ std::atomic<uint32_t> g_guest_xfb{0};
+ 
+ static NWII_NOINLINE void wgp_write32(uint32_t val, bool is_int) {
++    if (__builtin_expect(g_w_cap != nullptr, 0)) { w_cap(is_int ? 3 : 4, val, 4); return; }
+     if (__builtin_expect(s_wg_mode < 0, 0)) wg_init_mode();
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     bool bp = s_bp_armed && is_int;
+@@ -3450,6 +3584,11 @@
+ // hand-over (no XFB count, no PE signal; ~250 000/s in the title demo) and the
+ // value of a CP register write (array base/stride for the LOAD_INDX copies).
+ void GX_WGPIPE_Write32(uint32_t val) {
++    if (w1_on() && __builtin_expect(!s_bp_armed & (s_sn_st == 0), 1)) {
++        ++s_wg_writes_l;
++        w1_put4(val);
++        return;
++    }
+     if (wg_fast()) {
+         if (__builtin_expect(!s_bp_armed & (s_sn_st == 0), 1)) {
+             ++s_wg_writes_l;
+@@ -3478,6 +3617,13 @@
+ 
+ void GX_WGPIPE_WriteF32(float val) {
+     union { float f; uint32_t i; } u; u.f = val;
++    if (w1_on()) {
++        s_bp_armed = false;
++        s_sn_st = 0;
++        ++s_wg_writes_l;
++        w1_put4(u.i);
++        return;
++    }
+     if (wg_fast()) {
+         s_bp_armed = false;
+         s_sn_st = 0;  // idx_sniff32(v, false)
+@@ -3489,6 +3635,7 @@
+ }
+ 
+ static NWII_NOINLINE void wgp_write64_full(uint64_t v) {
++    if (__builtin_expect(g_w_cap != nullptr, 0)) { w_cap(5, v, 8); return; }
+     if (__builtin_expect(s_wg_mode < 0, 0)) wg_init_mode();
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     s_bp_armed = false;
+@@ -3523,6 +3670,127 @@
+     wgp_write64_full(u.i);
+ }
+ 
++// [r44w] frente W: entrega en bloque de la cola del renderizador nativo del agua (w_agua_cola.h).
++// bytes = las escrituras en orden, big endian; tape[i] = 1 (Write8), 2 (Write16) o 4 (WriteF32).
++// Camino rápido (el de las funciones en línea de R16w: write-gather, sin redirección, sin NWII_WGP_CHECK):
++// deja exactamente lo que dejarían esas llamadas una a una:
++//   - los bytes en el búfer (entregando al llenarse, como wg_room; solo cambia en qué byte se corta la entrega);
++//   - s_wg_writes_l += nwrites;
++//   - s_bp_armed = la última escritura es Write8(0x61);
++//   - sniffer: Write16/WriteF32 ponen s_sn_st = 0 (sin mirar s_idx_on) y no tocan s_sn_a; Write8 pasa por
++//     idx_sniff8. El estado final solo depende de la última racha de Write8 (desde s_sn_st = 0 si la precede otra
++//     escritura del bloque, o desde el estado de antes si empieza el bloque) y de si hay escrituras detrás.
++// Si no se puede usar el camino rápido, se repiten las llamadas una a una (idéntico por construcción).
++std::atomic<uint64_t> g_w_commits{0}, g_w_commit_writes{0}, g_w_commit_slow{0};
++// [r44w] comprobación: fuerza los caminos completos (0) mientras se captura; devuelve el modo anterior.
++// [r44w] NWII_W_WGP_SELFTEST=1 (PC, al arrancar, antes de que el juego escriba nada): las mismas secuencias
++// aleatorias de Write8/16/32/F32 (bytes sesgados a 0x61/0x08/0x20-0x38/0x40/0x78/0xAC/0xBC...) por los caminos
++// cortos y por los de siempre, comparando tras CADA escritura los bytes del búfer, s_sn_st, s_sn_a, s_bp_armed y
++// el contador. Evita lo que tiene efectos fuera del pipe (LOAD_INDX/CALL_DL completos, BP que entregan): esas
++// palabras van por el camino completo en las dos versiones igualmente.
++static void w1_selftest() {
++    uint64_t rs = 0x9E3779B97F4A7C15ull, nops = 0, nbad = 0;
++    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
++    static const uint8_t kSpecial[] = {0x61, 0x08, 0x20, 0x28, 0x30, 0x38, 0x40, 0x78, 0xAC, 0xBC, 0x10, 0x00};
++    const bool save = s_w1_fast;
++    for (int seq = 0; seq < 4000; ++seq) {
++        const uint64_t seed = rnd();
++        std::vector<uint64_t> trace[2];
++        for (int pass = 0; pass < 2; ++pass) {
++            s_w1_fast = pass == 1;
++            s_wg_n = 0; s_sn_st = 0; s_sn_a = 0; s_bp_armed = false;
++            uint64_t r2 = seed | 1;
++            auto rr = [&]() { r2 ^= r2 << 13; r2 ^= r2 >> 7; r2 ^= r2 << 17; return r2; };
++            for (int op = 0; op < 200; ++op) {
++                const uint64_t x = rr();
++                const int kind = (int)(x % 4);
++                const uint8_t sb = (x >> 8) % 3 ? kSpecial[(x >> 16) % sizeof kSpecial] : (uint8_t)(x >> 24);
++                if (kind == 0) GX_WGPIPE_Write8(sb);
++                else if (kind == 1) GX_WGPIPE_Write16((uint16_t)(sb << 8 | (x >> 32 & 0xFF)));
++                else if (kind == 2) {
++                    // sin efectos fuera del pipe: ni LOAD_INDX/CALL_DL pendientes ni BP que entregan
++                    if (s_sn_st == 3 || s_sn_st == 4 || s_sn_st == 5) { GX_WGPIPE_Write16(0x1234); }
++                    else {
++                        uint32_t v = (uint32_t)(x >> 32);
++                        const uint8_t top = v >> 24;
++                        if (top == 0x45 || top == 0x47 || top == 0x48 || top == 0x52) v ^= 0x01000000u;
++                        GX_WGPIPE_Write32(v);
++                    }
++                } else { union { uint32_t i; float f; } u; u.i = (uint32_t)(x >> 32); GX_WGPIPE_WriteF32(u.f); }
++                uint64_t h = s_wg_n;
++                h = h * 1000003u ^ (uint64_t)s_sn_st;
++                h = h * 1000003u ^ s_sn_a;
++                h = h * 1000003u ^ (uint64_t)s_bp_armed;
++                h = h * 1000003u ^ s_wg_writes_l;
++                for (uint32_t i = s_wg_n > 8 ? s_wg_n - 8 : 0; i < s_wg_n; ++i) h = h * 131u ^ s_wg[i];
++                trace[pass].push_back(h);
++                ++nops;
++            }
++            s_wg_writes_l -= 200;  // el contador debe sumar lo mismo en las dos pasadas; se deshace
++        }
++        if (trace[0] != trace[1]) ++nbad;
++    }
++    s_wg_n = 0; s_sn_st = 0; s_sn_a = 0; s_bp_armed = false;
++    s_w1_fast = save;
++    std::printf("[WGP] r44w selftest: %d secuencias, %llu escrituras por cada camino, %llu secuencias distintas -> %s\n",
++                4000, (unsigned long long)(nops / 2), (unsigned long long)nbad, nbad ? "FALLO" : "OK");
++}
++static bool s_w1_saved = false;
++int GX_W_ModeSwap(int m) {
++    const int o = s_wg_mode;
++    if (m <= 0) { s_w1_saved = s_w1_fast; s_w1_fast = false; }
++    else s_w1_fast = s_w1_saved;
++    s_wg_mode = m;
++    return o;
++}
++void GX_WGPIPE_CommitTape(const uint8_t *b, const uint8_t *t, uint32_t nw, uint32_t nb) {
++    if (!nw) return;
++    if (__builtin_expect(!wg_fast() || g_w_cap != nullptr, 0)) {
++        g_w_commit_slow.fetch_add(1, std::memory_order_relaxed);
++        uint32_t p = 0;
++        for (uint32_t i = 0; i < nw; ++i) {
++            if (t[i] == 1) { GX_WGPIPE_Write8(b[p]); p += 1; }
++            else if (t[i] == 2) { GX_WGPIPE_Write16((uint16_t)(b[p] << 8 | b[p + 1])); p += 2; }
++            else { union { uint32_t i; float f; } u; u.i = (uint32_t)b[p] << 24 | (uint32_t)b[p + 1] << 16 |
++                   (uint32_t)b[p + 2] << 8 | b[p + 3]; GX_WGPIPE_WriteF32(u.f); p += 4; }
++        }
++        return;
++    }
++    // estado final de BP/sniffer
++    const uint32_t last = nw - 1;
++    s_bp_armed = t[last] == 1 && b[nb - 1] == 0x61;
++    int32_t e = (int32_t)last;
++    uint32_t pe = nb;  // posición tras la escritura e
++    while (e >= 0 && t[e] != 1) { pe -= t[e]; --e; }
++    if (e < 0) {
++        s_sn_st = 0;
++    } else if (!s_idx_on) {
++        // alguna escritura no-Write8 en el bloque -> s_sn_st = 0 (Write8 no lo toca sin s_idx_on)
++        bool any = false;
++        for (uint32_t i = 0; i < nw; ++i) any |= t[i] != 1;
++        if (any) s_sn_st = 0;
++    } else {
++        int32_t s0 = e;
++        while (s0 > 0 && t[s0 - 1] == 1) --s0;
++        const uint32_t ps = pe - (uint32_t)(e - s0 + 1);
++        if (s0 > 0) s_sn_st = 0;
++        for (uint32_t p = ps; p < pe; ++p) idx_sniff8(b[p]);
++        if (e != (int32_t)last) s_sn_st = 0;
++    }
++    s_wg_writes_l += nw;
++    g_w_commits.fetch_add(1, std::memory_order_relaxed);
++    g_w_commit_writes.fetch_add(nw, std::memory_order_relaxed);
++    uint32_t p = 0;
++    while (p < nb) {
++        uint32_t room = s_wg_cap - s_wg_n;
++        if (!room) { wg_flush_now(); room = s_wg_cap; }
++        const uint32_t k = nb - p < room ? nb - p : room;
++        std::memcpy(s_wg + s_wg_n, b + p, k);
++        s_wg_n += k;
++        p += k;
++    }
++}
++
+ // ", wgp N writes/s M flushes/s" for the NWII_FPS / fps_log stats line
+ // (R16w: + of them at a BP / by age).
+ int GX_WgpStatsLine(char *buf, int size, double dt) {
+diff --color -ruN r41m/nWiiRuntime_m6g/src/platform/switch/switch_platform.cpp r41m/nWiiRuntime_m6h/src/platform/switch/switch_platform.cpp
+--- r41m/nWiiRuntime_m6g/src/platform/switch/switch_platform.cpp	2026-11-15 15:51:21.117050476 -0500
++++ r41m/nWiiRuntime_m6h/src/platform/switch/switch_platform.cpp	2026-11-15 19:05:07.837329335 -0500
+@@ -873,7 +873,7 @@
+     std::printf("[NX] game %.1f fps, host loop %.1f/s, cpu %u MHz, gpu %u MHz%s%s%s\n", (frames - last_frames) / dt,
+                 host_frames / dt, cpu_hz / 1000000, gpu_hz / 1000000, gov, thr, aud);
+     if (nwii::runtime::s2::g_enabled) {  // r34s2
+-      char s2l[1400];  // r38c: + linea [C38]
++      char s2l[2048];  // r38c: + linea [C38]; r41m m6h: + [A43]
+       nwii::runtime::s2::stats_line(s2l, sizeof s2l, dt);
+       std::printf("%s\n", s2l);
+     }
+diff --color -ruN r41m/nWiiRuntime_m6g/src/platform/switch/switch_profiler.cpp r41m/nWiiRuntime_m6h/src/platform/switch/switch_profiler.cpp
+--- r41m/nWiiRuntime_m6g/src/platform/switch/switch_profiler.cpp	2026-11-12 03:34:53.930771566 -0500
++++ r41m/nWiiRuntime_m6h/src/platform/switch/switch_profiler.cpp	2026-11-15 19:04:46.905241480 -0500
+@@ -20,6 +20,7 @@
+ 
+ #include "runtime/cpu_context.h"
+ #include "../../core/tprof.h"  // r31t
++#include "../../core/s2.h"     // r43a: CPU de sonido
+ 
+ #include <switch.h>
+ #include <sys/stat.h>
+@@ -290,12 +291,16 @@
+   t.hist.add(ctx.pc.x, ctx.lr);
+   if (t.slot == kThreadCpu)
+     if (CPUContext *c = g_ctx_ptr) t.guest.add(*(volatile uint32_t *)&c->pc);
++  if (t.slot == kThreadS2)  // r43a
++    if (CPUContext *c = s2::snd_ctx()) t.guest.add(*(volatile uint32_t *)&c->pc);
+   return true;
+ }
+ 
+ void sampler(void *) {
+   // R11: the render worker too (logs/profile_gxw.txt; no samples while it is off).
+-  static Target targets[] = {{"main", kThreadMain}, {"cpu", kThreadCpu}, {"gxw", kThreadGxw}};
++  // r43a: NWII_A_PROF_SND=1 muestrea tambien la CPU de sonido (S2) -> logs/profile_snd.txt (con pc invitado).
++  static Target targets[] = {{"main", kThreadMain}, {"cpu", kThreadCpu}, {"gxw", kThreadGxw}, {"snd", kThreadS2}};
++  static const int ntargets = [] { const char *e = std::getenv("NWII_A_PROF_SND"); return (e && *e && *e != '0') ? 4 : 3; }();
+   const u64 start = armGetSystemTick();
+   u64 last_write = start;
+   uint64_t win_paused[3] = {};
+@@ -335,13 +340,14 @@
+                   now_s, g_sampled_s);
+       if (!active) {  // the files right away: the game may be closed during the next one
+         mkdir((std::string(root_dir()) + "/logs").c_str(), 0777);
+-        for (Target &t : targets) write_target(t, now_s);
++        for (int k = 0; k < ntargets; ++k) write_target(targets[k], now_s);
+       }
+     }
+     if (active) g_sampled_s += armTicksToNs(tnow - last_tick) / 1e9;
+     last_tick = tnow;
+     if (!active) continue;
+-    for (Target &t : targets) {
++    for (int k = 0; k < ntargets; ++k) {
++      Target &t = targets[k];
+       if (sample(t)) continue;
+       std::printf("[PROFILE] %s: svcSetThreadActivity/svcGetThreadContext3 failed (rc 0x%x): "
+                   "sampling is not supported here, profiler off\n", t.name, t.last_rc);
+@@ -353,7 +359,7 @@
+       last_write = now;
+       const double elapsed = armTicksToNs(now - start) / 1e9;
+       mkdir((std::string(root_dir()) + "/logs").c_str(), 0777);
+-      for (Target &t : targets) write_target(t, elapsed);
++      for (int k = 0; k < ntargets; ++k) write_target(targets[k], elapsed);
+       if (g_tprof) tprof::flush();
+       const double tick_us = 1e6 / 19200000.0;
+       std::printf("[PROFILE] %.0f s: main %llu samples (%.2f %% paused), cpu %llu (%.2f %%) -> "
+@@ -415,6 +421,10 @@
+   svcGetInfo(&allowed, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
+   g_core = (allowed & 8) ? 3 : (allowed & 4) ? 2 : -2;
+   g_prio = 0x2C;
++  {  // r43a: para muestrear la CPU de sonido (0x2C, nucleo 2) el muestreador tiene que estar por encima de ella
++    const char *e = std::getenv("NWII_A_PROF_SND");
++    if (e && *e && *e != '0') g_prio = 0x2B;
++  }
+   Result rc = threadCreate(&g_thread, sampler, nullptr, nullptr, 64 * 1024, g_prio, g_core);
+   if (R_SUCCEEDED(rc)) rc = threadStart(&g_thread);
+   std::printf("[PROFILE] sampler %s: every %u us on core %d (allowed mask 0x%llx), image base "

@@ -1,0 +1,566 @@
+diff --color -ruN ../r35m4/nWiiRuntime_m5/src/core/main.cpp ref/c38src_c1/src/core/main.cpp
+--- ../r35m4/nWiiRuntime_m5/src/core/main.cpp	2026-11-14 21:32:24.165940940 -0500
++++ ref/c38src_c1/src/core/main.cpp	2026-11-15 11:59:26.407564498 -0500
+@@ -75,6 +75,9 @@
+ uint64_t g_stat_presented = 0, g_stat_repeats = 0, g_stat_unshown = 0;
+ 
+ void cpu_thread_func(nwii::runtime::CPUContext *ctx) {
++#ifndef __SWITCH__
++  nwii::runtime::s2::pc_sched(1);  // r38c: NWII_C_PCSCHED (solo PC)
++#endif
+   nwii::runtime::g_ctx_ptr = ctx;
+   {
+     // Leave 1 MiB of headroom below the guest call chain (stack: 8 MiB for a
+@@ -694,6 +697,9 @@
+   }
+ 
+   nwii::runtime::s2::init(ctx.get());  // r34s2 (NWII_S2=1): CPU de sonido
++#ifndef __SWITCH__
++  nwii::runtime::s2::pc_sched(0);  // r38c: NWII_C_PCSCHED (solo PC): este hilo es el de render
++#endif
+ #ifdef __SWITCH__
+   // Every guest call is a native call, so the host stack grows as deep as the
+   // game's call chain; libnx gives std::thread no way to size it.
+diff --color -ruN ../r35m4/nWiiRuntime_m5/src/core/s2.cpp ref/c38src_c1/src/core/s2.cpp
+--- ../r35m4/nWiiRuntime_m5/src/core/s2.cpp	2026-11-15 06:18:14.238883210 -0500
++++ ref/c38src_c1/src/core/s2.cpp	2026-11-15 11:59:26.408564500 -0500
+@@ -117,6 +117,40 @@
+   if (n < 40) std::printf("[S2] ASSERT: %s (0x%08x, 0x%08x)%s\n", what, a, b, t_snd ? " [hilo de sonido]" : " [hilo del juego]");
+ }
+ 
++// ---- r38c (frente C): esperas activas que ceden de verdad ----------------------------------
++// En Horizon ceder (sched_yield = svcSleepThread(-1)) solo deja correr a hilos de la MISMA prioridad. Si la
++// CPU de sonido (0x2C, nucleo 2) gira esperando S mientras el juego, con S tomado, espera un candado que tiene
++// un hilo de menos prioridad de su nucleo (el trabajador de render, 0x2D, con g_fifo_mutex), nadie avanza:
++// cuelgue de Z22. Aqui, tras un giro corto, se DUERME (svcSleepThread > 0): el nucleo pasa a los de abajo.
++// NWII_C_SPIN_OFF=1: como m5 (yield).
++bool g_spin_old = false;
++std::atomic<uint32_t> g_snd_wait{0};      // 0 nada, 1 candado S, 2 peticion al juego, 3 candado DSP, 4 siesta corta
++std::atomic<uint64_t> g_snd_wait_t0{0};   // ns
++std::atomic<uint64_t> g_game_wait_t0{0};  // el juego espera S desde (ns; 0 = no espera)
++std::atomic<uint64_t> st_backoff_sleeps{0}, st_game_wait_max_us{0}, st_snd_wait_max_us{0};
++uint32_t gs_acq_lr = 0, gs_acq_site = 0;  // juego: de donde tomo S (informativo, vigia)
++inline void sleep_us(uint32_t us) {
++#ifdef __SWITCH__
++  svcSleepThread((int64_t)us * 1000);
++#else
++  std::this_thread::sleep_for(std::chrono::microseconds(us));
++#endif
++}
++inline void backoff(uint32_t &spins) {
++  ++spins;
++  if (g_spin_old) {
++    cpu_relax();
++    if (spins > 4000) std::this_thread::yield();
++    return;
++  }
++  if (spins < 2000) { cpu_relax(); return; }
++  sleep_us(spins < 2100 ? 20 : 200);
++  st_backoff_sleeps.fetch_add(1, std::memory_order_relaxed);
++}
++inline void note_max(std::atomic<uint64_t> &m, uint64_t v) {
++  if (v > m.load(std::memory_order_relaxed)) m.store(v, std::memory_order_relaxed);
++}
++
+ // ---- candado S ----------------------------------------------------------------------------
+ std::atomic<uint32_t> s_lock{0};  // 0 libre, 1 juego, 2 sonido
+ enum : uint32_t { kHoldNone = 0, kHoldSection = 1, kHoldIrq = 2 };
+@@ -266,6 +300,7 @@
+   uint32_t exp = 0;
+   if (!s_lock.compare_exchange_strong(exp, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+     const uint64_t t0 = now_ns();
++    g_game_wait_t0.store(t0, std::memory_order_relaxed);
+     uint32_t spins = 0;
+     for (;;) {
+       exp = 0;
+@@ -275,11 +310,16 @@
+       cpu_relax();
+       if (++spins > 4000) { std::this_thread::yield(); }
+     }
+-    add(st.g_wait_ns, now_ns() - t0);
++    g_game_wait_t0.store(0, std::memory_order_relaxed);
++    const uint64_t w = now_ns() - t0;
++    note_max(st_game_wait_max_us, w / 1000);
++    add(st.g_wait_ns, w);
+     add(st.g_wait_n);
+   }
+   gs.holds = kind;
+   gs.owner = owner;
++  gs_acq_lr = ctx.lr;
++  gs_acq_site = ctx.pc;
+   g_game_work.store(g_game_work.load(std::memory_order_relaxed) | 2, std::memory_order_relaxed);
+   add(kind == kHoldIrq ? st.g_irq : st.g_sec);
+ }
+@@ -323,14 +363,18 @@
+     uint32_t exp = 0;
+     if (!s_lock.compare_exchange_strong(exp, 2, std::memory_order_acquire, std::memory_order_relaxed)) {
+       const uint64_t t0 = now_ns();
++      g_snd_wait_t0.store(t0, std::memory_order_relaxed);
++      g_snd_wait.store(1, std::memory_order_relaxed);
+       uint32_t spins = 0;
+       for (;;) {
+         exp = 0;
+         if (s_lock.compare_exchange_weak(exp, 2, std::memory_order_acquire, std::memory_order_relaxed)) break;
+-        cpu_relax();
+-        if (++spins > 4000) std::this_thread::yield();
++        backoff(spins);
+       }
+-      add(st.s_wait_ns, now_ns() - t0);
++      g_snd_wait.store(0, std::memory_order_relaxed);
++      const uint64_t w = now_ns() - t0;
++      note_max(st_snd_wait_max_us, w / 1000);
++      add(st.s_wait_ns, w);
+       add(st.s_wait_n);
+     }
+     snd_holds = true;
+@@ -493,6 +537,8 @@
+   rq.op = op; rq.arg = arg; rq.arg2 = arg2; rq.result = 0;
+   g_req.store(1, std::memory_order_release);
+   const uint64_t t0 = now_ns();
++  g_snd_wait_t0.store(t0, std::memory_order_relaxed);
++  g_snd_wait.store(2, std::memory_order_relaxed);
+   uint32_t spins = 0;
+   for (;;) {
+     if (g_req.load(std::memory_order_acquire) == 2) break;
+@@ -515,6 +561,7 @@
+     if (snd_state.load(std::memory_order_relaxed) == kQuit) break;
+   }
+   g_req.store(0, std::memory_order_release);
++  g_snd_wait.store(0, std::memory_order_relaxed);
+   add(st.req_wait_ns, now_ns() - t0);
+   if (!(msr0 & 0x8000)) { ctx.msr = msr0; snd_ee_sync(ctx); }
+   return rq.result;
+@@ -813,6 +860,9 @@
+     nx::note_thread(nx::kThreadS2);
+   }
+ #endif
++#ifndef __SWITCH__
++  pc_sched(5);
++#endif
+   for (;;) {
+     {
+       std::unique_lock<std::mutex> lk(snd_mx);
+@@ -848,9 +898,182 @@
+   }
+ }
+ 
++
++// ==== r38c (frente C): vigilante de cuelgues ===============================================
++// Hilo anfitrion de prioridad normal (0x2C, nucleo 0; duerme 1 s). Si ni el render (g_stat_frames) ni el juego
++// (copias XFB) avanzan en ~5 s, escribe al registro normal unas pocas lineas [VIGIA] (~2-3 KB) y hace flush:
++// estado del candado S, de la CPU de sonido (que espera y desde cuando), del candado del FIFO de GX y del DSP,
++// % de CPU de cada hilo anfitrion en el intervalo, y los hilos invitados (estado, cola en que esperan, dueno del
++// mutex). Repite cada 5 s mientras dure, como mucho 4 veces por parada y 8 en total. NWII_C_VIGIA_OFF=1 lo apaga.
++}  // namespace (anonimo)
++namespace {
++CPUContext *g_wd_ctx = nullptr;
++}  // namespace
++#ifndef __SWITCH__
++void pc_unsched_all();
++#endif
++namespace {
++inline bool guest_ok(uint32_t a) { return (a >= 0x80000000u && a < 0x817FFFF0u) || (a >= 0x90000000u && a < 0x93FFFFF0u); }
++inline uint32_t wd_rd32(uint32_t a) { return guest_ok(a) ? g_wd_ctx->mmu.read32(a) : 0xFFFFFFFFu; }
++inline uint32_t wd_rd16(uint32_t a) { return guest_ok(a) ? g_wd_ctx->mmu.read16(a) : 0xFFFFu; }
++const char *wait_name(uint32_t w) {
++  switch (w) { case 0: return "nada"; case 1: return "candado S"; case 2: return "peticion al juego"; case 3: return "candado DSP"; default: return "?"; }
++}
++void vigia_dump(int nth, double stalled_s) {
++  const uint64_t now = now_ns();
++  std::printf("[VIGIA] #%d sin progreso %.1f s (render fot %llu, copias XFB %llu)\n", nth, stalled_s,
++              (unsigned long long)c38_frames_render(), (unsigned long long)c38_frames_game());
++#ifdef __SWITCH__
++  {  // % de CPU de cada hilo en el ultimo segundo
++    static const char *const nm[] = {"main", "cpu", "ax", "aud", "gxw", "snd"};
++    static uint64_t last[6] = {}, last_t = 0;
++    const uint64_t t = armGetSystemTick();
++    char b[200]; int k = 0;
++    for (int i = 0; i < 6; ++i) {
++      const Handle h = nx::thread_handle(i);
++      u64 ticks = 0;
++      if (!h || R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, h, (u64)-1))) continue;
++      if (last_t) k += std::snprintf(b + k, sizeof b - k, " %s %.0f%%", nm[i], 100.0 * (double)(ticks - last[i]) / (double)(t - last_t));
++      last[i] = ticks;
++    }
++    last_t = t;
++    std::printf("[VIGIA] cpu%%:%s\n", b);
++  }
++#endif
++  if (g_wd_ctx) {
++    CPUContext &c = *g_wd_ctx;
++    std::printf("[VIGIA] juego: pc 0x%08x lr 0x%08x msr 0x%x hilo 0x%08x en_callback %d (prof %d) | espera S desde %.1f ms\n", c.pc, c.lr,
++                c.msr, wd_rd32(kCurThread), (int)c.in_callback, c.callback_depth,
++                g_game_wait_t0.load() ? (now - g_game_wait_t0.load()) / 1e6 : 0.0);
++  }
++  if (g_enabled) {
++    const uint64_t sw = g_snd_wait_t0.load();
++    std::printf("[VIGIA] S2: activo %d estado %u | S=%u (1 juego, 2 sonido) juego %s dueno 0x%08x tomado en pc 0x%08x lr 0x%08x | sonido S %d irq %d "
++                "fibra %s | espera %s desde %.1f ms | peticion %u (op %u arg 0x%08x) park %u | max espera S: juego %llu us, sonido %llu us | siestas %llu\n",
++                (int)g_active.load(), snd_state.load(), s_lock.load(), gs.holds == kHoldIrq ? "irq" : gs.holds == kHoldSection ? "secc" : "-", gs.owner,
++                gs_acq_site, gs_acq_lr, (int)snd_holds, in_irq, cur_fiber ? cur_fiber->name : "-", wait_name(g_snd_wait.load()),
++                g_snd_wait.load() && sw ? (now - sw) / 1e6 : 0.0, g_req.load(), rq.op, rq.arg, g_park.load(),
++                (unsigned long long)st_game_wait_max_us.load(), (unsigned long long)st_snd_wait_max_us.load(),
++                (unsigned long long)st_backoff_sleeps.load());
++    if (g_snd) std::printf("[VIGIA] S2 ctx: pc 0x%08x lr 0x%08x msr 0x%x | fibras: %s hosted %d n %d, %s hosted %d n %d | mutex del sonido %zu\n",
++                           g_snd->pc, g_snd->lr, g_snd->msr, fibers[0].name, (int)fibers[0].hosted.load(), fibers[0].n, fibers[1].name,
++                           (int)fibers[1].hosted.load(), fibers[1].n, snd_mtx.size());
++  }
++  {
++    char b[256];
++    c38_gx_state(b, sizeof b);
++    std::printf("[VIGIA] gx: %s | dsp: candado %d\n", b, (int)hw::c38_dsp_lock_busy());
++  }
++  // hilos invitados (0x800000DC, enlace +0x2FC): estado, prioridad, cola, pc/lr guardados
++  if (g_wd_ctx) {
++    uint32_t t = wd_rd32(0x800000DC);
++    std::printf("[VIGIA] hilos invitados (actual 0x%08x):", wd_rd32(kCurThread));
++    for (int i = 0; i < 20 && guest_ok(t); ++i) {
++      const uint32_t q = wd_rd32(t + kThQueue);
++      std::printf(" | 0x%08x st %u pri %u q 0x%08x", t, wd_rd16(t + kThState), wd_rd32(t + kThPrio), q);
++      if (guest_ok(q)) std::printf(" (mutex? dueno 0x%08x)", wd_rd32(q + kMtxThread));
++      std::printf(" srr0 0x%08x lr 0x%08x", wd_rd32(t + 0x198), wd_rd32(t + 0x84));
++      t = wd_rd32(t + 0x2FC);
++    }
++    std::printf("\n");
++  }
++  c38_log_flush();
++}
++void vigia_main() {
++#ifdef __SWITCH__
++  svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2C);
++#endif
++  uint64_t lr = c38_frames_render(), lg = c38_frames_game(), t_prog = now_ns();
++  int episode = 0, total = 0;
++  for (;;) {
++    sleep_us(1000000);
++    const uint64_t r = c38_frames_render(), g = c38_frames_game(), now = now_ns();
++    if (r != lr || g != lg) { lr = r; lg = g; t_prog = now; episode = 0; continue; }
++    const double st = (now - t_prog) / 1e9;
++    if (st >= 5.0 * (episode + 1) && episode < 4 && total < 8) {
++      ++episode; ++total; vigia_dump(total, st);
++#ifndef __SWITCH__
++      if (episode == 2) pc_unsched_all();  // PC con NWII_C_PCSCHED: romper un bloqueo por prioridades y ver si sigue
++#endif
++    }
++  }
++}
++}  // namespace
++void vigia_start(CPUContext *main_ctx) {
++  const char *off = NWII_ENV("NWII_C_VIGIA_OFF");
++  if (off && *off) return;
++  g_wd_ctx = main_ctx;
++  pthread_attr_t attr;
++  pthread_attr_init(&attr);
++  pthread_attr_setstacksize(&attr, 256 * 1024);
++  pthread_t th;
++  pthread_create(&th, &attr, [](void *) -> void * { vigia_main(); return nullptr; }, nullptr);
++  pthread_detach(th);
++  std::printf("[VIGIA] vigilante de cuelgues activo (5 s sin fotogramas -> volcado al registro)\n");
++}
++namespace {
+ }  // namespace
+ 
+ bool on_snd_thread() { return t_snd; }
++}  // namespace s2
++void c38_log_flush() {
++#ifdef __SWITCH__
++  nx::c38_sink_flush();
++#else
++  std::fflush(stdout);
++#endif
++}
++namespace s2 {
++void spin_backoff(uint32_t &spins) { backoff(spins); }
++#ifdef __SWITCH__
++void pc_sched(int) {}
++bool pc_set_prio(int) { return false; }
++#else
++}  // namespace s2
++}  // namespace nwii::runtime
++#include <sched.h>
++namespace nwii::runtime {
++namespace s2 {
++static bool pcs_on() { static const bool on = [] { const char *e = std::getenv("NWII_C_PCSCHED"); return e && *e && *e != '0'; }(); return on; }
++static std::mutex pcs_mx;
++static std::vector<pthread_t> pcs_threads;
++// Valvula de seguridad (vigia): todos los hilos fijados vuelven a SCHED_OTHER (sin prioridades estrictas).
++void pc_unsched_all() {
++  std::lock_guard<std::mutex> lk(pcs_mx);
++  sched_param sp{};
++  for (pthread_t t : pcs_threads) pthread_setschedparam(t, SCHED_OTHER, &sp);
++  std::printf("[C38] PCSCHED deshecho: %zu hilos vuelven a SCHED_OTHER\n", pcs_threads.size());
++}
++bool pc_set_prio(int hp) {
++  if (!pcs_on()) return false;
++  sched_param sp{};
++  sp.sched_priority = std::max(1, 0x3C - hp);  // 0x2C -> 16, 0x2D -> 15, 0x3B -> 1
++  return pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0;
++}
++void pc_sched(int slot) {
++  if (!pcs_on()) return;
++  // nucleos de la Switch 0..2 -> CPUs del PC (NWII_C_PCSCHED_CPUS, por defecto 2,3,4)
++  int cpus[3] = {2, 3, 4};
++  if (const char *e = std::getenv("NWII_C_PCSCHED_CPUS")) std::sscanf(e, "%d,%d,%d", &cpus[0], &cpus[1], &cpus[2]);
++  auto envi = [](const char *n, int d) { const char *e = std::getenv(n); return e ? (int)std::strtol(e, nullptr, 0) : d; };
++  int core = 0, prio = 0x2C;
++  switch (slot) {
++    case 0: core = 0; prio = 0x2C; break;
++    case 1: core = 1; prio = 0x3B; break;
++    case 4: core = envi("NWII_RENDER_WORKER_CORE", 2); prio = envi("NWII_RENDER_WORKER_PRIO", 0x2D); break;
++    case 5: core = envi("NWII_S2_CORE", 2); prio = envi("NWII_S2_PRIO", 0x2C); break;
++    default: return;
++  }
++  cpu_set_t cs;
++  CPU_ZERO(&cs);
++  CPU_SET(cpus[core % 3], &cs);
++  const int a = pthread_setaffinity_np(pthread_self(), sizeof cs, &cs);
++  const bool p = pc_set_prio(prio);
++  { std::lock_guard<std::mutex> lk(pcs_mx); pcs_threads.push_back(pthread_self()); }
++  std::printf("[C38] PCSCHED: hilo %d -> nucleo %d (CPU %d%s), prioridad 0x%X%s\n", slot, core, cpus[core % 3], a ? " FALLO" : "", prio,
++              p ? " (SCHED_FIFO)" : " FALLO");
++}
++#endif
+ CPUContext *snd_ctx() { return g_snd; }
+ 
+ uint64_t snd_now() { return g_snd->wall_timebase_now() - snd_slip; }
+@@ -907,6 +1130,10 @@
+ 
+ void game_irq_enter(CPUContext &ctx) {
+   if (!gs.holds) game_acquire(ctx, kHoldIrq, rd32(kCurThread), true);
++  // r38c NWII_C_STRESS_SFIFO=1 (solo pruebas): con S tomado, el juego toca el candado del FIFO de GX en cada
++  // interrupcion (como el vaciado por edad de Z22 dentro del manejador de alarmas): agranda la ventana del cuelgue.
++  static const bool s_stress = [] { const char *e = NWII_ENV("NWII_C_STRESS_SFIFO"); return e && *e && *e != '0'; }();
++  if (__builtin_expect(s_stress, 0)) c38_stress_fifo_touch();
+ }
+ void game_sync(CPUContext &ctx) { game_rules(ctx, false, false); }
+ 
+@@ -927,6 +1154,8 @@
+ }
+ 
+ void init(CPUContext *main_ctx) {
++  { const char *e = NWII_ENV("NWII_C_SPIN_OFF"); g_spin_old = e && *e; }
++  vigia_start(main_ctx);  // r38c
+   // [r35m4 m5] S2 ENCENDIDO por defecto. Apagado: NWII_S2_OFF=1 (llega desde debug.toml; apply_env borra los
+   // "0"/"off") o NWII_S2=0 explicito (PC).
+   const char *e = NWII_ENV("NWII_S2");
+@@ -957,7 +1186,8 @@
+   pthread_t th;
+   pthread_create(&th, &attr, [](void *) -> void * { snd_thread_main(); return nullptr; }, nullptr);
+   pthread_detach(th);
+-  std::printf("[S2] sonido en otro nucleo ACTIVADO (NWII_S2=1%s)\n", g_check ? ", NWII_S2_CHECK" : "");
++  std::printf("[S2] sonido en otro nucleo ACTIVADO (NWII_S2=1%s)%s\n", g_check ? ", NWII_S2_CHECK" : "",
++              g_spin_old ? " [r38c: esperas como m5, NWII_C_SPIN_OFF]" : " [r38c: esperas que duermen]");
+ }
+ 
+ void shutdown() {
+diff --color -ruN ../r35m4/nWiiRuntime_m5/src/core/s2.h ref/c38src_c1/src/core/s2.h
+--- ../r35m4/nWiiRuntime_m5/src/core/s2.h	2026-11-14 21:30:17.115283862 -0500
++++ ref/c38src_c1/src/core/s2.h	2026-11-15 11:59:26.409564502 -0500
+@@ -41,6 +41,13 @@
+ uint64_t snd_schedule_at(uint64_t due, Cb cb);
+ bool snd_cancel(uint64_t id, uint64_t *due);
+ void stats_line(char *buf, int n, double dt);
++// --- r38c (frente C) ---
++void spin_backoff(uint32_t &spins);    // espera activa: gira poco y luego DUERME (cede el nucleo a los de abajo)
++void vigia_start(CPUContext *main_ctx);
++// PC: NWII_C_PCSCHED=1 imita el reparto de la Switch (nucleo fijo + SCHED_FIFO con las prioridades de Horizon:
++// mayor prioridad = numero menor). slot: 0 render, 1 juego, 4 trabajador, 5 CPU de sonido. En la Switch, nada.
++void pc_sched(int slot);
++bool pc_set_prio(int horizon_prio);  // PC: cambia la del hilo actual
+ 
+ }  // namespace s2
+ 
+@@ -50,5 +57,12 @@
+ void s2_dsp_handback();   // lo devuelve a la agenda del juego
+ int s2_dsp_irq();         // CPU de sonido: 5 (AID), 7 (DSP) o 0
+ bool s2_dsp_quiescent();  // sin eventos de correo en vuelo ni interrupciones de sonido pendientes
++bool c38_dsp_lock_busy();  // r38c: vigia
+ }  // namespace hw
++// r38c: vigia (gx.cpp / plataforma)
++uint64_t c38_frames_render();
++uint64_t c38_frames_game();
++void c38_gx_state(char *buf, int n);
++void c38_log_flush();
++void c38_stress_fifo_touch();  // gx.cpp: toma y suelta g_fifo_mutex (solo pruebas)
+ }  // namespace nwii::runtime
+diff --color -ruN ../r35m4/nWiiRuntime_m5/src/hle/gx.cpp ref/c38src_c1/src/hle/gx.cpp
+--- ../r35m4/nWiiRuntime_m5/src/hle/gx.cpp	2026-11-15 06:18:14.229822228 -0500
++++ ref/c38src_c1/src/hle/gx.cpp	2026-11-15 11:59:26.409564502 -0500
+@@ -8,6 +8,7 @@
+ #include <unordered_map>
+ #include <memory>
+ #include "runtime/cpu_context.h"
++#include "../core/s2.h"  // r38c: pc_sched (PC), vigia
+ 
+ namespace nwii::runtime { extern CPUContext *g_ctx_ptr; }
+ 
+@@ -57,19 +58,31 @@
+ // GXPosition/GXColor call) and took a pthread mutex for each write (2.6% of
+ // all samples, Switch-like CPU profile). The host holds the lock only to take
+ // the bytes, so a test-and-test-and-set spinlock is enough.
++// r38c: `owner` / `waiters` solo para el vigilante de cuelgues (quien lo tiene, cuantos esperan).
+ struct FifoLock {
+     std::atomic<bool> busy{false};
++    std::atomic<uint32_t> owner{0}, waiters{0};
+     void lock() {
+         for (unsigned spins = 0; busy.exchange(true, std::memory_order_acquire);) {
++            if (spins > 64) waiters.fetch_add(1, std::memory_order_relaxed);
+             while (busy.load(std::memory_order_relaxed)) {
+                 if (++spins > 64) std::this_thread::yield();
+ #if defined(__x86_64__) || defined(__i386__)
+                 else __builtin_ia32_pause();
+ #endif
+             }
++            if (spins > 64) waiters.fetch_sub(1, std::memory_order_relaxed);
+         }
++        owner.store(self_tag(), std::memory_order_relaxed);
+     }
+     void unlock() { busy.store(false, std::memory_order_release); }
++    static uint32_t self_tag() {
++#ifdef __SWITCH__
++        return threadGetCurHandle();
++#else
++        return (uint32_t)std::hash<std::thread::id>{}(std::this_thread::get_id());
++#endif
++    }
+ };
+ FifoLock g_fifo_mutex;
+ std::vector<uint8_t> g_hw_fifo;
+@@ -106,7 +119,9 @@
+ static std::atomic<int64_t> s_pipe_xfb_last{0};
+ static std::atomic<uint64_t> s_pipe_xfb_n{0}, s_pipe_xfb_sum{0}, s_pipe_xfb_max{0};
+ static std::atomic<uint32_t> s_pipe_xfb_h[5];  // interval <=18, <=22, <=30, <=36, >36 ms
++static std::atomic<uint64_t> s_c38_xfb{0};  // r38c: copias XFB del juego (vigia)
+ static inline void PipeNoteXfb() {  // guest thread, g_fifo_mutex held
++    s_c38_xfb.fetch_add(1, std::memory_order_relaxed);
+     const int64_t t = PipeNow();
+     const int64_t l = s_pipe_xfb_last.exchange(t, std::memory_order_relaxed);
+     if (!l) return;
+@@ -1202,6 +1217,13 @@
+     TrimBuffers();
+     {
+         std::lock_guard<FifoLock> lock(g_fifo_mutex);
++        // r38c NWII_C_STRESS_FIFO_US (solo pruebas): el trabajador retiene el candado del FIFO ese tiempo
++        // (girando) en cada llamada, para agrandar la ventana del cuelgue de Z22 y reproducirlo.
++        static const long s_c38_stress = [] { const char *e = NWII_ENV("NWII_C_STRESS_FIFO_US"); return e ? std::atol(e) : 0L; }();
++        if (__builtin_expect(s_c38_stress > 0, 0) && !apply_now) {
++            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(s_c38_stress);
++            while (std::chrono::steady_clock::now() < until) {}
++        }
+         if (!apply_now) {  // worker: still not taken by the render thread
+             s_held_frames += s_fifo_frames;
+             s_prep_pending.held += s_fifo_frames;
+@@ -1870,6 +1892,9 @@
+ 
+ static void WorkerMain() {
+     t_on_worker = true;
++#ifndef __SWITCH__
++    nwii::runtime::s2::pc_sched(4);  // r38c: NWII_C_PCSCHED (solo PC)
++#endif
+ #ifdef __SWITCH__
+     // Homebrew gets cores 0-2: render (main) on 0, the recompiled CPU on 1,
+     // audio (AX mixer, audren output) on 2, a few % busy. One priority step
+@@ -2791,3 +2816,23 @@
+ 
+ } 
+ uint64_t g_prof_decode_us_accum = 0;
++
++
++// ---- r38c (frente C): estado para el vigilante de cuelgues (s2.cpp) ----
++namespace nwii::runtime {
++uint64_t c38_frames_render() { return __atomic_load_n(&g_stat_frames, __ATOMIC_RELAXED); }
++uint64_t c38_frames_game() { return s_c38_xfb.load(std::memory_order_relaxed); }
++void c38_stress_fifo_touch() { std::lock_guard<FifoLock> lock(g_fifo_mutex); }
++void c38_gx_state(char *buf, int n) {
++    const uint32_t own = g_fifo_mutex.owner.load(std::memory_order_relaxed);
++    const char *who = "?";
++#ifdef __SWITCH__
++    static const char *const nm[] = {"main", "cpu", "ax", "aud", "gxw", "snd"};
++    for (int i = 0; i < 6; ++i)
++        if (own && own == nwii::runtime::nx::thread_handle(i)) who = nm[i];
++#endif
++    std::snprintf(buf, n, "fifo candado %d (ultimo dueno %s 0x%x, esperan %u) fot en cola %u retenidos %u bytes %zu",
++                  (int)g_fifo_mutex.busy.load(), who, own, g_fifo_mutex.waiters.load(), s_fifo_frames, s_held_frames,
++                  g_hw_fifo.size());
++}
++}  // namespace nwii::runtime
+diff --color -ruN ../r35m4/nWiiRuntime_m5/src/hw/hw_dsp.cpp ref/c38src_c1/src/hw/hw_dsp.cpp
+--- ../r35m4/nWiiRuntime_m5/src/hw/hw_dsp.cpp	2026-11-14 22:08:42.633149169 -0500
++++ ref/c38src_c1/src/hw/hw_dsp.cpp	2026-11-15 11:59:26.410564504 -0500
+@@ -63,10 +63,12 @@
+         if (on && t_dsp_depth++ == 0) {
+             bool exp = false;
+             unsigned spins = 0;
++            uint32_t spins32 = 0;  // r38c: gira poco y luego duerme (s2::spin_backoff)
+             while (!s_dsp_lock.compare_exchange_weak(exp, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+                 exp = false;
+-                if (++spins > 2000) std::this_thread::yield();
++                nwii::runtime::s2::spin_backoff(spins32);
+             }
++            (void)spins;
+         }
+     }
+     ~DspGuard() {
+@@ -431,6 +433,7 @@
+     return s_ev_pending == 0 && !s_ax_sync_pending && s_dsp_mails.empty() &&
+            (((dsp_control >> 1) & dsp_control & 0x0088) == 0);
+ }
++bool c38_dsp_lock_busy() { return s_dsp_lock.load(std::memory_order_relaxed); }  // r38c: vigia
+ bool s2_dsp_quiescent() {
+     DspGuard g;
+     return dsp_quiescent_locked();
+diff --color -ruN ../r35m4/nWiiRuntime_m5/src/platform/switch/switch_alloc.cpp ref/c38src_c1/src/platform/switch/switch_alloc.cpp
+--- ../r35m4/nWiiRuntime_m5/src/platform/switch/switch_alloc.cpp	2026-11-08 17:48:03.876784029 -0500
++++ ref/c38src_c1/src/platform/switch/switch_alloc.cpp	2026-11-15 11:59:26.411564506 -0500
+@@ -20,6 +20,7 @@
+ #include <malloc.h>
+ #include <new>
+ #include <atomic>
++#include <switch.h>  // r38c: svcSleepThread
+ 
+ namespace {
+ 
+@@ -65,8 +66,11 @@
+ Shared g_shared[kClasses + 1];
+ 
+ inline void shared_lock(Shared &sh) {
+-  while (sh.lock.test_and_set(std::memory_order_acquire)) {
+-  }
++  // r38c: giro puro sin ceder: si el que lo tiene es un hilo de menos prioridad del MISMO nucleo (p. ej. el
++  // trabajador de render 0x2D bajo la CPU de sonido 0x2C en el nucleo 2), en Horizon no vuelve a correr nunca.
++  // Tras un giro corto se duerme 10 us (cede el nucleo de verdad).
++  for (unsigned spins = 0; sh.lock.test_and_set(std::memory_order_acquire);)
++    if (++spins > 4096) svcSleepThread(10000);
+ }
+ inline void shared_unlock(Shared &sh) { sh.lock.clear(std::memory_order_release); }
+ 
+diff --color -ruN ../r35m4/nWiiRuntime_m5/src/platform/switch/switch_platform.cpp ref/c38src_c1/src/platform/switch/switch_platform.cpp
+--- ../r35m4/nWiiRuntime_m5/src/platform/switch/switch_platform.cpp	2026-11-14 21:42:03.272932233 -0500
++++ ref/c38src_c1/src/platform/switch/switch_platform.cpp	2026-11-15 11:59:26.411564506 -0500
+@@ -767,6 +767,13 @@
+   }
+ }
+ 
++// r38c: el vigilante de cuelgues (s2.cpp) vuelca su informe al registro normal y lo lleva a la SD ya.
++void c38_sink_flush() {
++  if (g_log_mode != LogMode::File) return;
++  std::fflush(stdout);
++  g_out_sink.flush();
++}
++
+ void shutdown() {
+   rumble(false);
+   std::fflush(stdout);
+diff --color -ruN ../r35m4/nWiiRuntime_m5/src/platform/switch/switch_platform.h ref/c38src_c1/src/platform/switch/switch_platform.h
+--- ../r35m4/nWiiRuntime_m5/src/platform/switch/switch_platform.h	2026-11-14 21:42:03.272660029 -0500
++++ ref/c38src_c1/src/platform/switch/switch_platform.h	2026-11-15 11:59:26.412564508 -0500
+@@ -41,6 +41,9 @@
+ // Once per host frame: periodic log flush and (with NWII_LOG) fps/memory stats.
+ void frame_tick();
+ 
++// r38c: flush stdout + log file to the SD (hang watchdog).
++void c38_sink_flush();
++
+ // At exit: stop rumble, flush and close logs.
+ void shutdown();
+ 

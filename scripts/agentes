@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Panel de los agentes de Claude que trabajan en el proyecto NSMBW.
+
+  ~/nsmbw-port/scripts/agentes            agentes de las últimas 24 h
+  ~/nsmbw-port/scripts/agentes --todos    todos los agentes de la sesión
+  ~/nsmbw-port/scripts/agentes -v         con más pasos recientes y su último comentario
+  watch -n 15 ~/nsmbw-port/scripts/agentes   en vivo
+
+Lee los registros de cada agente (~/.claude/projects/-home-djvemo/*/subagents/) y la
+descripción de cada tarea en ~/nsmbw-port/status/agentes_tareas.json.
+"""
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+PROJ = f"{HOME}/.claude/projects/-home-djvemo"
+TAREAS = f"{HOME}/nsmbw-port/status/agentes_tareas.json"
+ACTIVO_MIN = 4  # minutos sin escribir nada = ya no está "trabajando ahora"
+args = sys.argv[1:]
+TODOS, VERBOSO = "--todos" in args, "-v" in args
+
+
+def ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def dur(seg):
+    seg = int(seg)
+    h, m = divmod(seg // 60, 60)
+    return f"{h} h {m:02d} min" if h else f"{m} min"
+
+
+def accion(tool):
+    """Texto corto de un paso (una llamada a herramienta)."""
+    name, inp = tool.get("name", "?"), tool.get("input", {}) or {}
+    if name == "Bash":
+        d = inp.get("description") or inp.get("command", "")
+        return ("⏳ " if inp.get("run_in_background") else "") + "comando: " + d
+    if name in ("Read", "Edit", "Write"):
+        verbo = {"Read": "lee", "Edit": "edita", "Write": "escribe"}[name]
+        return f"{verbo} {inp.get('file_path', '').replace(HOME, '~')}"
+    if name in ("Grep", "Glob"):
+        return f"busca '{inp.get('pattern', '')}'"
+    if name == "Agent":
+        return "lanza sub-agente: " + inp.get("description", "")
+    return name
+
+
+def leer_agente(path):
+    meta_p = path[:-6] + ".meta.json"
+    meta = json.load(open(meta_p)) if os.path.exists(meta_p) else {}
+    t0 = t1 = None
+    pasos, ultimo_texto, ultimo_tool, ultimo_es_tool, subagentes = [], "", None, False, 0
+    entregado = fondo = False
+    for line in open(path, errors="replace"):
+        try:
+            j = json.loads(line)
+        except ValueError:
+            continue
+        if "timestamp" in j:
+            t = ts(j["timestamp"])
+            t0 = t if t0 is None else t0
+            t1 = t
+        m = j.get("message")
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        tiene_tool = False
+        for b in c:
+            if b.get("type") == "tool_use":
+                tiene_tool = True
+                ultimo_tool = b
+                # "delivered" only if the report is its LAST action (a resumed agent works again)
+                entregado = b.get("name") == "SubagentHandback"
+                if b.get("name") == "Bash" and (b.get("input") or {}).get("run_in_background"):
+                    fondo = True
+                pasos.append((j.get("timestamp"), accion(b)))
+                if b.get("name") == "Agent":
+                    subagentes += 1
+            elif b.get("type") == "text" and b.get("text", "").strip():
+                ultimo_texto = b["text"].strip()
+        ultimo_es_tool = tiene_tool
+        if tiene_tool and not any(b.get("type") == "tool_use" and b.get("name") == "Bash"
+                                  and (b.get("input") or {}).get("run_in_background") for b in c):
+            fondo = fondo and not tiene_tool
+    return dict(entregado=entregado, fondo=fondo, meta=meta, t0=t0, t1=t1 or os.path.getmtime(path), pasos=pasos,
+                texto=ultimo_texto, ultimo_es_tool=ultimo_es_tool, subagentes=subagentes,
+                path=path)
+
+
+def progreso(entregables):
+    if not entregables:
+        return None, []
+    hechos = []
+    for e in entregables:
+        hechos.append(bool(glob.glob(os.path.expanduser(e))))
+    return 100 * sum(hechos) // len(hechos), list(zip(entregables, hechos))
+
+
+def barra(p, n=20):
+    llenos = p * n // 100
+    return "█" * llenos + "░" * (n - llenos)
+
+
+def main():
+    tareas = json.load(open(TAREAS)) if os.path.exists(TAREAS) else {}
+    ahora = time.time()
+    archivos = glob.glob(f"{PROJ}/*/subagents/agent-*.jsonl") + glob.glob(f"{PROJ}-nsmbw-port/*/subagents/agent-*.jsonl")
+    agentes = [leer_agente(p) for p in archivos]
+    # agentes dentro de un workflow (rondas multi-agente): solo si están activos (o --todos)
+    for p in glob.glob(f"{PROJ}/*/subagents/workflows/*/agent-*.jsonl"):
+        if TODOS or ahora - os.path.getmtime(p) < 3 * 3600:
+            a = leer_agente(p)
+            a["meta"].setdefault("description", "workflow " + a["meta"].get("label", os.path.basename(p)))
+            agentes.append(a)
+    if not TODOS:
+        agentes = [a for a in agentes if ahora - a["t1"] < 24 * 3600]
+    agentes.sort(key=lambda a: a["t1"], reverse=True)
+
+    def estado(a):
+        quieto = ahora - a["t1"]
+        if a["entregado"]:
+            return "✅ TERMINÓ (entregó su informe)"
+        if quieto < ACTIVO_MIN * 60:
+            return "🟢 TRABAJANDO"
+        if quieto < 3 * 3600:
+            return "⏳ ESPERANDO su compilación/prueba (sigue vivo, " + dur(quieto) + " sin escribir)"
+        return "⛔ DETENIDO (sin actividad hace " + dur(quieto) + ")"
+
+    est = [estado(a) for a in agentes]
+    n_trab = sum(e.startswith("🟢") for e in est)
+    n_esp = sum(e.startswith("⏳") for e in est)
+    n_fin = sum(e.startswith("✅") for e in est)
+    print(f"══ AGENTES NSMBW ══  {datetime.now():%H:%M:%S}   "
+          f"total {len(agentes)} · trabajando {n_trab} · esperando {n_esp} · terminados {n_fin}")
+    try:
+        perfil = subprocess.run(["powerprofilesctl", "get"], capture_output=True, text=True).stdout.strip()
+        carga = open("/proc/loadavg").read().split()[0]
+        print(f"   perfil de energía: {perfil} · carga CPU: {carga} (18 hilos)")
+    except OSError:
+        pass
+
+    for a, e in zip(agentes, est):
+        desc = a["meta"].get("description", "(sin descripción)")
+        info = tareas.get(desc, {})
+        print("\n" + "─" * 78)
+        print(f"{e}   {info.get('titulo', desc)}")
+        if info:
+            print(f"  Para qué : {info['para_que']}")
+            print(f"  Busca    : {info['busca']}")
+            print(f"  Cómo     : {info['como']}")
+        tiempo = (a["t1"] - a["t0"]) if a["t0"] else 0
+        inicio = datetime.fromtimestamp(a["t0"]).strftime("%d/%m %H:%M") if a["t0"] else "?"
+        print(f"  Tiempo   : {dur(tiempo)} (desde {inicio}) · {len(a['pasos'])} pasos"
+              + (f" · {a['subagentes']} sub-agentes" if a["subagentes"] else ""))
+        p, det = progreso(info.get("entregables"))
+        if p is not None:
+            print(f"  Avance   : {barra(p)} {p} % de entregables")
+            for ent, ok in det:
+                print(f"             {'✔' if ok else '·'} {ent.replace('~/nsmbw-port/', '')}")
+        if a["pasos"]:
+            n = 6 if VERBOSO else 2
+            print("  Últimos pasos:")
+            for t, txt in a["pasos"][-n:]:
+                hora = datetime.fromtimestamp(ts(t)).strftime("%H:%M") if t else "  ?  "
+                print(f"     {hora}  {txt[:100]}")
+        if VERBOSO and a["texto"]:
+            print("  Último comentario: " + a["texto"][:400].replace("\n", " "))
+
+    # procesos pesados (lo mismo que estado.sh)
+    print("\n" + "─" * 78)
+    est_sh = f"{HOME}/nsmbw-port/scripts/estado.sh"
+    if os.path.exists(est_sh):
+        out = subprocess.run([est_sh], capture_output=True, text=True).stdout
+        # solo instancias, compilaciones y Dolphin (los binarios ya los muestra estado.sh solo)
+        keep, skip = [], False
+        for line in out.splitlines():
+            if line.startswith("== Ronda") or line.startswith("== Binarios"):
+                skip = True
+            elif line.startswith("=="):
+                skip = False
+            if not skip:
+                keep.append(line)
+        print("\n".join(keep).strip())
+    cit = subprocess.run(["pgrep", "-fc", "AppDir/AppRun"], capture_output=True, text=True).stdout.strip()
+    if cit and cit != "0":
+        print(f"\n== citron: {cit} prueba(s) en curso (PC en rendimiento)")
+
+
+if __name__ == "__main__":
+    main()

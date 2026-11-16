@@ -1,0 +1,471 @@
+diff --color -ruN nWiiRuntime_m6e/src/core/s2.cpp ../nWiiRuntime/src/core/s2.cpp
+--- nWiiRuntime_m6e/src/core/s2.cpp	2026-11-15 16:52:21.980222795 -0500
++++ ../nWiiRuntime/src/core/s2.cpp	2026-11-15 17:36:58.157667625 -0500
+@@ -114,6 +114,15 @@
+ } st;
+ inline void add(std::atomic<uint64_t> &c, uint64_t v = 1) { c.store(c.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); }
+ 
++// ---- r43a (frente A): coste del hilo de sonido. Contadores (linea [A43]) e interruptores (valor != "0"):
++//   NWII_A_NOSPIN=1   esperas cortas (< 50 us hasta el siguiente evento) DURMIENDO (svcSleepThread) en vez de
++//                     ceder en bucle (en Horizon ceder no suelta el nucleo a los de menos prioridad: el trabajador)
++//   NWII_A_REQSPIN=n  vueltas de giro de una peticion al juego antes de empezar a dormir (por defecto 1500)
++std::atomic<uint64_t> st_a_os{0};
++std::atomic<uint64_t> st_a_cvwait{0}, st_a_yield{0}, st_a_nap{0}, st_a_polls{0}, st_a_dsp_ns{0}, st_a_req_spin{0}, st_a_req_sleep{0};
++bool g_a_nospin = false;
++uint32_t g_a_reqspin = 1500;
++
+ void check_fail(const char *what, uint32_t a = 0, uint32_t b = 0) {
+   const uint64_t n = st.checks_bad.fetch_add(1, std::memory_order_relaxed);
+   if (n < 40) std::printf("[S2] ASSERT: %s (0x%08x, 0x%08x)%s\n", what, a, b, t_snd ? " [hilo de sonido]" : " [hilo del juego]");
+@@ -545,7 +554,13 @@
+   if (due <= now) return;
+   uint64_t us = (due - now) * 1000000 / ctx.tb_freq;
+   if (us > 2000) us = 2000;
+-  if (us < 50) { std::this_thread::yield(); return; }
++  if (us < 50) {
++    if (g_a_nospin) { add(st_a_nap); sleep_us((uint32_t)us); return; }  // r43a
++    add(st_a_yield);
++    std::this_thread::yield();
++    return;
++  }
++  add(st_a_cvwait);
+   std::unique_lock<std::mutex> lk(snd_mx);
+   if (hb_req.load(std::memory_order_relaxed) || snd_state.load(std::memory_order_relaxed) == kQuit) return;
+   snd_cv.wait_for(lk, std::chrono::microseconds(us - 30));
+@@ -614,7 +629,9 @@
+     deferred_wakes.clear();
+   }
+   add(n == 5 ? st.irq_aid : st.irq_dsp);
+-  add(st.irq_ns, now_ns() - t0);
++  const uint64_t dt_irq = now_ns() - t0;
++  add(st.irq_ns, dt_irq);
++  if (n != 5) add(st_a_dsp_ns, dt_irq);
+ }
+ 
+ // Espera de la CPU de sonido a nivel de hilo (equivale a "el hilo duerme y corren otros"): mientras
+@@ -657,13 +674,14 @@
+       g_park.store(1, std::memory_order_release);
+       if (g_req.load(std::memory_order_acquire) == 2) break;
+     }
+-    if ((spins & 63) == 0 || spins > 1500) g_main->poll_kick();
++    if ((spins & 63) == 0 || spins > g_a_reqspin) g_main->poll_kick();
+     cpu_relax();
+     // Espera corta girando (el hilo del juego atiende en su siguiente sondeo: microsegundos); si no llega
+     // es que esta parado en el anfitrion (carga de disco, GPU): se duerme cada vez mas para no quitarle
+     // el nucleo al trabajador de render (misma prioridad o menor, mismo nucleo).
+-    if (++spins > 1500) {
+-      const uint32_t k = spins - 1500;
++    if (++spins > g_a_reqspin) {
++      const uint32_t k = spins - g_a_reqspin;
++      add(st_a_req_sleep);
+       std::this_thread::sleep_for(std::chrono::microseconds(k < 20 ? 20 : k < 60 ? 100 : 500));
+     }
+     if (snd_state.load(std::memory_order_relaxed) == kQuit) break;
+@@ -671,6 +689,7 @@
+   g_req.store(0, std::memory_order_release);
+   g_snd_wait.store(0, std::memory_order_relaxed);
+   add(st.req_wait_ns, now_ns() - t0);
++  add(st_a_req_spin, spins);
+   if (!(msr0 & 0x8000)) { ctx.msr = msr0; snd_ee_sync(ctx); }
+   return rq.result;
+ }
+@@ -736,6 +755,7 @@
+ 
+ // Ganchos de entrada (E2) en el contexto de sonido. true = resuelto aqui (la funcion invitada no corre).
+ S2_NO_TSAN bool snd_os(CPUContext &ctx, uint32_t fn, uint32_t lr) {
++  add(st_a_os);
+   switch (fn) {
+     case F_OSLockMutex:
+       if (lr == kRegLockLr || lr == kUnregLockLr) axl_note(ctx.gpr[30], snd_cur_thread(), lr, 1, snd_holds, (uint8_t)in_irq);
+@@ -1228,6 +1248,7 @@
+   const bool in_axloop = s_irq_stress0 > 0 && in_irq && ctx.pc - 0x8027B91Cu <= 0x1Cu;
+   ctx.poll_left.store(in_axloop ? 1 : 64, std::memory_order_relaxed);
+   ctx.note_idle();
++  add(st_a_polls);
+   if (snd_state.load(std::memory_order_relaxed) == kQuit) longjmp(snd_exit_jb, 2);
+   // r38c NWII_C_STRESS_IRQ_US (solo pruebas): la CPU de sonido se entretiene dentro de sus interrupciones (agranda la
+   // ventana en que recorre la lista AX).
+@@ -1342,6 +1363,8 @@
+ 
+ void init(CPUContext *main_ctx) {
+   { const char *e = NWII_ENV("NWII_C_SPIN_OFF"); g_spin_old = e && *e; }
++  { const char *e = NWII_ENV("NWII_A_NOSPIN"); g_a_nospin = e && *e && *e != '0'; }  // r43a
++  { const char *e = NWII_ENV("NWII_A_REQSPIN"); if (e && *e) g_a_reqspin = (uint32_t)std::max(1L, std::atol(e)); }
+   { const char *e = NWII_ENV("NWII_C_AXLIST_OFF"); g_axl_fix = !(e && *e); }      // r38c
+   { const char *e = NWII_ENV("NWII_C_AXLIST_CHECK"); g_axl_check = e && *e && *e != '0'; }
+   { const char *e = NWII_ENV("NWII_C_AXLIST_MUTEX"); g_axl_mutex = g_axl_fix && e && *e && *e != '0'; }
+@@ -1455,6 +1478,19 @@
+                 g_axl_fix ? (g_axl_mutex ? " (regla del mutex)" : "") : " (SIN arreglo)", dq(7, st_axl_calls.load()) * k, (unsigned long long)st_axl_overlap.load(),
+                 (unsigned long long)st_axl_fallback.load(), axw_ns * k / 1e6, (unsigned long long)st_axl_bad.load(),
+                 dq(8, st_axl_hold_ns.load()) * k / 1e6, (unsigned long long)st_axl_hold_max_us.exchange(0));
++  // r43a: tercera linea [A43]
++  static uint64_t a[8] = {0};
++  auto da = [&](int i, uint64_t v) { const uint64_t r = v - a[i]; a[i] = v; return r; };
++  const uint64_t cvw = da(0, st_a_cvwait.load()), yl = da(1, st_a_yield.load()), np = da(2, st_a_nap.load());
++  const uint64_t pl = da(3, st_a_polls.load()), dns = da(4, st_a_dsp_ns.load()), rsp = da(5, st_a_req_spin.load());
++  const uint64_t rsl = da(6, st_a_req_sleep.load()), nreq = lk + d(18, st.req_unlock) + d(19, st.req_wake);
++  const uint64_t sacq = da(7, st.s_acq.load()), nos = dq(9, st_a_os.load());
++  const size_t used2 = std::strlen(buf);
++  std::snprintf(buf + used2, n - (int)used2,
++                "\n[A43] sonido: esperas cv %.0f/s, cesiones %.0f/s, siestas cortas %.0f/s | sondeos %.0f/s | irq DSP %.1f ms/s (AID %.1f) | "
++                "peticiones %.0f/s, giro %.0f vueltas/pet, siestas %.0f/s | S tomado %.0f/s, ganchos SO %.0f/s | nospin %d reqspin %u",
++                cvw * k, yl * k, np * k, pl * k, dns * k / 1e6, (irqns - dns) * k / 1e6, nreq * k,
++                nreq ? (double)rsp / nreq : 0.0, rsl * k, sacq * k, nos * k, (int)g_a_nospin, g_a_reqspin);
+ }
+ 
+ }  // namespace s2
+diff --color -ruN nWiiRuntime_m6e/src/hle/ax/ax_hle.cpp ../nWiiRuntime/src/hle/ax/ax_hle.cpp
+--- nWiiRuntime_m6e/src/hle/ax/ax_hle.cpp	2026-10-31 06:08:18.875515730 -0500
++++ ../nWiiRuntime/src/hle/ax/ax_hle.cpp	2026-11-15 17:49:37.882064569 -0500
+@@ -4,6 +4,7 @@
+ #include "runtime/nwii_env.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ 
+@@ -485,7 +486,277 @@
+   // Wii Remote speaker output (pb remote fields) is not emulated.
+ }
+ 
++// ---- r43a (frente A): mezclador rapido, NWII_A_MIX=1 ----------------------------------------
++// Mismo algoritmo bit a bit que process_voice (lo comprueba NWII_AX_VERIFY=1 contra ref::). En la Switch
++// (-O2, cortex-a57) Accelerator::read_sample y aram8 no se integraban: dos llamadas con marco por muestra,
++// g_m1/g_m2/g_read_log recargados en cada una y el registro de lecturas (vector) dentro de aram8 (664
++// bytes). Aqui todo va integrado, con MEM1/MEM2 en locales y el formato de muestra fijado por plantilla
++// (ADPCM, PCM16, PCM8; el resto, generico). Solo sin registro de lecturas (g_read_log: NWII_AX_HAZARD).
++// Voces paradas: solo se leen NEXT y RUNNING (antes, las 150 palabras; no se escribia nada igual).
++#define A43_INL inline __attribute__((always_inline))
++struct FastAcc {
++  const uint8_t *m1, *m2;
++  uint16_t *pb;
++  uint32_t start, end, cur;
++  uint16_t format, pred_scale;
++  int16_t yn1, yn2, gain;
++  bool stopped;
++
++  A43_INL uint8_t a8(uint32_t a) const {
++    if (a & 0x10000000) return m2[a & 0x03FFFFFF];
++    const uint32_t o = a & 0x01FFFFFF;
++    return o < kMem1Bytes ? m1[o] : 0;
++  }
++  template <int F3> A43_INL uint16_t cur_sample() const {
++    const int f3 = F3 >= 0 ? F3 : (int)(format & 3);
++    if (f3 == 0) {
++      const uint16_t v = a8(cur >> 1);
++      return (cur & 1) ? (v & 0xF) : (v >> 4);
++    }
++    if (f3 == 1) return a8(cur);
++    if (f3 == 2) return (uint16_t)((a8(cur * 2) << 8) | a8(cur * 2 + 1));
++    return 0;
++  }
++  A43_INL void on_end() {  // = Accelerator::on_end
++    if (pb[LOOPING]) {
++      pred_scale = pb[LOOP_PRED_SCALE] & 0x7F;
++      if (pb[IS_STREAM] != 1) {
++        yn1 = (int16_t)pb[LOOP_YN1];
++        yn2 = (int16_t)pb[LOOP_YN2];
++      }
++      stopped = false;  // set_yn2
++    } else {
++      pb[RUNNING] = 0;
++    }
++  }
++  // = Accelerator::read_sample
++  template <int F3, int DEC> A43_INL int16_t read(const int16_t *coefs) {
++    if (stopped) return 0;
++    const unsigned decode = DEC >= 0 ? (unsigned)DEC : (format >> 2) & 3;
++    int16_t raw = (int16_t)cur_sample<F3>();
++    const int ci = (pred_scale >> 4) & 7;
++    const int32_t c1 = coefs[ci * 2], c2 = coefs[ci * 2 + 1];
++    int16_t val;
++    uint32_t step;
++    if (decode == 0) {
++      raw &= 0xF;
++      const int32_t scale = 1 << (pred_scale & 0xF);
++      if (raw >= 8) raw -= 16;
++      const int32_t v = scale * raw + ((0x400 + c1 * yn1 + c2 * yn2) >> 11);
++      val = clamp16(v);
++      step = 2;
++      yn2 = yn1;
++      yn1 = val;
++      cur += 1;
++      if ((end & 0xF) == 0 && cur == end) {
++        cur = start + 1;
++      } else if ((end & 0xF) == 1 && cur == end - 1) {
++        cur = start;
++      } else if ((cur & 15) == 0) {
++        pred_scale = a8((cur & ~15u) >> 1);
++        cur += 2;
++        step += 2;
++      }
++    } else {
++      const unsigned gain_scale = (format >> 4) & 3;
++      const int shift = gain_scale == 0 ? 11 : gain_scale == 2 ? 16 : 0;
++      const int32_t v = ((int32_t)gain * raw >> shift) + ((c1 * yn1) >> shift) + ((c2 * yn2) >> shift);
++      val = (int16_t)v;
++      yn2 = yn1;
++      yn1 = val;
++      step = 2;
++      if (decode != 1) cur += 1;
++    }
++    if (cur == end + step - 1) {
++      cur = start;
++      stopped = true;
++      on_end();
++    }
++    cur &= 0xBFFFFFFF;
++    return val;
++  }
++  // NWII_A_MIX=2: `cnt` muestras DSP-ADPCM, exactamente como cnt llamadas a read<0, 0>(coefs). Dentro de una trama
++  // de 8 bytes (cur & 15 en [2, 15)) y lejos del final, solo hay que decodificar el nibble y avanzar: ese tramo va
++  // en un bucle corto (coeficientes y escala fijos, puntero de la trama fijo); el nibble que cierra la trama, el
++  // final de la muestra y lo raro van por read<0, 0>.
++  A43_INL void adpcm_batch(int16_t *out, uint32_t cnt, const int16_t *coefs) {
++    uint32_t k = 0;
++    while (k < cnt) {
++      if (stopped) {  // read devuelve 0 sin tocar nada mientras la voz esta parada
++        for (; k < cnt; ++k) out[k] = 0;
++        return;
++      }
++      const uint32_t in_fr = cur & 15;
++      uint32_t m = 0;
++      const uint8_t *hb = nullptr;
++      const uint32_t ba = cur >> 1;
++      if (in_fr >= 2 && in_fr < 15) {
++        m = 15 - in_fr;
++        if (end >= cur && end - cur < m) m = end - cur;
++        if (m > cnt - k) m = cnt - k;
++        if (ba & 0x10000000) hb = m2 + (ba & 0x03FFFFFF);
++        else if ((ba & 0x01FFFFFF) < kMem1Bytes) hb = m1 + (ba & 0x01FFFFFF);
++        else m = 0;
++      }
++      if (m) {
++        const int ci = (pred_scale >> 4) & 7;
++        const int32_t c1 = coefs[ci * 2], c2 = coefs[ci * 2 + 1];
++        const int32_t scale = 1 << (pred_scale & 0xF);
++        int32_t y1 = yn1, y2 = yn2;
++        uint32_t c = cur;
++        for (uint32_t j = 0; j < m; ++j, ++c) {
++          const uint8_t b = hb[(c >> 1) - ba];
++          int32_t raw = (c & 1) ? (b & 0xF) : (b >> 4);
++          if (raw >= 8) raw -= 16;
++          const int16_t val = clamp16(scale * raw + ((0x400 + c1 * y1 + c2 * y2) >> 11));
++          y2 = y1;
++          y1 = val;
++          out[k + j] = val;
++        }
++        yn1 = (int16_t)y1;
++        yn2 = (int16_t)y2;
++        cur = c;
++        k += m;
++        continue;
++      }
++      out[k++] = read<0, 0>(coefs);
++    }
++  }
++};
++
++int a43_mix_mode() {
++  static const int m = [] {
++    const char *e = std::getenv("NWII_A_MIX");
++    return (e && *e && *e != '0') ? (*e == '2' ? 2 : 1) : 0;
++  }();
++  return m;
++}
++
++template <int F3, int DEC>
++void process_voice_fast(uint16_t *pb) {
++  FastAcc acc;
++  acc.m1 = g_m1;
++  acc.m2 = g_m2;
++  acc.pb = pb;
++  acc.start = hilo(pb, LOOP_HI) & 0x3FFFFFFF;
++  acc.end = hilo(pb, END_HI) & 0x3FFFFFFF;
++  acc.cur = hilo(pb, CUR_HI) & 0xBFFFFFFF;
++  acc.format = pb[SAMPLE_FORMAT];
++  acc.yn1 = (int16_t)pb[ADPCM_YN1];
++  acc.yn2 = (int16_t)pb[ADPCM_YN2];
++  acc.stopped = false;
++  acc.gain = (int16_t)pb[ADPCM_GAIN];
++  acc.pred_scale = pb[ADPCM_PRED_SCALE] & 0x7F;
++  int16_t coefs[16];
++  for (int i = 0; i < 16; ++i) coefs[i] = (int16_t)pb[ADPCM_COEFS + i];
++  alignas(16) int16_t s[kFrame];
++  uint32_t pos;
++  // NWII_A_MIX=2 (ADPCM): primero las muestras de entrada que pedira el remuestreo (cuantas: solo depende de la
++  // fraccion, la razon y el tipo), en lote; luego el remuestreo de siempre leyendolas del bufer.
++  constexpr uint32_t kMaxBatch = 2048;
++  uint32_t total = kMaxBatch + 1;
++  if constexpr (F3 == 0 && DEC == 0) {
++    if (a43_mix_mode() == 2) {
++      const uint32_t ratio = hilo(pb, SRC_RATIO_HI);
++      if (pb[SRC_TYPE] == SRC_NEAREST) {
++        total = kFrame;
++      } else if (ratio < 0x01000000u) {
++        uint32_t p = pb[SRC_FRAC];
++        total = 0;
++        for (int i = 0; i < kFrame; ++i) {
++          p += ratio;
++          total += p >> 16;
++          p &= 0xFFFF;
++        }
++      }
++    }
++  }
++  if (total <= kMaxBatch) {
++    alignas(16) int16_t in[kMaxBatch];
++    acc.adpcm_batch(in, total, coefs);
++    uint32_t k = 0;
++    pos = resample([&]() __attribute__((always_inline)) { return in[k++]; }, s, kFrame, &pb[SRC_LAST], pb[SRC_FRAC],
++                   hilo(pb, SRC_RATIO_HI), pb[SRC_TYPE]);
++  } else {
++    pos = resample([&]() __attribute__((always_inline)) { return acc.read<F3, DEC>(coefs); }, s, kFrame,
++                   &pb[SRC_LAST], pb[SRC_FRAC], hilo(pb, SRC_RATIO_HI), pb[SRC_TYPE]);
++  }
++  pb[SRC_FRAC] = (uint16_t)pos;
++  pb[CUR_HI] = (uint16_t)(acc.cur >> 16);
++  pb[CUR_LO] = (uint16_t)acc.cur;
++  pb[ADPCM_YN1] = (uint16_t)acc.yn1;
++  pb[ADPCM_YN2] = (uint16_t)acc.yn2;
++  pb[ADPCM_PRED_SCALE] = acc.pred_scale;
++  envelope(s, pb);
++  if (pb[LPF_ON]) low_pass(s, pb);
++  if (pb[BQ_ON]) biquad(s, pb);
++  const uint32_t mc = hilo(pb, MIX_CTRL_HI);
++  struct Route {
++    int32_t *bus;
++    int vol, dpop;
++    uint32_t on, ramp;
++  };
++  static const Route routes[] = {
++      {g_bus.main_l, MIX_MAIN_L, DPOP_MAIN_L, 0x00000001 | 0x00000004, 0x00000004},
++      {g_bus.main_r, MIX_MAIN_R, DPOP_MAIN_R, 0x00000002 | 0x00000004, 0x00000004},
++      {g_bus.main_s, MIX_MAIN_S, DPOP_MAIN_S, 0x00000008 | 0x00000010, 0x00000010},
++      {g_bus.auxa_l, MIX_AUXA_L, DPOP_AUXA_L, 0x00010000 | 0x00040000, 0x00040000},
++      {g_bus.auxa_r, MIX_AUXA_R, DPOP_AUXA_R, 0x00020000 | 0x00040000, 0x00040000},
++      {g_bus.auxa_s, MIX_AUXA_S, DPOP_AUXA_S, 0x00080000 | 0x00100000, 0x00100000},
++      {g_bus.auxb_l, MIX_AUXB_L, DPOP_AUXB_L, 0x00200000 | 0x00800000, 0x00800000},
++      {g_bus.auxb_r, MIX_AUXB_R, DPOP_AUXB_R, 0x00400000 | 0x00800000, 0x00800000},
++      {g_bus.auxb_s, MIX_AUXB_S, DPOP_AUXB_S, 0x01000000 | 0x02000000, 0x02000000},
++      {g_bus.auxc_l, MIX_AUXC_L, DPOP_AUXC_L, 0x04000000 | 0x10000000, 0x10000000},
++      {g_bus.auxc_r, MIX_AUXC_R, DPOP_AUXC_R, 0x08000000 | 0x10000000, 0x10000000},
++      {g_bus.auxc_s, MIX_AUXC_S, DPOP_AUXC_S, 0x20000000 | 0x40000000, 0x40000000},
++  };
++  for (const Route &r : routes)
++    if (mc & r.on) mix_add(r.bus, s, pb, r.vol, r.dpop, (mc & r.ramp) != 0);
++}
++
++void process_voice_a43(uint16_t *pb) {
++  switch (pb[SAMPLE_FORMAT] & 0xF) {  // (format & 3) | decode << 2
++    case 0x0: process_voice_fast<0, 0>(pb); break;   // DSP-ADPCM
++    case 0xA: process_voice_fast<2, 2>(pb); break;   // PCM16
++    case 0x9: process_voice_fast<1, 2>(pb); break;   // PCM8
++    default: process_voice_fast<-1, -1>(pb); break;
++  }
++}
++
++bool a43_mix_on() { return a43_mix_mode() != 0; }
++
+ void process_pb_list(uint32_t pb_addr) {
++  if (a43_mix_on() && g_read_log == nullptr) {
++    uint16_t pb[PB_WORDS], orig[PB_WORDS];
++    for (int n = 0; pb_addr && n < kMaxVoices; ++n) {
++      uint8_t *p = span(pb_addr, PB_WORDS * 2);
++      if (!p) {  // no contiguo: camino de siempre para este bloque
++        for (int i = 0; i < PB_WORDS; ++i) pb[i] = rd16(pb_addr + i * 2);
++        if (pb[RUNNING] == 1) {
++          std::memcpy(orig, pb, sizeof pb);
++          process_voice_a43(pb);
++          for (int i = 0; i < PB_WORDS; ++i)
++            if (pb[i] != orig[i]) wr16(pb_addr + i * 2, pb[i]);
++        }
++        pb_addr = hilo(pb, NEXT_HI);
++        continue;
++      }
++      if (be16(p + RUNNING * 2) != 1) {
++        pb_addr = ((uint32_t)be16(p) << 16) | be16(p + 2);
++        continue;
++      }
++      for (int i = 0; i < PB_WORDS; ++i) pb[i] = be16(p + i * 2);
++      std::memcpy(orig, pb, sizeof pb);
++      process_voice_a43(pb);
++      for (int i = 0; i < PB_WORDS; ++i) {
++        if (pb[i] == orig[i]) continue;
++        put16(p + i * 2, pb[i]);
++        log_w(p + i * 2, 2);
++      }
++      pb_addr = hilo(pb, NEXT_HI);
++    }
++    return;
++  }
+   uint16_t pb[PB_WORDS], orig[PB_WORDS];
+   for (int n = 0; pb_addr && n < kMaxVoices; ++n) {
+     uint8_t *p = span(pb_addr, PB_WORDS * 2);
+diff --color -ruN nWiiRuntime_m6e/src/platform/switch/switch_profiler.cpp ../nWiiRuntime/src/platform/switch/switch_profiler.cpp
+--- nWiiRuntime_m6e/src/platform/switch/switch_profiler.cpp	2026-11-12 03:34:53.930771566 -0500
++++ ../nWiiRuntime/src/platform/switch/switch_profiler.cpp	2026-11-15 17:36:58.155750516 -0500
+@@ -20,6 +20,7 @@
+ 
+ #include "runtime/cpu_context.h"
+ #include "../../core/tprof.h"  // r31t
++#include "../../core/s2.h"     // r43a: CPU de sonido
+ 
+ #include <switch.h>
+ #include <sys/stat.h>
+@@ -290,12 +291,16 @@
+   t.hist.add(ctx.pc.x, ctx.lr);
+   if (t.slot == kThreadCpu)
+     if (CPUContext *c = g_ctx_ptr) t.guest.add(*(volatile uint32_t *)&c->pc);
++  if (t.slot == kThreadS2)  // r43a
++    if (CPUContext *c = s2::snd_ctx()) t.guest.add(*(volatile uint32_t *)&c->pc);
+   return true;
+ }
+ 
+ void sampler(void *) {
+   // R11: the render worker too (logs/profile_gxw.txt; no samples while it is off).
+-  static Target targets[] = {{"main", kThreadMain}, {"cpu", kThreadCpu}, {"gxw", kThreadGxw}};
++  // r43a: NWII_A_PROF_SND=1 muestrea tambien la CPU de sonido (S2) -> logs/profile_snd.txt (con pc invitado).
++  static Target targets[] = {{"main", kThreadMain}, {"cpu", kThreadCpu}, {"gxw", kThreadGxw}, {"snd", kThreadS2}};
++  static const int ntargets = [] { const char *e = std::getenv("NWII_A_PROF_SND"); return (e && *e && *e != '0') ? 4 : 3; }();
+   const u64 start = armGetSystemTick();
+   u64 last_write = start;
+   uint64_t win_paused[3] = {};
+@@ -335,13 +340,14 @@
+                   now_s, g_sampled_s);
+       if (!active) {  // the files right away: the game may be closed during the next one
+         mkdir((std::string(root_dir()) + "/logs").c_str(), 0777);
+-        for (Target &t : targets) write_target(t, now_s);
++        for (int k = 0; k < ntargets; ++k) write_target(targets[k], now_s);
+       }
+     }
+     if (active) g_sampled_s += armTicksToNs(tnow - last_tick) / 1e9;
+     last_tick = tnow;
+     if (!active) continue;
+-    for (Target &t : targets) {
++    for (int k = 0; k < ntargets; ++k) {
++      Target &t = targets[k];
+       if (sample(t)) continue;
+       std::printf("[PROFILE] %s: svcSetThreadActivity/svcGetThreadContext3 failed (rc 0x%x): "
+                   "sampling is not supported here, profiler off\n", t.name, t.last_rc);
+@@ -353,7 +359,7 @@
+       last_write = now;
+       const double elapsed = armTicksToNs(now - start) / 1e9;
+       mkdir((std::string(root_dir()) + "/logs").c_str(), 0777);
+-      for (Target &t : targets) write_target(t, elapsed);
++      for (int k = 0; k < ntargets; ++k) write_target(targets[k], elapsed);
+       if (g_tprof) tprof::flush();
+       const double tick_us = 1e6 / 19200000.0;
+       std::printf("[PROFILE] %.0f s: main %llu samples (%.2f %% paused), cpu %llu (%.2f %%) -> "
+@@ -415,6 +421,10 @@
+   svcGetInfo(&allowed, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
+   g_core = (allowed & 8) ? 3 : (allowed & 4) ? 2 : -2;
+   g_prio = 0x2C;
++  {  // r43a: para muestrear la CPU de sonido (0x2C, nucleo 2) el muestreador tiene que estar por encima de ella
++    const char *e = std::getenv("NWII_A_PROF_SND");
++    if (e && *e && *e != '0') g_prio = 0x2B;
++  }
+   Result rc = threadCreate(&g_thread, sampler, nullptr, nullptr, 64 * 1024, g_prio, g_core);
+   if (R_SUCCEEDED(rc)) rc = threadStart(&g_thread);
+   std::printf("[PROFILE] sampler %s: every %u us on core %d (allowed mask 0x%llx), image base "

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Run a heavy command (build, game, Dolphin, gdb) inside the memory-capped nsmbw.slice
+# (MemoryHigh=5.75G, MemoryMax=6.5G, swap 4G) so an out-of-memory situation kills only that command,
+# never VS Code / Claude.   Usage: ~/nsmbw-port/scripts/lim <command> [args...]
+# Compilaciones y pruebas de citron (build*.sh, citron*.sh, ninja, make, cmake): como mucho LIM_BUILDS (2; el 2.º solo con ≥7 GB libres) a la vez; las demás esperan
+# turno. Así varios agentes compilando en paralelo no agotan la RAM (30-oct: systemd-oomd mató 2).
+cmd="$*"
+if [[ -z "${LIM_SLOT_HELD:-}" && "$cmd" =~ (^|[/ ])(build[A-Za-z0-9_]*\.sh|citron[A-Za-z0-9_]*\.sh|citron|ninja|make|cmake)( |$) ]]; then
+  dir=/tmp/nsmbw-lim; mkdir -p "$dir"
+  slots=${LIM_BUILDS:-1}   # 9-nov: 1 (two builds + VS Code with long sessions filled RAM and swap twice)
+  while :; do
+    for ((i = 0; i < slots; i++)); do
+      # el 2.º turno (y siguientes) solo con RAM de sobra: dos compilaciones grandes juntas agotaban la RAM
+      (( i > 0 )) && (( $(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo) < ${LIM_MIN_FREE_MB:-7000} )) && continue
+      exec 9>"$dir/build$i.lock"
+      flock -n 9 && break 2
+      exec 9>&-
+    done
+    sleep 5
+  done
+  export LIM_SLOT_HELD=1   # los hijos (p. ej. citron_test.sh) no piden otro turno
+fi
+exec systemd-run --user --quiet --collect --scope --slice=nsmbw.slice \
+  --working-directory="$PWD" -- "$@"

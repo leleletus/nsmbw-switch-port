@@ -1,0 +1,1149 @@
+diff --color -ru r13/nWiiRuntime/src/hle/ax/ax_async.cpp r16w/nWiiRuntime/src/hle/ax/ax_async.cpp
+--- r13/nWiiRuntime/src/hle/ax/ax_async.cpp	2026-10-31 06:08:18.875365522 -0500
++++ r16w/nWiiRuntime/src/hle/ax/ax_async.cpp	2026-11-08 19:32:12.519138228 -0500
+@@ -204,8 +204,16 @@
+         core = c;
+         break;
+       }
+-    std::printf("[NX] AX thread on core %d (allowed mask 0x%llx)\n", core,
+-                (unsigned long long)allowed);
++    // R14 R5: libnx starts pthreads at priority 0x3B (the lowest), below the
++    // render worker (0x2D) that shares core 2: every list the worker
++    // preempted made the CPU thread wait in finish() (console, castle
++    // cutscene: ~70 ms of waits per second, mixes up to 42 ms). One step above
++    // the worker, as the worker's own comment assumed. NWII_AX_PRIO overrides.
++    const char *pe = std::getenv("NWII_AX_PRIO");
++    const int prio = pe ? (int)std::strtol(pe, nullptr, 0) : 0x2C;
++    const Result prc = svcSetThreadPriority(CUR_THREAD_HANDLE, prio);
++    std::printf("[NX] AX thread on core %d, priority 0x%X%s (allowed mask 0x%llx)\n", core, prio,
++                R_SUCCEEDED(prc) ? "" : " (failed)", (unsigned long long)allowed);
+     nx::note_thread(nx::kThreadAx);
+ #endif
+     uint64_t seen = 0;
+diff --color -ru r13/nWiiRuntime/src/hle/gx.cpp r16w/nWiiRuntime/src/hle/gx.cpp
+--- r13/nWiiRuntime/src/hle/gx.cpp	2026-11-08 13:20:49.853890579 -0500
++++ r16w/nWiiRuntime/src/hle/gx.cpp	2026-11-08 22:14:00.220235997 -0500
+@@ -201,6 +201,8 @@
+     return !(e && e[0] == '0');
+ }();
+ struct IdxRecMain { uint32_t frame, arr, addr, num; float v[16]; };
++// The parser's copy of the record of the list it is expanding (parser thread;
++// the byte vectors keep their capacity from call to call).
+ struct IdxRecDL {
+     uint32_t frame;
+     uint64_t key;
+@@ -209,13 +211,65 @@
+     std::vector<uint8_t> bytes[4];
+ };
+ struct IdxRange { uint32_t lo = ~0u, hi = 0; };
+-static std::mutex s_idx_mtx;
+ static std::atomic<uint64_t> s_idx_bytes{0};  // bytes the guest thread copied for lists
+-static std::deque<IdxRecMain> s_idx_main;
+-static std::deque<IdxRecDL> s_idx_dl;
+-static std::unordered_map<uint64_t, std::array<IdxRange, 4>> s_idx_need;  // per list
+ static constexpr uint32_t kIdxMaxSpan = 64u << 10;
+ static constexpr size_t kIdxMaxQueue = 16384, kIdxSearch = 64;
++
++// ---- R16w: the records go from the guest thread to the parser without a lock
++// r13 kept them in two std::deque and a std::unordered_map under one
++// std::mutex, taken twice per GXCallDisplayList by the guest (~22 000 calls/s
++// in the title demo) and twice per list by the parser on the render worker.
++// The worker runs on core 2 at a lower priority than the AX mixer, which
++// preempts it, sometimes with the lock held; the guest then blocked in the
++// kernel (svcArbitrateLock: 4 % of the CPU thread's samples on the console)
++// and every record cost heap allocations (one vector per array) freed on the
++// other thread. Now:
++//   - main-stream and list records go through single-producer /
++//     single-consumer rings (the guest pushes at the tail, the parser takes
++//     from the head, both with acquire/release indices);
++//   - the array bytes of a list record live in a byte ring, contiguous per
++//     record; the parser copies them into its IdxRecDL when it takes the
++//     record and gives the space back with the head;
++//   - the ranges each list read the last time (s_idx_need) belong to the
++//     parser, which sends the guest every change through a third ring; the
++//     guest applies them to its own copy before each lookup, so it sees every
++//     change made before its call, as it did under the lock.
++// What the parser takes is unchanged: the same records in the same order, the
++// same search window (kIdxSearch) and the same pruning by frame. Differences,
++// only past the caps: a full ring drops the new record (r13 dropped the
++// oldest) and a full byte ring sends the record without bytes; either way the
++// parser reads live RAM for it, as for any record it lacks.
++template <class T> struct IdxRing {
++    T *v = nullptr;
++    uint32_t mask = 0;
++    alignas(64) std::atomic<uint64_t> tail{0};  // producer
++    alignas(64) std::atomic<uint64_t> head{0};  // consumer
++    explicit IdxRing(uint32_t cap) : v(new T[cap]), mask(cap - 1) {}
++};
++struct IdxRecDLR {  // a list record in the ring; its bytes: [bpos, bpos + sum(len))
++    uint32_t frame;
++    uint64_t key;
++    uint32_t base[4], lo[4], len[4];
++    uint32_t boff[4];     // where each array's bytes start, from bpos
++    uint64_t bpos, bend;  // byte ring positions (bend: the ring position after it)
++};
++struct IdxNeedMsg { uint64_t key; std::array<IdxRange, 4> r; bool clear; };
++static constexpr uint32_t kIdxBytesCap = 1u << 20;  // byte ring (~60 frames of the title demo)
++struct IdxRings {
++    IdxRing<IdxRecMain> main{(uint32_t)kIdxMaxQueue};
++    IdxRing<IdxRecDLR> dl{(uint32_t)kIdxMaxQueue};
++    IdxRing<IdxNeedMsg> need{4096};
++    uint8_t *bytes = new uint8_t[kIdxBytesCap];
++    uint64_t bw = 0;                          // guest: next byte position
++    alignas(64) std::atomic<uint64_t> br{0};  // parser: bytes before this are free
++};
++static IdxRings *const s_idx_rings = s_idx_on ? new IdxRings : nullptr;
++// Guest thread: its copy of the parser's ranges per list.
++static std::unordered_map<uint64_t, std::array<IdxRange, 4>> s_idx_need_g;
++// Parser thread: the ranges per list (sent to the guest when they change).
++static std::unordered_map<uint64_t, std::array<IdxRange, 4>> s_idx_need;
++static uint64_t s_idx_drops = 0;  // guest: records dropped at a full ring
++
+ // Guest thread: the CP array state seen in the pipe.
+ static uint32_t s_sn_base[4], s_sn_stride[4];
+ static uint32_t s_sn_frame = 0;  // XFB copies written (stamps the records)
+@@ -248,16 +302,19 @@
+ 
+ static void idx_loadindx(uint8_t op, uint32_t v) {
+     if (!g_mmu) return;
+-    IdxRecMain r;
++    const uint32_t arr = (op - 0x20) / 8, num = ((v >> 12) & 0xF) + 1;
++    const uint32_t addr = s_sn_base[arr] + (v >> 16) * s_sn_stride[arr];
++    if (!s_sn_base[arr] || !idx_in_ram(addr, num * 4)) return;
++    IdxRing<IdxRecMain> &q = s_idx_rings->main;
++    const uint64_t t = q.tail.load(std::memory_order_relaxed);
++    if (t - q.head.load(std::memory_order_acquire) > q.mask) { ++s_idx_drops; return; }
++    IdxRecMain &r = q.v[t & q.mask];
+     r.frame = s_sn_frame;
+-    r.arr = (op - 0x20) / 8;
+-    r.num = ((v >> 12) & 0xF) + 1;
+-    r.addr = s_sn_base[r.arr] + (v >> 16) * s_sn_stride[r.arr];
+-    if (!s_sn_base[r.arr] || !idx_in_ram(r.addr, r.num * 4)) return;
+-    for (uint32_t i = 0; i < r.num; ++i) r.v[i] = g_mmu->read_f32(r.addr + i * 4);
+-    std::lock_guard<std::mutex> lk(s_idx_mtx);
+-    if (s_idx_main.size() >= kIdxMaxQueue) s_idx_main.pop_front();
+-    s_idx_main.push_back(r);
++    r.arr = arr;
++    r.num = num;
++    r.addr = addr;
++    for (uint32_t i = 0; i < num; ++i) r.v[i] = g_mmu->read_f32(addr + i * 4);
++    q.tail.store(t + 1, std::memory_order_release);
+ }
+ static inline void idx_sniff8(uint8_t b) {
+     if (!s_idx_on) return;
+@@ -292,38 +349,73 @@
+ 
+ // GXCallDisplayList, guest thread: copy the parts of the arrays this list
+ // read the previous times it was parsed (unknown the first time: live RAM).
++static void idx_need_drain() {  // guest: apply the parser's range changes
++    IdxRing<IdxNeedMsg> &q = s_idx_rings->need;
++    uint64_t h = q.head.load(std::memory_order_relaxed);
++    const uint64_t t = q.tail.load(std::memory_order_acquire);
++    if (h == t) return;
++    for (; h != t; ++h) {
++        const IdxNeedMsg &m = q.v[h & q.mask];
++        if (m.clear) s_idx_need_g.clear();
++        else s_idx_need_g[m.key] = m.r;
++    }
++    q.head.store(h, std::memory_order_release);
++}
+ static void idx_dl_call(uint32_t addr, uint32_t size) {
+     if (!s_idx_on || hw::g_wgp_redirect_on) return;
+-    IdxRecDL r;
++    IdxRings &R = *s_idx_rings;
++    IdxRing<IdxRecDLR> &q = R.dl;
++    const uint64_t t = q.tail.load(std::memory_order_relaxed);
++    if (t - q.head.load(std::memory_order_acquire) > q.mask) { ++s_idx_drops; return; }
++    idx_need_drain();
++    IdxRecDLR &r = q.v[t & q.mask];
+     r.frame = s_sn_frame;
+     r.key = ((uint64_t)(addr & 0x1FFFFFFF) << 24) ^ size;
+     std::array<IdxRange, 4> need{};
+     {
+-        std::lock_guard<std::mutex> lk(s_idx_mtx);
+-        auto it = s_idx_need.find(r.key);
+-        if (it != s_idx_need.end()) need = it->second;
++        auto it = s_idx_need_g.find(r.key);
++        if (it != s_idx_need_g.end()) need = it->second;
+     }
++    uint32_t total = 0;
+     for (int a = 0; a < 4; ++a) {
+         r.base[a] = s_sn_base[a];
+         r.lo[a] = 0;
++        r.len[a] = 0;
++        r.boff[a] = total;
+         if (!r.base[a] || need[a].hi <= need[a].lo) continue;
+         r.lo[a] = need[a].lo;
+-        r.bytes[a].resize(need[a].hi - need[a].lo);
+-        s_idx_bytes.fetch_add(need[a].hi - need[a].lo, std::memory_order_relaxed);
+-        if (!idx_copy(r.base[a] + r.lo[a], need[a].hi - need[a].lo, r.bytes[a].data()))
+-            r.bytes[a].clear();
+-    }
+-    std::lock_guard<std::mutex> lk(s_idx_mtx);
+-    if (s_idx_dl.size() >= kIdxMaxQueue) s_idx_dl.pop_front();
+-    s_idx_dl.push_back(std::move(r));
++        r.len[a] = need[a].hi - need[a].lo;
++        total += r.len[a];
++    }
++    if (total) s_idx_bytes.fetch_add(total, std::memory_order_relaxed);
++    // Room for the bytes, contiguous (skip the end of the ring if needed).
++    uint64_t pos = R.bw;
++    const uint32_t off = (uint32_t)(pos & (kIdxBytesCap - 1));
++    if (off + total > kIdxBytesCap) pos += kIdxBytesCap - off;
++    if (total > kIdxBytesCap || pos + total - R.br.load(std::memory_order_acquire) > kIdxBytesCap) {
++        for (int a = 0; a < 4; ++a) r.len[a] = 0;  // no room: the parser reads live RAM
++        pos = R.bw;
++        total = 0;
++    }
++    r.bpos = pos;
++    uint8_t *const dst = R.bytes + (pos & (kIdxBytesCap - 1));
++    for (int a = 0; a < 4; ++a)
++        if (r.len[a] && !idx_copy(r.base[a] + r.lo[a], r.len[a], dst + r.boff[a]))
++            r.len[a] = 0;  // as r13: no bytes (the space stays taken)
++    R.bw = pos + total;
++    r.bend = R.bw;
++    q.tail.store(t + 1, std::memory_order_release);
+ }
+ 
+ // ---- parser side (host thread) ----
+ // Records the parser never matched (data that looked like a command, or a
+ // command it parsed differently) are dropped once they are 16 frames older
+ // than the newest one: the host is never that far behind (FIFO_MAX_FRAMES).
+-template <class Q> static void idx_prune(Q &q) {
+-    while (!q.empty() && q.front().frame + 16 < q.back().frame) q.pop_front();
++template <class T> static uint64_t idx_prune(IdxRing<T> &q, uint64_t h, uint64_t t) {
++    if (h == t) return h;
++    const uint32_t newest = q.v[(t - 1) & q.mask].frame;
++    while (h != t && q.v[h & q.mask].frame + 16 < newest) ++h;
++    return h;
+ }
+ // NWII_IDXSNAP_LOG=1: [IDXSNAP] counters (copies used / live reads).
+ static uint64_t s_idx_n[6];  // main used, main live, dl calls with/without record, dl used, dl live
+@@ -332,27 +424,31 @@
+     static uint64_t next = 2000;
+     if (!on || s_idx_n[2] + s_idx_n[3] < next) return;
+     next += 20000;
+-    std::printf("[IDXSNAP] main used=%llu live=%llu | lists with=%llu without=%llu | in lists used=%llu live=%llu | copied %llu KB\n",
++    std::printf("[IDXSNAP] main used=%llu live=%llu | lists with=%llu without=%llu | in lists used=%llu live=%llu | copied %llu KB | dropped %llu\n",
+                 (unsigned long long)s_idx_n[0], (unsigned long long)s_idx_n[1],
+                 (unsigned long long)s_idx_n[2], (unsigned long long)s_idx_n[3],
+                 (unsigned long long)s_idx_n[4], (unsigned long long)s_idx_n[5],
+-                (unsigned long long)(s_idx_bytes.load(std::memory_order_relaxed) >> 10));
++                (unsigned long long)(s_idx_bytes.load(std::memory_order_relaxed) >> 10),
++                (unsigned long long)s_idx_drops);
+ }
+ // Main-stream LOAD_INDX: the copy made when it was written, if it is this one.
+ bool GX_IdxTakeMain(int arr, uint32_t addr, int num, float *out) {
+     if (!s_idx_on) return false;
+-    std::lock_guard<std::mutex> lk(s_idx_mtx);
+-    idx_prune(s_idx_main);
+-    const size_t n = std::min(s_idx_main.size(), kIdxSearch);
+-    for (size_t i = 0; i < n; ++i) {
+-        const IdxRecMain &r = s_idx_main[i];
++    IdxRing<IdxRecMain> &q = s_idx_rings->main;
++    const uint64_t t = q.tail.load(std::memory_order_acquire);
++    const uint64_t h0 = q.head.load(std::memory_order_relaxed);
++    const uint64_t h = idx_prune(q, h0, t);
++    const uint64_t n = std::min<uint64_t>(t - h, kIdxSearch);
++    for (uint64_t i = 0; i < n; ++i) {
++        const IdxRecMain &r = q.v[(h + i) & q.mask];
+         if (r.arr == (uint32_t)arr && r.addr == addr && r.num == (uint32_t)num) {
+             std::memcpy(out, r.v, num * sizeof(float));
+-            s_idx_main.erase(s_idx_main.begin(), s_idx_main.begin() + i + 1);
++            q.head.store(h + i + 1, std::memory_order_release);
+             ++s_idx_n[0];
+             return true;
+         }
+     }
++    if (h != h0) q.head.store(h, std::memory_order_release);
+     ++s_idx_n[1];
+     return false;
+ }
+@@ -360,24 +456,42 @@
+ static bool s_idx_ctx = false;
+ static IdxRecDL s_idx_cur;
+ static std::array<IdxRange, 4> s_idx_seen;
++// The list ring's head moves to `h`: the bytes of the records before it are free.
++static void idx_dl_release(uint64_t h) {
++    IdxRings &R = *s_idx_rings;
++    R.br.store(R.dl.v[(h - 1) & R.dl.mask].bend, std::memory_order_release);
++    R.dl.head.store(h, std::memory_order_release);
++}
+ // CALL_DL in the main stream: take that call's record for the list's LOAD_INDX.
+ void GX_IdxBeginDL(uint32_t addr, uint32_t size) {
+     s_idx_ctx = false;
+     if (!s_idx_on) return;
+     const uint64_t key = ((uint64_t)(addr & 0x1FFFFFFF) << 24) ^ size;
+-    std::lock_guard<std::mutex> lk(s_idx_mtx);
+-    idx_prune(s_idx_dl);
+-    const size_t n = std::min(s_idx_dl.size(), kIdxSearch);
+-    for (size_t i = 0; i < n; ++i) {
+-        if (s_idx_dl[i].key != key) continue;
+-        s_idx_cur = std::move(s_idx_dl[i]);
+-        s_idx_dl.erase(s_idx_dl.begin(), s_idx_dl.begin() + i + 1);
++    IdxRings &R = *s_idx_rings;
++    IdxRing<IdxRecDLR> &q = R.dl;
++    const uint64_t t = q.tail.load(std::memory_order_acquire);
++    const uint64_t h0 = q.head.load(std::memory_order_relaxed);
++    const uint64_t h = idx_prune(q, h0, t);
++    const uint64_t n = std::min<uint64_t>(t - h, kIdxSearch);
++    for (uint64_t i = 0; i < n; ++i) {
++        const IdxRecDLR &r = q.v[(h + i) & q.mask];
++        if (r.key != key) continue;
++        s_idx_cur.frame = r.frame;
++        s_idx_cur.key = r.key;
++        const uint8_t *src = R.bytes + (r.bpos & (kIdxBytesCap - 1));
++        for (int a = 0; a < 4; ++a) {
++            s_idx_cur.base[a] = r.base[a];
++            s_idx_cur.lo[a] = r.lo[a];
++            s_idx_cur.bytes[a].assign(src + r.boff[a], src + r.boff[a] + r.len[a]);
++        }
++        idx_dl_release(h + i + 1);
+         s_idx_ctx = true;
+         s_idx_seen = {};
+         ++s_idx_n[2];
+         idx_log();
+         return;
+     }
++    if (h != h0) idx_dl_release(h);
+     ++s_idx_n[3];
+     idx_log();
+ }
+@@ -402,23 +516,44 @@
+     return true;
+ }
+ 
++// Parser: queue a range change for the guest. False: the ring is full (the
++// caller leaves its own map as it was, so the change is sent again later).
++static bool idx_need_send(uint64_t key, const std::array<IdxRange, 4> &r, bool clear) {
++    IdxRing<IdxNeedMsg> &q = s_idx_rings->need;
++    const uint64_t t = q.tail.load(std::memory_order_relaxed);
++    if (t - q.head.load(std::memory_order_acquire) > q.mask) return false;
++    IdxNeedMsg &m = q.v[t & q.mask];
++    m.key = key;
++    m.r = r;
++    m.clear = clear;
++    q.tail.store(t + 1, std::memory_order_release);
++    return true;
++}
++
+ // End of the list: remember the range it read for its next call.
+ void GX_IdxEndDL() {
+     if (!s_idx_ctx) return;
+     s_idx_ctx = false;
+-    std::lock_guard<std::mutex> lk(s_idx_mtx);
+-    std::array<IdxRange, 4> *need = nullptr;
++    bool any = false;
++    for (int a = 0; a < 4; ++a) any |= s_idx_seen[a].hi > s_idx_seen[a].lo;
++    if (!any) return;
++    // As r13: past 8192 lists the map starts again (and so does the guest's).
++    if (s_idx_need.size() >= 8192) {
++        if (!idx_need_send(0, {}, true)) return;
++        s_idx_need.clear();
++    }
++    auto it = s_idx_need.try_emplace(s_idx_cur.key).first;
++    std::array<IdxRange, 4> nr = it->second;
++    bool changed = false;
+     for (int a = 0; a < 4; ++a) {
+         const IdxRange &sr = s_idx_seen[a];
+         if (sr.hi <= sr.lo) continue;
+-        if (!need) {
+-            if (s_idx_need.size() >= 8192) s_idx_need.clear();
+-            need = &s_idx_need[s_idx_cur.key];
+-        }
+-        IdxRange &nr = (*need)[a];
+-        nr.lo = std::min(nr.lo, sr.lo);
+-        nr.hi = std::max(nr.hi, sr.hi);
++        const uint32_t lo = std::min(nr[a].lo, sr.lo), hi = std::max(nr[a].hi, sr.hi);
++        changed |= lo != nr[a].lo || hi != nr[a].hi;
++        nr[a].lo = lo;
++        nr[a].hi = hi;
+     }
++    if (changed && idx_need_send(s_idx_cur.key, nr, false)) it->second = nr;
+ }
+ } // namespace nwii::runtime
+ 
+@@ -1621,24 +1756,51 @@
+ // piece. Order and content of the stream are unchanged; only the moment the
+ // host can see the bytes moves, and the host takes the FIFO at arbitrary
+ // moments anyway (1 ms polls), so every stream the host can observe now is
+-// one it could already observe before. The buffer is handed over:
++// one it could already observe before.
++//
++// R16w: when the buffer is handed over. r13 handed it over 4 bytes after any
++// 0x61 byte (every possible BP command): ~200 000-280 000 hand-overs per
++// second of 13-15 bytes in the title demo, each one a lock + vector insert
++// (wg_flush_now: 1.2 % of the CPU thread on the console, plus the byte-wise
++// path for every word holding a 0x61 byte). Nothing on the host needs the
++// bytes that early: it only parses what a 1 ms poll finds, the vertex arrays
++// are read when the frame end is parsed, and the display-list and LOAD_INDX
++// copies are made at call time (above). Now the buffer (4 KB) is handed over:
+ //   - when it is full;
+-//   - after every possible BP command, i.e. 4 bytes after any 0x61 byte, so a
+-//     BP (frame end = XFB copy, EFB copy, draw done, tokens) is visible to
+-//     the host at the same moment as before;
+-//   - when the guest idles (idle_wait).
++//   - at the BPs the host or the guest's frame pacing must see at once:
++//     0x52 (EFB/XFB copy: the XFB copy ends a game frame and is counted for
++//     FifoWaitForHost here), 0x45 (draw done) and 0x47/0x48 (draw-sync
++//     tokens, which NWII_LATE_SYNC signals from the parser) -- written as the
++//     SDK does, Write8(0x61) + Write32;
++//   - when the buffer is older than NWII_WGP_MAXAGE_US (default 500 us of
++//     host time, checked at the guest's clock refreshes), so the worker still
++//     parses a frame while the game builds it;
++//   - when the guest idles (idle_wait) and after a CP FIFO drain.
++// NWII_WGP_FLUSH_ALL_BP=1 also hands it over after every SDK BP write
++// (close to r13). NWII_WGP_DIRECT=1 restores the direct per-write path. The
++// debug captures (NWII_GXDUMP/NWII_WGSEG/NWII_WGTRACE) always use the direct
++// path.
+ // The redirect test (FIFO pointed at a display list buffer in RAM) is a flag
+ // kept by the PI/CP register writes instead of two calls per write.
+-// NWII_WGP_DIRECT=1 restores the direct per-write path. The debug captures
+-// (NWII_GXDUMP/NWII_WGSEG/NWII_WGTRACE) always use the direct path.
+ // Guest thread only (all GX_WGPIPE_* callers are: MMIO writes, GX seams, the
+ // CP FIFO drain of an MMIO write).
+-static constexpr uint32_t kWgCap = 512;
++static constexpr uint32_t kWgCap = 4096;
+ alignas(64) static uint8_t s_wg[kWgCap];
+ static uint32_t s_wg_n = 0;
+-// Bit k set: a possible BP command completes when k more bytes are appended.
+-static uint32_t s_wg_bp = 0;
+-static std::atomic<uint64_t> s_wg_writes{0}, s_wg_flushes{0}, s_wg_bytes{0};
++static uint32_t s_wg_cap = kWgCap;  // NWII_WGP_CAP (test: a smaller buffer)
++// R16w: -1 not decided yet, 0 every write takes the full path (direct path,
++// NWII_WGP_CHECK, NWII_SAMPLE), 1 the inline paths below may be used.
++static int s_wg_mode = -1;
++static bool s_wg_flush_all_bp = false;
++// wgp_gather() / NWII_SAMPLE as plain flags once decided (function-local
++// statics cost an acquire load of their guard on every call: ~1/3 of the full
++// path's samples on the console).
++static bool s_wg_gather = true, s_wg_sample = false;
++// Counters: plain on the guest thread, published at each hand-over.
++static uint64_t s_wg_writes_l = 0, s_wg_flushes_l = 0, s_wg_bytes_l = 0, s_wg_bpf_l = 0,
++                s_wg_agef_l = 0;
++static std::atomic<uint64_t> s_wg_writes{0}, s_wg_flushes{0}, s_wg_bytes{0}, s_wg_bpf{0},
++    s_wg_agef{0};
+ 
+ static inline bool wgp_gather() {
+     static const bool g = !wgp_debug() && NWII_ENV("NWII_WGP_DIRECT") == nullptr;
+@@ -1649,9 +1811,9 @@
+ // is also recorded, at the moment it is made, as the direct path would have
+ // pushed it (<prefix>.w), and every hand-over to g_hw_fifo is recorded too
+ // (<prefix>.f); the two files (first 512 MB) must be equal up to the bytes
+-// still buffered at exit. After each write it also checks the BP rule (no
+-// complete 0x61 + 4 bytes left in the buffer) and the cached redirect flag
+-// against the full register test ([WGP] check lines).
++// still buffered at exit. It also checks the cached redirect flag against the
++// full register test and, after each write, that no frame-end copy is left
++// in the buffer ([WGP] check lines).
+ static FILE *wg_check_open(const char *ext) {
+     const char *p = NWII_ENV("NWII_WGP_CHECK");
+     if (!p) return nullptr;
+@@ -1684,16 +1846,18 @@
+         std::printf("[WGP] check: redirect flag %d, registers say %d\n",
+                     (int)hw::g_wgp_redirect_on, (int)on);
+ }
+-// Called after the write: a complete BP still in the buffer is a violation.
++// R8 memory + threads: an XFB copy (BP 0x52, bit 14) in the buffer is counted
++// in s_fifo_frames by the flush that hands it over, under the same lock, as
++// the direct path counts it when it pushes it; s_wg_full asks the writer to
++// wait for the host afterwards (FifoWaitForHost).
++static bool s_wg_xfb = false, s_wg_full = false;
++
++// Called after the write: an XFB copy must never wait in the buffer.
+ static NWII_NOINLINE void wg_check_after() {
+-    for (uint32_t i = 0; i + 4 < s_wg_n; ++i)
+-        if (s_wg[i] == 0x61) {
+-            if (s_wcheck_bad++ < 8)
+-                std::printf("[WGP] check: BP left in buffer at %u of %u\n", i, s_wg_n);
+-            break;
+-        }
++    if (s_wg_xfb && s_wcheck_bad++ < 8)
++        std::printf("[WGP] check: XFB copy left in the buffer (%u bytes)\n", s_wg_n);
+     if ((s_wcheck_calls & 0xFFFFFF) == 0) {
+-        std::printf("[WGP] check: %llu writes, %zu bytes recorded, %llu BP rule violations, "
++        std::printf("[WGP] check: %llu writes, %zu bytes recorded, %llu rule violations, "
+                     "%llu redirected writes, %llu redirect flag mismatches\n",
+                     (unsigned long long)s_wcheck_calls, s_wcheck_n,
+                     (unsigned long long)s_wcheck_bad, (unsigned long long)s_wcheck_redir,
+@@ -1703,12 +1867,6 @@
+     }
+ }
+ 
+-// R8 memory + threads: an XFB copy (BP 0x52, bit 14) in the buffer is counted
+-// in s_fifo_frames by the flush that hands it over, under the same lock, as
+-// the direct path counts it when it pushes it; s_wg_full asks the writer to
+-// wait for the host afterwards (FifoWaitForHost).
+-static bool s_wg_xfb = false, s_wg_full = false;
+-
+ static NWII_NOINLINE void wg_flush_now() {
+     {
+         std::lock_guard<FifoLock> lock(g_fifo_mutex);
+@@ -1723,8 +1881,13 @@
+         std::fwrite(s_wg, 1, s_wg_n, s_wcheck_f);
+         s_wcheck_fn += s_wg_n;
+     }
+-    s_wg_flushes.store(s_wg_flushes.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+-    s_wg_bytes.store(s_wg_bytes.load(std::memory_order_relaxed) + s_wg_n, std::memory_order_relaxed);
++    ++s_wg_flushes_l;
++    s_wg_bytes_l += s_wg_n;
++    s_wg_flushes.store(s_wg_flushes_l, std::memory_order_relaxed);
++    s_wg_bytes.store(s_wg_bytes_l, std::memory_order_relaxed);
++    s_wg_writes.store(s_wg_writes_l, std::memory_order_relaxed);
++    s_wg_bpf.store(s_wg_bpf_l, std::memory_order_relaxed);
++    s_wg_agef.store(s_wg_agef_l, std::memory_order_relaxed);
+     s_wg_n = 0;
+ }
+ 
+@@ -1732,57 +1895,91 @@
+     if (s_wg_n) wg_flush_now();
+ }
+ 
+-// Appends one byte (room for it must exist) and applies the BP rule.
+-static inline void wg_byte(uint8_t b) {
+-    s_wg[s_wg_n++] = b;
+-    s_wg_bp >>= 1;
+-    const bool bp_done = s_wg_bp & 1;
+-    s_wg_bp &= ~1u;
+-    if (b == 0x61) s_wg_bp |= 1u << 4;
+-    if (bp_done) wg_flush_now();
++// R16w: the buffer's age limit, in host timebase ticks (0: off). The guest's
++// clock refresh (ios.cpp poll_tb_refresh, ~200 000/s) calls
++// GX_WGPIPE_AgeFlush once g_wgp_age_next is reached.
++uint64_t g_wgp_age_next = 0;
++static uint64_t s_wgp_age_ticks = 0;
++static bool s_wgp_age_init = false;
++void GX_WGPIPE_AgeFlush(uint64_t now, uint64_t tb_freq) {
++    if (__builtin_expect(!s_wgp_age_init, 0)) {
++        s_wgp_age_init = true;
++        const char *e = NWII_ENV("NWII_WGP_MAXAGE_US");
++        const uint64_t us = e ? std::strtoull(e, nullptr, 10) : 500;
++        s_wgp_age_ticks = us * tb_freq / 1000000;
++        if (!s_wgp_age_ticks) {
++            g_wgp_age_next = ~0ull;
++            return;
++        }
++    }
++    g_wgp_age_next = now + s_wgp_age_ticks;
++    if (s_wg_n && s_wg_mode > 0) {
++        ++s_wg_agef_l;
++        wg_flush_now();
++    }
+ }
+ 
+-static inline void wg_room(uint32_t k) {
+-    if (__builtin_expect(s_wg_n + k > kWgCap, 0)) wg_flush_now();
++static NWII_NOINLINE void wg_init_mode() {
++    static const bool sample = NWII_ENV("NWII_SAMPLE") != nullptr;
++    if (const char *e = NWII_ENV("NWII_WGP_CAP")) {
++        const unsigned long c = std::strtoul(e, nullptr, 10);
++        s_wg_cap = c < 16 ? 16 : c > kWgCap ? kWgCap : (uint32_t)c;
++    }
++    s_wg_flush_all_bp = NWII_ENV("NWII_WGP_FLUSH_ALL_BP") != nullptr;
++    s_wg_gather = wgp_gather();
++    s_wg_sample = sample;
++    s_wg_mode = wgp_gather() && !s_wcheck && !sample ? 1 : 0;
++    std::printf("[WGP] write-gather: %s, buffer %u B, hand-over at full / BP 0x45 0x47 0x48 0x52%s"
++                " / age / idle\n",
++                !wgp_gather() ? "off (direct path)" : s_wg_mode ? "on (inline paths)" : "on (checked paths)",
++                s_wg_cap, s_wg_flush_all_bp ? " / every BP" : "");
+ }
+ 
+-static inline void wg_count() {
+-    s_wg_writes.store(s_wg_writes.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
++// Room for k more bytes.
++static inline void wg_room(uint32_t k) {
++    if (__builtin_expect(s_wg_n + k > s_wg_cap, 0)) wg_flush_now();
+ }
+-
+-// Big-endian bytes of `v` (k of them, most significant first).
+-static inline void wg_bytes_be(uint64_t v, int k) {
+-    wg_room(k);
+-    for (int s = (k - 1) * 8; s >= 0; s -= 8) wg_byte((v >> s) & 0xFF);
++static inline void wg_put1(uint8_t b) {
++    wg_room(1);
++    s_wg[s_wg_n++] = b;
+ }
+-
+-// Any byte of v equal to 0x61?
+-static inline bool has_0x61(uint32_t v) {
+-    const uint32_t x = v ^ 0x61616161u;
+-    return ((x - 0x01010101u) & ~x & 0x80808080u) != 0;
++static inline void wg_put2(uint16_t v) {
++    wg_room(2);
++    const uint16_t be = __builtin_bswap16(v);
++    std::memcpy(s_wg + s_wg_n, &be, 2);
++    s_wg_n += 2;
+ }
+-
+-static inline void wg_word(uint32_t v) {
++static inline void wg_put4(uint32_t v) {
+     wg_room(4);
+-    if (__builtin_expect((s_wg_bp != 0) | has_0x61(v), 0)) {
+-        wg_bytes_be(v, 4);
+-        return;
+-    }
+     const uint32_t be = __builtin_bswap32(v);
+     std::memcpy(s_wg + s_wg_n, &be, 4);
+     s_wg_n += 4;
+ }
++static inline void wg_put8(uint64_t v) {
++    wg_room(8);
++    const uint64_t be = __builtin_bswap64(v);
++    std::memcpy(s_wg + s_wg_n, &be, 8);
++    s_wg_n += 8;
++}
++// The BPs the host must see at once (see above).
++static inline bool wg_bp_hands_over(uint8_t reg) {
++    return reg == 0x52 || reg == 0x45 || reg == 0x47 || reg == 0x48 || s_wg_flush_all_bp;
++}
++// The inline paths: gathering, no debug check, no display list being built.
++static inline bool wg_fast() {
++    return __builtin_expect((s_wg_mode > 0) & !hw::g_wgp_redirect_on, 1);
++}
+ 
+-void GX_WGPIPE_Write8(uint8_t val) {
++static NWII_NOINLINE void wgp_write8_full(uint8_t val) {
++    if (__builtin_expect(s_wg_mode < 0, 0)) wg_init_mode();
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     if (__builtin_expect(hw::g_wgp_redirect_on, 0) && wgp_redirect(val)) { s_bp_armed = false; return; }
+     s_bp_armed = (val == 0x61);
+     idx_sniff8(val);
+     if (__builtin_expect(wgp_gather(), 1)) {
+-        wg_count();
++        ++s_wg_writes_l;
+         if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check(val, 1);
+-        wg_room(1);
+-        wg_byte(val);
++        wg_put1(val);
+         if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_after();
+         return;
+     }
+@@ -1790,15 +1987,27 @@
+     wgp_push(val);
+ }
+ 
+-void GX_WGPIPE_Write16(uint16_t val) {
++void GX_WGPIPE_Write8(uint8_t val) {
++    if (wg_fast()) {
++        s_bp_armed = (val == 0x61);
++        idx_sniff8(val);
++        ++s_wg_writes_l;
++        wg_put1(val);
++        return;
++    }
++    wgp_write8_full(val);
++}
++
++static NWII_NOINLINE void wgp_write16_full(uint16_t val) {
++    if (__builtin_expect(s_wg_mode < 0, 0)) wg_init_mode();
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     s_bp_armed = false;
+     if (__builtin_expect(hw::g_wgp_redirect_on, 0) && wgp_redirect(val >> 8)) { wgp_redirect(val & 0xFF); return; }
+     idx_sniff16(val);
+     if (__builtin_expect(wgp_gather(), 1)) {
+-        wg_count();
++        ++s_wg_writes_l;
+         if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check(val, 2);
+-        wg_bytes_be(val, 2);
++        wg_put2(val);
+         if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_after();
+         return;
+     }
+@@ -1807,11 +2016,23 @@
+     wgp_push(val & 0xFF);
+ }
+ 
+-static void wgp_write32(uint32_t val, bool is_int);
++void GX_WGPIPE_Write16(uint16_t val) {
++    if (wg_fast()) {
++        s_bp_armed = false;
++        idx_sniff16(val);
++        ++s_wg_writes_l;
++        wg_put2(val);
++        return;
++    }
++    wgp_write16_full(val);
++}
+ 
+-void GX_WGPIPE_Write32(uint32_t val) { wgp_write32(val, true); }
++// Game frames (XFB copies) written by the guest, for the Switch profiler's
++// slow-scene trigger (NWII_NX_PROFILE_SLOW_MS).
++std::atomic<uint32_t> g_guest_xfb{0};
+ 
+-static void wgp_write32(uint32_t val, bool is_int) {
++static NWII_NOINLINE void wgp_write32(uint32_t val, bool is_int) {
++    if (__builtin_expect(s_wg_mode < 0, 0)) wg_init_mode();
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     bool bp = s_bp_armed && is_int;
+     s_bp_armed = false;
+@@ -1822,9 +2043,13 @@
+         return;
+     }
+     idx_sniff32(val, is_int);
+-    if (bp && (val >> 24) == 0x52 && (val & 0x4000)) ++s_sn_frame;
+-    static const bool s_sample = NWII_ENV("NWII_SAMPLE") != nullptr;
+-    if (__builtin_expect(s_sample, 0)) {
++    const uint8_t reg = val >> 24;
++    const bool xfb = bp && reg == 0x52 && (val & 0x4000);
++    if (xfb) {
++        ++s_sn_frame;
++        g_guest_xfb.fetch_add(1, std::memory_order_relaxed);
++    }
++    if (__builtin_expect(s_wg_sample, 0)) {
+         static uint64_t n = 0;
+         ++n;
+         if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000 ||
+@@ -1833,32 +2058,33 @@
+                       << " fifo_bytes=" << g_hw_fifo.size() << "\n";
+     }
+     bool full = false;
+-    if (__builtin_expect(wgp_gather(), 1)) {
+-        // A BP (0x61 + this word) is handed over by wg_byte's BP rule before
+-        // the PE is signalled below, as the direct path pushes it first.
+-        wg_count();
++    if (__builtin_expect(s_wg_gather, 1)) {
++        ++s_wg_writes_l;
+         if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check(val, 4);
+-        // BP 0x52 with bit 14: the copy to the XFB that ends a game frame. The
+-        // BP rule hands this word over within wg_word (0x61 came just before),
+-        // and that flush counts it (room first, so no earlier flush can).
+-        wg_room(4);
+-        if (bp && (val >> 24) == 0x52 && (val & 0x4000)) s_wg_xfb = true;
+-        wg_word(val);
++        wg_put4(val);
++        // A BP the host must see now is handed over before the PE is
++        // signalled below, as the direct path pushes it first. BP 0x52 with
++        // bit 14 (the copy to the XFB that ends a game frame) is counted by
++        // this flush (put first, so no earlier flush can count it).
++        if (bp && wg_bp_hands_over(reg)) {
++            s_wg_xfb = xfb;
++            ++s_wg_bpf_l;
++            wg_flush_now();
++            full = s_wg_full;
++            s_wg_full = false;
++        }
+         if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_after();
+-        full = s_wg_full;
+-        s_wg_full = false;
+     } else {
+         std::lock_guard<FifoLock> lock(g_fifo_mutex);
+         wgp_push4(val);
+         // BP 0x52 with bit 14: the copy to the XFB that ends a game frame.
+-        if (bp && (val >> 24) == 0x52 && (val & 0x4000)) {
++        if (xfb) {
+             const uint32_t max = FifoMaxFrames();
+             full = ++s_fifo_frames + s_held_frames >= max && max != 0;
+         }
+     }
+     if (__builtin_expect(full, 0)) FifoWaitForHost();
+     if (bp && g_early_gx_sync) {
+-        uint8_t reg = val >> 24;
+         if (reg == 0x45 && (val & 0xF) == 2)
+             nwii::runtime::hw::pe_signal_finish();
+         else if (reg == 0x47)
+@@ -1868,48 +2094,105 @@
+     }
+ }
+ 
++// A 32-bit integer write: data (no command pending) takes the inline path;
++// the word after Write8(0x61) (a BP) or after a CP / LOAD_INDX / CALL_DL
++// opcode takes the full one.
++// R16w (w4): the two frequent command words take inline paths too, doing
++// exactly what the full path does for them: a BP whose register needs no
++// hand-over (no XFB count, no PE signal; ~250 000/s in the title demo) and the
++// value of a CP register write (array base/stride for the LOAD_INDX copies).
++void GX_WGPIPE_Write32(uint32_t val) {
++    if (wg_fast()) {
++        if (__builtin_expect(!s_bp_armed & (s_sn_st == 0), 1)) {
++            ++s_wg_writes_l;
++            wg_put4(val);
++            return;
++        }
++        if (s_bp_armed & (s_sn_st == 0)) {
++            if (!wg_bp_hands_over(val >> 24)) {
++                s_bp_armed = false;
++                ++s_wg_writes_l;
++                wg_put4(val);
++                return;
++            }
++        } else if (!s_bp_armed & (s_sn_st == 2)) {
++            s_sn_st = 0;
++            const uint32_t a = s_sn_a;
++            if (a >= 0xAC && a <= 0xAF) s_sn_base[a - 0xAC] = val & 0x3FFFFFFF;
++            else if (a >= 0xBC && a <= 0xBF) s_sn_stride[a - 0xBC] = val & 0xFF;
++            ++s_wg_writes_l;
++            wg_put4(val);
++            return;
++        }
++    }
++    wgp_write32(val, true);
++}
++
+ void GX_WGPIPE_WriteF32(float val) {
+     union { float f; uint32_t i; } u; u.f = val;
++    if (wg_fast()) {
++        s_bp_armed = false;
++        s_sn_st = 0;  // idx_sniff32(v, false)
++        ++s_wg_writes_l;
++        wg_put4(u.i);
++        return;
++    }
+     wgp_write32(u.i, false);
+ }
+ 
+-void GX_WGPIPE_WriteF64(double val) {
++static NWII_NOINLINE void wgp_write64_full(uint64_t v) {
++    if (__builtin_expect(s_wg_mode < 0, 0)) wg_init_mode();
+     if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_redirect();
+     s_bp_armed = false;
+-    union { double d; uint64_t i; } u; u.d = val;
+-    if (__builtin_expect(hw::g_wgp_redirect_on, 0) && wgp_redirect((u.i >> 56) & 0xFF)) {
++    if (__builtin_expect(hw::g_wgp_redirect_on, 0) && wgp_redirect((v >> 56) & 0xFF)) {
+         for (int s = 48; s >= 0; s -= 8)
+-            wgp_redirect((u.i >> s) & 0xFF);
++            wgp_redirect((v >> s) & 0xFF);
+         return;
+     }
+-    idx_sniff32((uint32_t)(u.i >> 32), false);
+-    idx_sniff32((uint32_t)u.i, false);
++    idx_sniff32((uint32_t)(v >> 32), false);
++    idx_sniff32((uint32_t)v, false);
+     if (__builtin_expect(wgp_gather(), 1)) {
+-        wg_count();
+-        if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check(u.i, 8);
+-        wg_bytes_be(u.i, 8);
++        ++s_wg_writes_l;
++        if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check(v, 8);
++        wg_put8(v);
+         if (__builtin_expect(s_wcheck != nullptr, 0)) wg_check_after();
+         return;
+     }
+     std::lock_guard<FifoLock> lock(g_fifo_mutex);
+     for (int s = 56; s >= 0; s -= 8)
+-        wgp_push((u.i >> s) & 0xFF);
++        wgp_push((v >> s) & 0xFF);
++}
++
++void GX_WGPIPE_WriteF64(double val) {
++    union { double d; uint64_t i; } u; u.d = val;
++    if (wg_fast()) {
++        s_bp_armed = false;
++        s_sn_st = 0;
++        ++s_wg_writes_l;
++        wg_put8(u.i);
++        return;
++    }
++    wgp_write64_full(u.i);
+ }
+ 
+-// ", wgp N writes/s M flushes/s" for the NWII_FPS / fps_log stats line.
++// ", wgp N writes/s M flushes/s" for the NWII_FPS / fps_log stats line
++// (R16w: + of them at a BP / by age).
+ int GX_WgpStatsLine(char *buf, int size, double dt) {
+-    static uint64_t w0 = 0, f0 = 0, b0 = 0;
++    static uint64_t w0 = 0, f0 = 0, b0 = 0, p0 = 0, a0 = 0;
+     const uint64_t w = s_wg_writes.load(std::memory_order_relaxed);
+     const uint64_t f = s_wg_flushes.load(std::memory_order_relaxed);
+     const uint64_t b = s_wg_bytes.load(std::memory_order_relaxed);
++    const uint64_t p = s_wg_bpf.load(std::memory_order_relaxed);
++    const uint64_t a = s_wg_agef.load(std::memory_order_relaxed);
+     int r = 0;
+     if (!wgp_gather())
+         r = std::snprintf(buf, size, ", wgp direct");
+     else if (dt > 0)
+-        r = std::snprintf(buf, size, ", wgp %.0fk writes/s %.0fk flushes/s (%.0f B)",
++        r = std::snprintf(buf, size, ", wgp %.0fk writes/s %.1fk flushes/s (%.0f B; bp %.1fk/s, age %.1fk/s)",
+                           (w - w0) / dt / 1000, (f - f0) / dt / 1000,
+-                          f > f0 ? double(b - b0) / double(f - f0) : 0.0);
+-    w0 = w; f0 = f; b0 = b;
++                          f > f0 ? double(b - b0) / double(f - f0) : 0.0,
++                          (p - p0) / dt / 1000, (a - a0) / dt / 1000);
++    w0 = w; f0 = f; b0 = b; p0 = p; a0 = a;
+     return r;
+ }
+ 
+diff --color -ru r13/nWiiRuntime/src/hle/ios.cpp r16w/nWiiRuntime/src/hle/ios.cpp
+--- r13/nWiiRuntime/src/hle/ios.cpp	2026-11-08 08:47:11.453601586 -0500
++++ r16w/nWiiRuntime/src/hle/ios.cpp	2026-11-08 18:53:29.213092744 -0500
+@@ -1656,11 +1656,17 @@
+   return r;
+ }
+ 
++// R16w: age limit of the guest's GX write-gather buffer (gx.cpp).
++extern uint64_t g_wgp_age_next;
++void GX_WGPIPE_AgeFlush(uint64_t now, uint64_t tb_freq);
++
+ // Same as CPUContext::read_timebase() on its refresh path (wall clock).
+ static NWII_NOINLINE void poll_tb_refresh(CPUContext &ctx) {
+   poll_count(g_poll_tb_n);
+-  const uint64_t tb = ctx.guest_timebase_from_wall(ctx.wall_timebase_now());
++  const uint64_t now = ctx.wall_timebase_now();
++  const uint64_t tb = ctx.guest_timebase_from_wall(now);
+   if (tb > ctx.tb_cached) ctx.tb_cached = tb;
++  if (__builtin_expect(now >= g_wgp_age_next, 0)) GX_WGPIPE_AgeFlush(now, ctx.tb_freq);
+ }
+ 
+ // ---- NWII_POLL_CHECK=1 (test only): is the inline skip ever wrong? ---------
+diff --color -ru r13/nWiiRuntime/src/hw/hw_cp.cpp r16w/nWiiRuntime/src/hw/hw_cp.cpp
+--- r13/nWiiRuntime/src/hw/hw_cp.cpp	2026-10-31 06:08:18.876224145 -0500
++++ r16w/nWiiRuntime/src/hw/hw_cp.cpp	2026-11-08 18:53:29.213860679 -0500
+@@ -5,6 +5,7 @@
+ namespace nwii::runtime {
+ extern CPUContext *g_ctx_ptr;
+ void GX_WGPIPE_Write8(uint8_t val);
++void GX_WGPIPE_Flush();
+ }
+ 
+ namespace nwii::runtime::hw {
+@@ -58,6 +59,9 @@
+         }
+     }
+     g_cp_fifo_rp = rp;
++    // R16w: the write-gather buffer no longer hands bytes over at every BP;
++    // a drained CP FIFO goes to the host at once, as before.
++    if (count > 0) nwii::runtime::GX_WGPIPE_Flush();
+     if (count > 0 && std::getenv("NWII_CPTRACE"))
+         std::cout << "[CPFIFO] drained " << std::dec << count << " bytes rp=0x"
+                   << std::hex << rp0 << "->0x" << rp << " wp=0x" << wp
+diff --color -ru r13/nWiiRuntime/src/platform/switch/switch_profiler.cpp r16w/nWiiRuntime/src/platform/switch/switch_profiler.cpp
+--- r13/nWiiRuntime/src/platform/switch/switch_profiler.cpp	2026-11-08 13:20:49.854341502 -0500
++++ r16w/nWiiRuntime/src/platform/switch/switch_profiler.cpp	2026-11-08 22:12:25.941811617 -0500
+@@ -24,6 +24,7 @@
+ #include <sys/stat.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -33,6 +34,7 @@
+ 
+ namespace nwii::runtime {
+ extern CPUContext *g_ctx_ptr;  // main.cpp
++extern std::atomic<uint32_t> g_guest_xfb;  // gx.cpp: game frames (XFB copies)
+ }
+ 
+ namespace nwii::runtime::nx {
+@@ -102,19 +104,72 @@
+   }
+ };
+ 
++// R16w: who is waiting. For a sample whose pc is in a kernel wait (the svc
++// wrappers of svcArbitrateLock, svcWaitProcessWideKeyAtomic, svcSleepThread,
++// svcWaitSynchronization), the paused thread's stack is scanned upwards from
++// sp for words that point into this image's code (likely return addresses):
++// the first kWaitDepth of them, with pc and lr, are counted together. Stale
++// slots can show up too, but the chain above mutexLock / condvarWaitTimeout /
++// nanosleep is there. Written as "wstack <count> <pc> <lr> <ret>..." lines
++// (r9/r16w/tools/wstack_symbolize.py).
++constexpr int kWaitDepth = 6;
++struct WaitHist {
++  static constexpr uint32_t kCap = 1u << 12;
++  struct E { uint64_t w[kWaitDepth + 2]; uint32_t n; };
++  std::vector<E> e;
++  uint32_t used = 0;
++  uint64_t overflow = 0;
++  WaitHist() : e(kCap, E{}) {}
++  void add(const uint64_t *w) {
++    uint64_t h = 0;
++    for (int i = 0; i < kWaitDepth + 2; ++i) h = (h ^ w[i]) * 0x9E3779B97F4A7C15ull;
++    for (uint32_t k = (uint32_t)(h >> 52);; ++k) {
++      E &x = e[k & (kCap - 1)];
++      if (x.n == 0) {
++        if (used >= kCap / 4 * 3) {
++          ++overflow;
++          return;
++        }
++        std::memcpy(x.w, w, sizeof x.w);
++        x.n = 1;
++        ++used;
++        return;
++      }
++      if (std::memcmp(x.w, w, sizeof x.w) == 0) {
++        ++x.n;
++        return;
++      }
++    }
++  }
++};
++
+ struct Target {
+   const char *name;
+   int slot;
+   PairHist hist;
+   GuestHist guest;
++  WaitHist waits;
++  uint64_t stack_lo = 0, stack_hi = 0;  // mapping that held sp last time
+   uint64_t samples = 0, failed = 0, paused_ticks = 0, max_pause_ticks = 0;
+   uint32_t last_rc = 0;
+ };
+ 
+-uint64_t g_base = 0;
++uint64_t g_base = 0, g_text_end = 0;
++uint64_t g_wait_fn[4] = {};  // svc wrappers of the kernel waits
+ int g_core = -1, g_prio = 0;
+ uint32_t g_interval_us = 1000, g_write_secs = 10;
+ Thread g_thread;
++// R16w: sampling window. NWII_NX_PROFILE_FROM / _TO: seconds since the
++// profiler started (about the NRO's start); NWII_NX_PROFILE_SLOW_MS: sample
++// only while the game is slow -- on once the game-frame interval (XFB copies
++// of the guest, averaged over 1 s) has stayed above that many ms for
++// NWII_NX_PROFILE_SLOW_HOLD_S (2) seconds, off after 1 s back under it (a
++// second with no game frame at all, e.g. a load, counts as not slow). The
++// two combine (AND). Outside the window nothing is sampled; the files say
++// how long it was open (sampled_s) and how many times (windows).
++double g_from_s = 0, g_to_s = -1, g_slow_ms = 0, g_slow_hold_s = 2;
++double g_sampled_s = 0;
++uint32_t g_windows = 0;
+ 
+ void write_target(Target &t, double elapsed) {
+   const std::string path = std::string(root_dir()) + "/logs/profile_" + t.name + ".txt";
+@@ -133,12 +188,14 @@
+                "thread %s\nbase 0x%llx\ninterval_us %u\nelapsed_s %.1f\nsamples %llu\n"
+                "failed %llu (last rc 0x%x)\npaused_us_total %.0f\npaused_us_max %.1f\n"
+                "overhead_pct %.2f\nsampler core %d prio 0x%X\ndistinct %u\noverflow %llu\n"
++               "window from %.1f to %.1f slow_ms %.1f hold %.1f\nsampled_s %.1f\nwindows %u\n"
+                "# count pc lr\n",
+                t.name, (unsigned long long)g_base, g_interval_us, elapsed,
+                (unsigned long long)t.samples, (unsigned long long)t.failed, t.last_rc,
+                t.paused_ticks * tick_us, t.max_pause_ticks * tick_us,
+-               elapsed > 0 ? t.paused_ticks * tick_us / (elapsed * 1e4) : 0.0, g_core, g_prio,
+-               t.hist.used, (unsigned long long)t.hist.overflow);
++               g_sampled_s > 0 ? t.paused_ticks * tick_us / (g_sampled_s * 1e4) : 0.0, g_core, g_prio,
++               t.hist.used, (unsigned long long)t.hist.overflow, g_from_s, g_to_s, g_slow_ms,
++               g_slow_hold_s, g_sampled_s, g_windows);
+   for (uint32_t i : idx)
+     std::fprintf(f, "%u 0x%llx 0x%llx\n", t.hist.n[i], (unsigned long long)t.hist.pc[i],
+                  (unsigned long long)t.hist.lr[i]);
+@@ -151,11 +208,49 @@
+                  (unsigned long long)t.guest.overflow);
+     for (uint32_t i : g) std::fprintf(f, "guest %u 0x%08x\n", t.guest.n[i], t.guest.pc[i]);
+   }
++  if (t.waits.used) {
++    std::vector<uint32_t> w;
++    for (uint32_t i = 0; i < WaitHist::kCap; ++i)
++      if (t.waits.e[i].n) w.push_back(i);
++    std::sort(w.begin(), w.end(), [&](uint32_t a, uint32_t b) { return t.waits.e[a].n > t.waits.e[b].n; });
++    std::fprintf(f, "# wait stacks: wstack count pc lr ret... (overflow %llu)\n",
++                 (unsigned long long)t.waits.overflow);
++    for (uint32_t i : w) {
++      const WaitHist::E &x = t.waits.e[i];
++      std::fprintf(f, "wstack %u", x.n);
++      for (int k = 0; k < kWaitDepth + 2; ++k) std::fprintf(f, " 0x%llx", (unsigned long long)x.w[k]);
++      std::fprintf(f, "\n");
++    }
++  }
+   std::fclose(f);
+   remove(path.c_str());  // the SD card's rename does not replace
+   rename(tmp.c_str(), path.c_str());
+ }
+ 
++// Paused thread in a kernel wait: count its return-address chain (see WaitHist).
++void wait_stack(Target &t, const ThreadContext &ctx) {
++  const uint64_t pc = ctx.pc.x;
++  bool wait = false;
++  for (uint64_t f : g_wait_fn) wait |= f && pc - f < 32;
++  if (!wait || !g_text_end) return;
++  const uint64_t sp = ctx.sp;
++  if (sp < t.stack_lo || sp >= t.stack_hi) {
++    MemoryInfo mi = {};
++    u32 pi = 0;
++    if (R_FAILED(svcQueryMemory(&mi, &pi, sp)) || !(mi.perm & Perm_R)) return;
++    t.stack_lo = mi.addr;
++    t.stack_hi = mi.addr + mi.size;
++  }
++  uint64_t w[kWaitDepth + 2] = {pc, ctx.lr};
++  int k = 2;
++  const uint64_t end = std::min<uint64_t>(t.stack_hi, sp + 1024);
++  for (uint64_t a = sp & ~7ull; a + 8 <= end && k < kWaitDepth + 2; a += 8) {
++    const uint64_t v = *(const volatile uint64_t *)a;
++    if (v >= g_base && v < g_text_end && !(v & 3) && v != w[k - 1]) w[k++] = v;
++  }
++  t.waits.add(w);
++}
++
+ // Returns false when the kernel refuses (e.g. an emulator without the svc).
+ bool sample(Target &t) {
+   const Handle h = (Handle)thread_handle(t.slot);
+@@ -166,6 +261,7 @@
+   Result rc2 = rc;
+   if (R_SUCCEEDED(rc)) {
+     rc2 = svcGetThreadContext3(&ctx, h);
++    if (R_SUCCEEDED(rc2)) wait_stack(t, ctx);  // while the stack holds still
+     svcSetThreadActivity(h, ThreadActivity_Runnable);
+   }
+   const u64 dt = armGetSystemTick() - t0;
+@@ -189,8 +285,48 @@
+   const u64 start = armGetSystemTick();
+   u64 last_write = start;
+   uint64_t win_paused[3] = {};
++  const bool windowed = g_from_s > 0 || g_to_s >= 0 || g_slow_ms > 0;
++  bool active = false;
++  u64 last_tick = start, slow_check = start;
++  uint32_t xfb_hist[4] = {};  // game frames at the last 4 quarter-second checks
++  int xfb_n = 0;
++  double slow_for = 0, fast_for = 0;
++  bool slow = false;
+   for (;;) {
+     svcSleepThread((s64)g_interval_us * 1000);
++    const u64 tnow = armGetSystemTick();
++    const double now_s = armTicksToNs(tnow - start) / 1e9;
++    if (g_slow_ms > 0 && armTicksToNs(tnow - slow_check) >= 250000000ull) {
++      // Mean game-frame interval over the last second.
++      const double dt = armTicksToNs(tnow - slow_check) / 1e9;
++      slow_check = tnow;
++      const uint32_t x = g_guest_xfb.load(std::memory_order_relaxed);
++      const uint32_t old = xfb_hist[xfb_n & 3];
++      xfb_hist[xfb_n & 3] = x;
++      if (++xfb_n > 4) {
++        const uint32_t d = x - old;
++        const bool s_now = d > 0 && 1000.0 / d > g_slow_ms;  // 1 s / frames, in ms
++        if (s_now) { slow_for += dt; fast_for = 0; }
++        else { fast_for += dt; slow_for = 0; }
++        if (!slow && slow_for >= g_slow_hold_s) slow = true;
++        if (slow && fast_for >= 1.0) slow = false;
++      }
++    }
++    const bool want = !windowed || ((now_s >= g_from_s) && (g_to_s < 0 || now_s < g_to_s) &&
++                                    (g_slow_ms <= 0 || slow));
++    if (want != active) {
++      active = want;
++      if (active) ++g_windows;
++      std::printf("[PROFILE] window %s at %.1f s (sampled so far %.1f s)\n", active ? "open" : "closed",
++                  now_s, g_sampled_s);
++      if (!active) {  // the files right away: the game may be closed during the next one
++        mkdir((std::string(root_dir()) + "/logs").c_str(), 0777);
++        for (Target &t : targets) write_target(t, now_s);
++      }
++    }
++    if (active) g_sampled_s += armTicksToNs(tnow - last_tick) / 1e9;
++    last_tick = tnow;
++    if (!active) continue;
+     for (Target &t : targets) {
+       if (sample(t)) continue;
+       std::printf("[PROFILE] %s: svcSetThreadActivity/svcGetThreadContext3 failed (rc 0x%x): "
+@@ -236,10 +372,23 @@
+   if (!e || !*e || !std::strcmp(e, "0")) return;
+   if (const char *v = std::getenv("NWII_NX_PROFILE_US")) g_interval_us = std::max(100, std::atoi(v));
+   if (const char *v = std::getenv("NWII_NX_PROFILE_SECS")) g_write_secs = std::max(1, std::atoi(v));
++  if (const char *v = std::getenv("NWII_NX_PROFILE_FROM")) g_from_s = std::atof(v);
++  if (const char *v = std::getenv("NWII_NX_PROFILE_TO")) g_to_s = std::atof(v);
++  if (const char *v = std::getenv("NWII_NX_PROFILE_SLOW_MS")) g_slow_ms = std::atof(v);
++  if (const char *v = std::getenv("NWII_NX_PROFILE_SLOW_HOLD_S")) g_slow_hold_s = std::atof(v);
++  if (g_from_s > 0 || g_to_s >= 0 || g_slow_ms > 0)
++    std::printf("[PROFILE] window: from %.1f s to %.1f s (-1: end), slow scenes only: %s "
++                "(game frame > %.1f ms for %.1f s)\n", g_from_s, g_to_s, g_slow_ms > 0 ? "yes" : "no",
++                g_slow_ms, g_slow_hold_s);
+   MemoryInfo region = {};
+   u32 page_info = 0;
+   svcQueryMemory(&region, &page_info, (u64)(uintptr_t)&profiler_start);
+   g_base = region.addr;  // start of the NRO's code (elf address 0)
++  g_text_end = region.addr + region.size;
++  g_wait_fn[0] = (uint64_t)(uintptr_t)&svcArbitrateLock;
++  g_wait_fn[1] = (uint64_t)(uintptr_t)&svcWaitProcessWideKeyAtomic;
++  g_wait_fn[2] = (uint64_t)(uintptr_t)&svcSleepThread;
++  g_wait_fn[3] = (uint64_t)(uintptr_t)&svcWaitSynchronization;
+   // Core 3 if this process may use it (homebrew normally gets 0-2), else 2
+   // (the audio cores: AX mixer + audio output, a few % busy).
+   u64 allowed = 0;
